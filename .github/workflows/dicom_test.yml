@@ -1,0 +1,78 @@
+name: DICOM Scapy Test
+
+on:
+  push:
+    branches: [ main ] # Run on pushes to main
+  pull_request:
+    branches: [ main ] # Optional: Run on PRs targeting main
+
+jobs:
+  test-dicom-implementation:
+    runs-on: ubuntu-latest
+    # Optional: Add container definition if you need specific OS tools not in runner
+    # container: ubuntu:22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4 # Use the latest version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Choose your desired Python version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install scapy # Install scapy itself
+          # Add other dependencies if your test script needs them
+          # pip install -r requirements.txt # Or install from requirements
+
+      - name: Start DICOM SCP (DCMTK storescp in Docker)
+        run: |
+          echo "Starting DCMTK storescp container..."
+          # Use a specific version tag for reproducibility
+          docker run \
+            --detach \
+            --rm \
+            --name dicom-scp-test \
+            --publish 11112:11112 \
+            dcmtk/dcmtk:3.6.8 \
+            storescp +xa +ae STORESCP 11112 -v -od /tmp/dicom_test_storage --fork
+            # +xa: Accept all proposed transfer syntaxes
+            # +ae STORESCP: Set the Application Entity Title
+            # 11112: Listen on port 11112 inside the container
+            # -v: Verbose logging from storescp (useful for debugging)
+            # -od /tmp/...: Output directory (required, even for echo)
+            # --fork: Run in background within the container (optional alternative to --detach)
+
+          echo "Waiting for SCP to start..."
+          sleep 5 # Give the SCP a few seconds to initialize
+
+          echo "Checking if SCP container is running..."
+          docker ps --filter name=dicom-scp-test
+
+      - name: Run DICOM Integration Test Script
+        run: |
+          # Execute the test script, passing SCP details
+          # Note: Use 127.0.0.1 because we published the Docker port to the runner's localhost
+          python test_integration.py \
+            --ip 127.0.0.1 \
+            --port 11112 \
+            --ae-title STORESCP \
+            --calling-ae SCAPY_CI_SCU \
+            # --debug # Uncomment to enable debug logging during CI run
+
+      # Optional: Capture SCP logs for debugging if tests fail
+      - name: Show SCP Logs on Failure
+        if: failure() # Only run this step if previous steps failed
+        run: |
+          echo "--- DICOM SCP Logs ---"
+          docker logs dicom-scp-test || echo "Could not get SCP logs."
+
+      - name: Stop DICOM SCP Container
+        # Always run this step, even if the test script failed, to clean up
+        if: always()
+        run: |
+          echo "Stopping DICOM SCP container..."
+          docker stop dicom-scp-test || echo "SCP container already stopped or could not be stopped."
