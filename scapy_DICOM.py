@@ -817,57 +817,174 @@ class DICOMSession:
             return False
 
     def _parse_associate_ac(self, ac_pdu):
-        """Parse the A-ASSOCIATE-AC PDU to store negotiated parameters."""
-        self.accepted_contexts = {}
-        self.peer_max_pdu_length = None # Reset
+        """
+        Parse the A-ASSOCIATE-AC PDU to store negotiated parameters.
+        Manually parses variable items from raw bytes due to Scapy dissection limitations.
+        """
+        self.accepted_contexts = {} # Reset accepted contexts
+        self.peer_max_pdu_length = None # Reset peer max length
 
-        for item in ac_pdu.variable_items:
-            if item.item_type == 0x21: # Presentation Context AC
-                # Need to parse the 'data' field of the PresentationContextACItem manually
-                if len(item.data) >= 4:
-                    context_id, _, result_reason, _ = struct.unpack("!BBBB", item.data[:4])
-                    if result_reason == 0: # Acceptance
-                        # Find the Transfer Syntax Sub-item within the remaining data
-                        sub_item_data = item.data[4:]
-                        if len(sub_item_data) >= 4 and sub_item_data[0] == 0x40: # Transfer Syntax type
-                            ts_len = struct.unpack("!H", sub_item_data[2:4])[0]
-                            if len(sub_item_data) >= 4 + ts_len:
-                                trn_syntax_uid = UIDField("dummy", "").m2i(None, sub_item_data[4:4+ts_len])
-                                # Need original abstract syntax - requires matching RQ context ID,
-                                # which we don't store directly here. Assume matching for now.
-                                # TODO: Improve context matching if needed later
-                                log.info(f"Presentation Context ID {context_id} accepted (Transfer Syntax: {trn_syntax_uid})")
-                                # Store context_id -> transfer_syntax mapping (abstract syntax unknown here)
-                                self.accepted_contexts[context_id] = ("Unknown Abstract Syntax", trn_syntax_uid)
-                            else:
-                                log.warning(f"Malformed Transfer Syntax sub-item in AC context {context_id}")
-                        else:
-                             log.warning(f"No valid Transfer Syntax found in accepted AC context {context_id}")
-                    else:
-                         log.info(f"Presentation Context ID {context_id} rejected/failed (Reason: {result_reason})")
+        log.debug(f"AC Called AE Title: {ac_pdu.called_ae_title.decode().strip()}")
+        log.debug(f"AC Calling AE Title: {ac_pdu.calling_ae_title.decode().strip()}")
 
-            elif item.item_type == 0x50: # User Information
-                 # Parse User Info sub-items within the 'data' field
-                 user_data = item.data
-                 offset = 0
-                 while offset < len(user_data):
-                     if offset + 4 > len(user_data): break # Need type, res, len
-                     sub_type, _, sub_len = struct.unpack("!BBH", user_data[offset:offset+4])
-                     if offset + 4 + sub_len > len(user_data):
-                         log.warning("Malformed User Information sub-item structure in AC.")
-                         break
-                     sub_item_payload = user_data[offset+4 : offset+4+sub_len]
+        # --- Manual parsing of Variable Items ---
+        # Get the raw bytes *after* the fixed A-ASSOCIATE-AC header (68 bytes)
+        # These bytes contain the concatenated Variable Items.
+        # Check if the A_ASSOCIATE_AC layer has payload bytes available
+        if not isinstance(ac_pdu.payload, (bytes, NoPayload)):
+             # Access payload differently if it's another Scapy layer (like Raw)
+             variable_items_bytes = bytes(ac_pdu.payload)
+        elif isinstance(ac_pdu.payload, bytes):
+             variable_items_bytes = ac_pdu.payload # Should ideally be bytes
+        else: # NoPayload or unexpected
+             log.warning("A-ASSOCIATE-AC PDU has no payload bytes containing variable items.")
+             variable_items_bytes = b''
 
-                     if sub_type == 0x51: # Max Length
-                         if sub_len == 4:
-                             self.peer_max_pdu_length = struct.unpack("!I", sub_item_payload)[0]
-                             log.info(f"Peer maximum PDU length: {self.peer_max_pdu_length}")
-                         else:
-                              log.warning("Invalid length for Max Length sub-item in AC.")
-                     # Could parse other items like Impl Class UID if needed
 
-                     offset += (4 + sub_len)
+        log.debug(f"Manually parsing {len(variable_items_bytes)} bytes of AC variable items.")
+        offset = 0
+        total_len = len(variable_items_bytes)
 
+        while offset < total_len:
+            # Check for sufficient bytes for header (Type, Res, Len)
+            if offset + 4 > total_len:
+                log.warning(f"Truncated variable item header at offset {offset}. Stopping parse.")
+                break
+
+            # Read item header
+            item_type, _, item_length = struct.unpack("!BBH", variable_items_bytes[offset:offset+4])
+            item_data_offset = offset + 4
+            item_end_offset = item_data_offset + item_length
+
+            # Check if item length exceeds available bytes
+            if item_end_offset > total_len:
+                log.warning(f"Variable item (Type {item_type:02X}) length ({item_length}) exceeds available data ({total_len - item_data_offset} left). Stopping parse.")
+                break
+
+            item_data_bytes = variable_items_bytes[item_data_offset:item_end_offset]
+            log.debug(f"  Found Item Type: 0x{item_type:02X}, Length: {item_length}")
+
+            # --- Process item based on type ---
+            if item_type == 0x10: # Application Context
+                 app_ctx_uid = UIDField("dummy", "").m2i(None, item_data_bytes)
+                 log.debug(f"    Application Context UID: {app_ctx_uid}")
+                 # Optional: Verify it matches APP_CONTEXT_UID
+
+            elif item_type == 0x21: # Presentation Context AC
+                 self._parse_presentation_context_ac_item(item_data_bytes)
+
+            elif item_type == 0x50: # User Information
+                 self._parse_user_information_item(item_data_bytes)
+
+            # Add elif for other item types if needed
+
+            else:
+                log.debug(f"    Skipping unknown/unhandled variable item type 0x{item_type:02X}")
+
+            # Move to the next item
+            offset = item_end_offset
+        # --- End Manual Parsing Loop ---
+
+        if offset != total_len:
+            log.warning(f"Finished parsing AC variable items, but {total_len - offset} bytes remain unprocessed.")
+
+
+    def _parse_presentation_context_ac_item(self, data_bytes):
+        """Helper to parse the data part of a Presentation Context AC item."""
+        if len(data_bytes) < 4:
+            log.warning(f"Malformed Presentation Context AC item received (data length {len(data_bytes)} < 4)")
+            return
+
+        context_id, _, result_reason, _ = struct.unpack("!BBBB", data_bytes[:4])
+        log.debug(f"    Presentation Context AC Item (ID: {context_id}):")
+
+        original_request = self.requested_contexts_map.get(context_id)
+        if original_request:
+            original_abstract_syntax = original_request[0]
+        else:
+            original_abstract_syntax = "Unknown (Context ID not in RQ map?)"
+            log.warning(f"      Received AC for Presentation Context ID {context_id} which was not in our RQ map.")
+
+        result_map = {0: "Acceptance", 1: "User Rejection", 2: "Provider Rejection (no reason)",
+                      3: "Abstract Syntax Not Supported", 4: "Transfer Syntaxes Not Supported"}
+        result_str = result_map.get(result_reason, f"Unknown ({result_reason})")
+        log.debug(f"      Result: {result_str} ({result_reason})")
+
+        if result_reason == 0: # Acceptance
+            # Try to parse the accepted Transfer Syntax Sub-item (starts immediately after result/reserved)
+            sub_item_data = data_bytes[4:]
+            accepted_transfer_syntax = "Error parsing Transfer Syntax"
+            if len(sub_item_data) >= 4 and sub_item_data[0] == 0x40: # Transfer Syntax type
+                # Read TS sub-item length
+                ts_len = struct.unpack("!H", sub_item_data[2:4])[0]
+                ts_data_offset = 4
+                ts_end_offset = ts_data_offset + ts_len
+                if ts_end_offset <= len(sub_item_data):
+                     ts_uid_bytes = sub_item_data[ts_data_offset:ts_end_offset]
+                     try:
+                         accepted_transfer_syntax = UIDField("dummy", "").m2i(None, ts_uid_bytes)
+                         log.info(f"      Presentation Context ID {context_id} ACCEPTED")
+                         log.info(f"        Abstract Syntax: {original_abstract_syntax}")
+                         log.info(f"        Transfer Syntax: {accepted_transfer_syntax}")
+                         # Store accepted context details
+                         self.accepted_contexts[context_id] = (original_abstract_syntax, accepted_transfer_syntax)
+                     except Exception as e_parse:
+                         log.warning(f"      Error parsing accepted Transfer Syntax UID for context {context_id}: {e_parse}")
+                else:
+                     log.warning(f"      Transfer Syntax sub-item length ({ts_len}) exceeds available data ({len(sub_item_data) - ts_data_offset} left).")
+            else:
+                 log.warning(f"      No valid Transfer Syntax sub-item (Type 0x40) found in accepted AC context {context_id}")
+        else:
+             log.info(f"      Presentation Context ID {context_id} ({original_abstract_syntax}) REJECTED/FAILED (Reason: {result_str})")
+
+
+    def _parse_user_information_item(self, data_bytes):
+        """Helper to parse the sub-items within a User Information item's data."""
+        log.debug("    User Information Item:")
+        sub_offset = 0
+        sub_total_len = len(data_bytes)
+        while sub_offset < sub_total_len:
+             if sub_offset + 4 > sub_total_len:
+                 log.warning("      Truncated User Information sub-item header.")
+                 break
+
+             sub_type, _, sub_len = struct.unpack("!BBH", data_bytes[sub_offset:sub_offset+4])
+             sub_data_offset = sub_offset + 4
+             sub_end_offset = sub_data_offset + sub_len
+
+             if sub_end_offset > sub_total_len:
+                 log.warning(f"      User Information sub-item (Type {sub_type:02X}) length ({sub_len}) exceeds available data.")
+                 break
+
+             sub_item_payload_bytes = data_bytes[sub_data_offset:sub_end_offset]
+             log.debug(f"      Found Sub-Item Type: 0x{sub_type:02X}, Length: {sub_len}")
+
+             # Example: Parse Max Length sub-item
+             if sub_type == 0x51: # Max Length
+                 if sub_len == 4:
+                     try:
+                         self.peer_max_pdu_length = struct.unpack("!I", sub_item_payload_bytes)[0]
+                         log.info(f"        Peer maximum PDU length: {self.peer_max_pdu_length}")
+                     except struct.error:
+                         log.warning("        Could not unpack Max Length sub-item value.")
+                 else:
+                      log.warning(f"        Invalid length ({sub_len}) for Max Length sub-item (expected 4).")
+             elif sub_type == 0x52: # Implementation Class UID
+                  try:
+                       peer_impl_uid = UIDField("dummy", "").m2i(None, sub_item_payload_bytes)
+                       log.info(f"        Peer Implementation Class UID: {peer_impl_uid}")
+                  except Exception as e_uid:
+                       log.warning(f"        Could not parse Peer Implementation Class UID: {e_uid}")
+             elif sub_type == 0x55: # Implementation Version Name
+                  try:
+                       peer_impl_ver = sub_item_payload_bytes.decode('ascii')
+                       log.info(f"        Peer Implementation Version Name: {peer_impl_ver}")
+                  except Exception as e_ver:
+                       log.warning(f"        Could not parse Peer Implementation Version Name: {e_ver}")
+             # Could parse other items like Async Ops, Role Selection if needed
+
+             # Move to the next sub-item
+             sub_offset = sub_end_offset
 
     def send_p_data(self, pdv_list):
         """
