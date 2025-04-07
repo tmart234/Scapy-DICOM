@@ -31,25 +31,30 @@ log = logging.getLogger("dicom_test")
 def build_c_echo_rq_dimse(message_id=1):
     """Builds raw bytes for a C-ECHO-RQ DIMSE command message."""
     log.debug(f"Building C-ECHO-RQ DIMSE (Message ID: {message_id})")
-    dimse_command_set = b''
+    # Build elements *before* calculating group length
+    elements_payload = b''
     affected_sop_uid_bytes = _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)
 
-    # (0000,0002) Affected SOP Class UID - Tag, VR, Len, Value
-    # Need explicit VR 'UI' for DIMSE command elements, even in Implicit TS negotiation! (PS3.7 6.3.1)
-    dimse_command_set += struct.pack("<HH", 0x0000, 0x0002) + b'UI' + struct.pack("<H", len(affected_sop_uid_bytes)) + affected_sop_uid_bytes
+    # (0000,0002) Affected SOP Class UID - Tag(4), VR(2), Len(2), Value(N)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0002) + b'UI' + struct.pack("<H", len(affected_sop_uid_bytes)) + affected_sop_uid_bytes
 
-    # (0000,0100) Command Field (C-ECHO-RQ = 0x0030) - Tag, VR, Len, Value
-    dimse_command_set += struct.pack("<HH", 0x0000, 0x0100) + b'US' + struct.pack("<HH", 2, 0x0030)
+    # (0000,0100) Command Field (C-ECHO-RQ = 0x0030) - Tag(4), VR(2), Len(2)=2, Value(2)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0100) + b'US' + struct.pack("<H", 2) + struct.pack("<H", 0x0030)
 
-    # (0000,0110) Message ID - Tag, VR, Len, Value
-    dimse_command_set += struct.pack("<HH", 0x0000, 0x0110) + b'US' + struct.pack("<HH", 2, message_id)
+    # (0000,0110) Message ID - Tag(4), VR(2), Len(2)=2, Value(2)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0110) + b'US' + struct.pack("<H", 2) + struct.pack("<H", message_id)
 
-    # (0000,0800) Command Data Set Type (0x0101 = No dataset) - Tag, VR, Len, Value
-    dimse_command_set += struct.pack("<HH", 0x0000, 0x0800) + b'US' + struct.pack("<HH", 2, 0x0101)
+    # (0000,0800) Command Data Set Type (0x0101 = No dataset) - Tag(4), VR(2), Len(2)=2, Value(2)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0800) + b'US' + struct.pack("<H", 2) + struct.pack("<H", 0x0101)
 
-    # (0000,0000) Command Group Length - Tag, VR, Len, Value
-    cmd_group_len = len(dimse_command_set) # Length of elements *after* this one
-    dimse_command_set = struct.pack("<HH", 0x0000, 0x0000) + b'UL' + struct.pack("<HI", 4, cmd_group_len) + dimse_command_set
+    # Calculate group length (length of all elements built above)
+    cmd_group_len = len(elements_payload)
+
+    # (0000,0000) Command Group Length - Tag(4), VR(2), Len(2)=4, Value(4)
+    group_length_element = struct.pack("<HH", 0x0000, 0x0000) + b'UL' + struct.pack("<H", 4) + struct.pack("<I", cmd_group_len)
+
+    # Prepend group length element to the other elements
+    dimse_command_set = group_length_element + elements_payload
 
     log.debug(f"Built DIMSE Command Set (len={len(dimse_command_set)}): {dimse_command_set.hex()}")
     return dimse_command_set
