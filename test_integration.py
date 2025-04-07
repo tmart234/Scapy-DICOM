@@ -100,9 +100,11 @@ def main():
 
         # 4. Create the PresentationDataValueItem object for C-ECHO-RQ
         pdv_to_send = PresentationDataValueItem(
-            context_id=echo_ctx_id,
-            data=dimse_command_bytes
+            context_id=echo_ctx_id
+            # message_control_header can be set via properties later
         )
+        # Assign data and flags explicitly as attributes
+        pdv_to_send.data = dimse_command_bytes # Assign data directly
         pdv_to_send.is_command = True # Mark as DIMSE command
         pdv_to_send.is_last = True    # Mark as last fragment
 
