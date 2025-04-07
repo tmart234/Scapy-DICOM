@@ -195,26 +195,41 @@ def main():
         # 7. Process the response
         if response_pdata.haslayer(P_DATA_TF):
             log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
-            # Check the received PDV(s)
+
+            # --- Use Scapy's dissected list directly ---
+            # Remove the manual parsing loop here
+
             rsp_pdv = None
-            for pdv in response_pdata[P_DATA_TF].pdv_items:
-                log.info(f"  PDV Context: {pdv.context_id}, Command: {pdv.is_command}, Last: {pdv.is_last}, Data Len: {len(pdv.data)}")
-                # Check if this PDV matches our expectation for a C-ECHO response
-                if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
-                    rsp_pdv = pdv
-                    break # Found the likely response PDV
+            # Iterate Scapy's dissected list
+            if not response_pdata[P_DATA_TF].pdv_items:
+                log.error("P-DATA-TF received, but Scapy dissection yielded no PDV items.")
+            else:
+                for pdv in response_pdata[P_DATA_TF].pdv_items:
+                    # Access fields directly, assuming dissection worked
+                    try:
+                        log.info(f"  PDV Context: {pdv.context_id}, Command: {pdv.is_command}, Last: {pdv.is_last}, Data Len: {len(pdv.data)}")
+                        if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
+                            if pdv.data:
+                                 rsp_pdv = pdv
+                                 break
+                            else:
+                                 log.warning("  Found matching PDV, but its data field is empty after Scapy dissection.")
+                    except AttributeError as e:
+                        log.error(f"  AttributeError accessing dissected PDV fields: {e}. PDV was: {pdv.summary() if hasattr(pdv, 'summary') else pdv}")
+                        # This might happen if dissection put Raw or something else in the list
+            # --- End direct access ---
+
 
             if rsp_pdv:
-                log.info("Found relevant PDV in response.")
-                # Validate the DIMSE status within the received data
+                log.info("Found relevant PDV in response with data.")
+                # Validate the DIMSE status
                 if check_c_echo_rsp(rsp_pdv.data):
                     log.info("C-ECHO Response indicates SUCCESS!")
-                    test_success = True # Mark the test as successful
+                    test_success = True
                 else:
                     log.error("C-ECHO Response DIMSE status check failed (Status != Success or parse error).")
-                    # Test failed, finally block handles cleanup
             else:
-                 log.error("Did not find a suitable PDV (Command, Last, matching Context ID) in the P-DATA-TF response.")
+                 log.error("Did not find a suitable PDV (Command, Last, matching Context ID, with data) in the P-DATA-TF response.")
                  # Test failed, finally block handles cleanup
 
         elif response_pdata.haslayer(A_ABORT):

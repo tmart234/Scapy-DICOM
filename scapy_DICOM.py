@@ -18,15 +18,17 @@ import struct
 import time
 import socket
 import logging
+from io import BytesIO
 
 from scapy.all import Packet, bind_layers, PacketListField, conf
 from scapy.fields import (
     ByteEnumField, ByteField, ShortField, IntField, FieldLenField,
-    StrFixedLenField, StrLenField, ShortEnumField, Field, BitField, StrField
+    StrFixedLenField, StrLenField, ShortEnumField, Field, BitField, 
+    StrField
 )
 from scapy.layers.inet import TCP
 from scapy.supersocket import StreamSocket
-from scapy.packet import NoPayload
+from scapy.packet import NoPayload, Raw
 
 log = logging.getLogger("scapy.contrib.dicom")
 
@@ -364,20 +366,66 @@ class A_ASSOCIATE_RQ(Packet):
         # Variable Items (Application Context, Presentation Context(s), User Information)
         PacketListField("variable_items", [], DICOMVariableItem, length_from=lambda pkt: pkt.underlayer.length - 68) # 68 bytes fixed header
     ]
+    def dissect_payload(self, s):
+        """Manually dissect variable items"""
+        # Assumes underlayer (DICOM) has set the length correctly
+        # Calculate expected payload length based on DICOM UL header length
+        total_payload_len = getattr(self.underlayer, 'length', len(s)) # Use length from UL PDU if available
+        if total_payload_len > 68: # Ensure length accounts for fixed header
+            total_payload_len -= 68
+        else:
+            # If length is too small or not set, guess based on available bytes 's'
+            # This might happen if the DICOM layer itself wasn't fully dissected
+            log.warning("A-ASSOCIATE-RQ/AC UL length seems invalid or missing, guessing payload length from available bytes.")
+            total_payload_len = len(s)
 
-class A_ASSOCIATE_AC(Packet):
+        payload_bytes = s[:total_payload_len]
+        remaining_bytes = s[total_payload_len:]
+
+        items = []
+        stream = BytesIO(payload_bytes) # Use BytesIO for easier reading
+
+        while True:
+            header = stream.read(4)
+            if len(header) < 4:
+                # End of stream or truncated item
+                if len(header) > 0:
+                    log.warning("Trailing bytes found after last complete variable item in A-ASSOCIATE-RQ/AC.")
+                    # Add leftover bytes to remaining_bytes to avoid losing them
+                    remaining_bytes = header + remaining_bytes
+                break # Exit loop
+
+            item_type, _, item_length = struct.unpack("!BBH", header)
+            item_data = stream.read(item_length)
+
+            if len(item_data) < item_length:
+                log.warning(f"Variable item {item_type:02X} truncated. Expected {item_length}, got {len(item_data)}.")
+                # Put back partially read header and data to remaining_bytes
+                remaining_bytes = header + item_data + remaining_bytes
+                break # Stop on truncation
+
+            # Attempt to dissect this item
+            try:
+                # Reconstruct full item bytes for dissection
+                full_item_bytes = header + item_data
+                # Use the generic class to dissect based on type/length
+                # This relies on DICOMVariableItem and its children being defined
+                item_pkt = DICOMVariableItem(full_item_bytes)
+                items.append(item_pkt)
+                log.debug(f"Dissected Variable Item: {item_pkt.summary()}")
+            except Exception as e:
+                log.error(f"Failed to dissect variable item type {item_type:02X}: {e}")
+                # Append as Raw data to avoid losing bytes
+                items.append(Raw(header + item_data))
+
+        self.variable_items = items # Assign the manually dissected list
+        self.payload = Raw(remaining_bytes) if remaining_bytes else NoPayload() # Assign any leftover bytes
+
+class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     """A-ASSOCIATE-AC PDU (PS3.8 Section 9.3.3)"""
     # Structure identical to RQ up to reserved2 field
     name = "A-ASSOCIATE-AC"
-    fields_desc = [
-        ShortField("protocol_version", 0x0001),
-        ShortField("reserved1", 0),
-        StrFixedLenField("called_ae_title", b"DefaultCalled ".ljust(16), 16), # Usually mirrors RQ
-        StrFixedLenField("calling_ae_title", b"DefaultCalling".ljust(16), 16), # Usually mirrors RQ
-        StrFixedLenField("reserved2", b"\x00"*32, 32),
-        # Variable Items (Application Context, Presentation Context(s) AC, User Information)
-        PacketListField("variable_items", [], DICOMVariableItem, length_from=lambda pkt: pkt.underlayer.length - 68)
-    ]
+
 
 class A_ASSOCIATE_RJ(Packet):
     """A-ASSOCIATE-RJ PDU (PS3.8 Section 9.3.4 & Table 9-16)"""
@@ -526,6 +574,50 @@ class P_DATA_TF(Packet):
         PacketListField("pdv_items", [], PresentationDataValueItem,
                         length_from=lambda pkt: pkt.underlayer.length)
     ]
+    def dissect_payload(self, s):
+        """Manually dissect PDV items from the payload"""
+        # Assumes underlayer (DICOM) has set the length correctly
+        total_payload_len = getattr(self.underlayer, 'length', len(s)) # Use length from UL PDU
+        payload_bytes = s[:total_payload_len]
+        remaining_bytes = s[total_payload_len:]
+
+        items = []
+        stream = BytesIO(payload_bytes) # Use BytesIO for easier reading
+
+        while True:
+            # Read PDV Length (4 bytes)
+            len_bytes = stream.read(4)
+            if len(len_bytes) < 4:
+                if len(len_bytes) > 0:
+                    log.warning("Trailing bytes found after last complete PDV item.")
+                    remaining_bytes = len_bytes + remaining_bytes # Prepend back
+                break # End of stream or truncated length
+
+            pdv_item_len = struct.unpack("!I", len_bytes)[0] # Length of ContextID+MsgHdr+Data
+
+            # Read the rest of the PDV item (ContextID+MsgHdr+Data)
+            pdv_item_data_bytes = stream.read(pdv_item_len)
+
+            if len(pdv_item_data_bytes) < pdv_item_len:
+                log.warning(f"PDV item truncated. Expected {pdv_item_len}, got {len(pdv_item_data_bytes)}.")
+                # Put back partially read bytes
+                remaining_bytes = len_bytes + pdv_item_data_bytes + remaining_bytes
+                break # Stop on truncation
+
+            # Attempt to dissect this item using PresentationDataValueItem class
+            try:
+                # Reconstruct full PDV bytes (Length field + rest) for dissection
+                full_pdv_bytes = len_bytes + pdv_item_data_bytes
+                pdv_pkt = PresentationDataValueItem(full_pdv_bytes) # Dissection happens here
+                items.append(pdv_pkt)
+                log.debug(f"Dissected PDV Item: {pdv_pkt.summary()}")
+            except Exception as e:
+                log.error(f"Failed to dissect PDV item: {e}")
+                # Append as Raw data?
+                items.append(Raw(len_bytes + pdv_item_data_bytes))
+
+        self.pdv_items = items # Assign the manually dissected list
+        self.payload = Raw(remaining_bytes) if remaining_bytes else NoPayload() # Assign any leftover bytes
 
 # --- Layer Binding ---
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
