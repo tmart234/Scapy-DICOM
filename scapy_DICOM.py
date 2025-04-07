@@ -708,10 +708,11 @@ class PresentationDataValueItem(Packet):
         'p' now contains [context_id(1), msg_hdr(1)]
         We need to append self.data before calculating length.
         """
-        value_payload = p + self.data # Combine fixed fields and data
+        # Combine fixed fields from 'p' and the instance's data attribute
+        value_payload = p + self.data
         pdv_value_len = len(value_payload)
 
-        # Prepend length to the fields' bytes
+        # Prepend length to the combined value payload
         p_with_len = struct.pack("!I", pdv_value_len) + value_payload
         log.debug(f"PDV post_build: Calculated value length: {pdv_value_len}. Final PDV item bytes (len={len(p_with_len)}): {p_with_len.hex('.')}")
         return p_with_len + pay # Append outer payload if any
