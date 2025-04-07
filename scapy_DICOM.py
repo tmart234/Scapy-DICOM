@@ -22,7 +22,7 @@ import logging
 from scapy.all import Packet, bind_layers, PacketListField, conf
 from scapy.fields import (
     ByteEnumField, ByteField, ShortField, IntField, FieldLenField,
-    StrFixedLenField, StrLenField, ShortEnumField, Field, BitField
+    StrFixedLenField, StrLenField, ShortEnumField, Field, BitField, StrField
 )
 from scapy.layers.inet import TCP
 from scapy.supersocket import StreamSocket
@@ -449,61 +449,72 @@ class PresentationDataValueItem(Packet):
         # PDV Length: Length of the *following* fields (Context ID + Msg Hdr + Data)
         IntField("length", None),
         # --- Start of PDV Value (length bytes) ---
-        ByteField("context_id", 0), # Presentation Context ID this data relates to
-        # Message Control Header (1 byte containing flags)
+        ByteField("context_id", 0),
         ByteField("message_control_header", 0),
         # The actual DIMSE message fragment (Command or Data Set)
-        # Length is PDV length - 1 (context_id) - 1 (msg_ctrl_hdr)
-        StrLenField("data", b"", length_from=lambda x: x.length - 2),
+        # We will use extract_padding to handle this field's length correctly.
+        # Define it initially as empty; extract_padding will populate it.
+        StrField("data", b""),
     ]
 
-    # Define properties to access flags within message_control_header
+    def extract_padding(self, s):
+        """
+        Called after dissecting fixed fields. 's' contains the remaining bytes.
+        We use this to correctly extract the 'data' field based on pdv length.
+        """
+        expected_data_len = 0
+        if self.length is not None:
+            # Data length = Total PDV Length - Context ID (1) - Msg Ctrl Hdr (1)
+            expected_data_len = self.length - 2
+        else:
+            # Should not happen if dissection works, but handle defensively
+            log.warning("PDV Item length field is None during padding extraction.")
+            expected_data_len = len(s) # Consume rest if length unknown
+
+        # Ensure calculated length is not negative
+        expected_data_len = max(0, expected_data_len)
+
+        # Ensure we don't read past the end of available bytes
+        actual_data_len = min(expected_data_len, len(s))
+
+        if actual_data_len < expected_data_len:
+             log.warning(f"PDV Item data is shorter ({actual_data_len} bytes) than expected ({expected_data_len} bytes based on length field {self.length}).")
+
+        self.data = s[:actual_data_len]
+        # Return the remaining bytes (padding, should be empty)
+        return s[actual_data_len:]
+
+    # --- is_last, is_command properties remain the same ---
     @property
     def is_last(self):
-        # Bit 1 (0-indexed) from the right = Last Fragment flag
         return (self.message_control_header >> 1) & 0x01
-
     @is_last.setter
     def is_last(self, value):
-        if value:
-            self.message_control_header |= 0x02 # Set bit 1
-        else:
-            self.message_control_header &= ~0x02 # Clear bit 1
-
+        if value: self.message_control_header |= 0x02
+        else: self.message_control_header &= ~0x02
     @property
     def is_command(self):
-        # Bit 0 (0-indexed) from the right = Command/Data flag
         return self.message_control_header & 0x01
-
     @is_command.setter
     def is_command(self, value):
-        if value:
-            self.message_control_header |= 0x01 # Set bit 0
-        else:
-            self.message_control_header &= ~0x01 # Clear bit 0
+        if value: self.message_control_header |= 0x01
+        else: self.message_control_header &= ~0x01
 
     def post_build(self, p, pay):
         # Calculate PDV length if not provided
-        # Length = length of context_id(1) + msg_ctrl_hdr(1) + data
         if self.length is None:
             length = 1 + 1 + len(self.data)
             p = struct.pack("!I", length) + p[4:]
-
-        # Ensure the message_control_header byte is correctly placed
-        # Scapy should handle placing self.context_id and self.message_control_header
-        # based on fields_desc before StrLenField.
-        # If StrLenField misbehaves, manual packing might be needed here.
-        # Assuming Scapy places the ByteFields correctly:
+        # Manually ensure order if needed (Scapy usually handles this)
         p = p[:4] + bytes([self.context_id]) + bytes([self.message_control_header]) + self.data
-
-        # Append any potential payload (should normally be empty for PDV)
         return p + pay
 
-    # Add a summary for better display
     def summary(self):
         cmd_data = "Command" if self.is_command else "Data"
         last = "Last" if self.is_last else "More"
-        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, Len: {self.length}, DataLen: {len(self.data)})"
+        # Use getattr to avoid errors if data is not bytes (should be)
+        data_len = len(getattr(self, 'data', b''))
+        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, Len: {self.length}, DataLen: {data_len})"
 class P_DATA_TF(Packet):
     """
     P-DATA-TF PDU (PS3.8 Section 9.3.5)
