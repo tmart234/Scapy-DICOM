@@ -759,6 +759,7 @@ class P_DATA_TF(Packet):
         log.debug(f"P_DATA_TF.dissect_payload: Starting dissection of {len(payload_bytes)} bytes (UL length: {total_payload_len}).")
 
         while offset < len(payload_bytes):
+            current_pdv_start_offset = offset # Remember start for error case
             if offset + 4 > len(payload_bytes):
                 log.warning(f"P-DATA-TF: Trailing bytes ({len(payload_bytes) - offset}) insufficient for PDV length field.")
                 remaining_bytes = payload_bytes[offset:] + remaining_bytes
@@ -787,22 +788,26 @@ class P_DATA_TF(Packet):
                 if pdv_item_obj:
                     self.parsed_pdv_items.append(pdv_item_obj)
                     log.debug(f"  P_DATA_TF: Successfully parsed PDV: {pdv_item_obj.summary()}")
+                    # Move offset ONLY if successful
+                    offset = pdv_item_end_offset
                 else:
-                    log.warning(f"  P_DATA_TF: Failed to parse PDV item bytes. Adding as Raw.")
-                    self.parsed_pdv_items.append(Raw(pdv_full_bytes))
-
-                # Move offset to the next PDV
-                offset = pdv_item_end_offset
+                    # from_bytes returned None (logged its own error)
+                    log.warning(f"  P_DATA_TF: Failed to parse PDV item bytes at offset {current_pdv_start_offset}. Stopping dissection of this PDU.")
+                    # Assign the rest of the PDU payload as Raw
+                    remaining_bytes = payload_bytes[current_pdv_start_offset:] + remaining_bytes
+                    offset = len(payload_bytes) # Force loop termination
 
             except struct.error as e:
                  log.error(f"P-DATA-TF: Error unpacking PDV length at offset {offset}: {e}")
                  remaining_bytes = payload_bytes[offset:] + remaining_bytes
-                 break
+                 break # Stop dissection on unpack error
             except Exception as e:
-                 log.error(f"P-DATA-TF: Unexpected error during PDV parsing at offset {offset}: {e}", exc_info=True)
+                 # Catch any other unexpected error during the loop for this PDV
+                 log.error(f"P-DATA-TF: Unexpected error during PDV processing at offset {offset}: {e}", exc_info=True)
                  remaining_bytes = payload_bytes[offset:] + remaining_bytes
                  break # Stop dissection
 
+        # Assign whatever wasn't processed or came after PDU length as payload
         self.payload = Raw(remaining_bytes) if remaining_bytes else NoPayload()
         log.debug(f"P_DATA_TF.dissect_payload: Finished dissection. Parsed {len(self.parsed_pdv_items)} items. Remaining payload type: {type(self.payload)}")
 
