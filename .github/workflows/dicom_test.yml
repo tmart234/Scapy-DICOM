@@ -53,6 +53,8 @@ jobs:
           docker ps --filter name=orthanc-scp-test
 
       - name: Run DICOM Integration Test Script against Orthanc
+        id: test_script
+        continue-on-error: true
         run: |
           python test_integration.py \
               --ip 127.0.0.1 \
@@ -61,14 +63,23 @@ jobs:
               --calling-ae SCAPY_CI_SCU \
               --debug
 
-      - name: Show SCP Logs on Failure
-        if: failure()
-        run: |
-          echo "--- DICOM SCP Logs ---"
-          docker logs dicom-scp-test || echo "Could not get SCP logs."
-
-      - name: Stop DICOM SCP Container
+      - name: Show Orthanc Logs
         if: always()
         run: |
-          echo "Stopping DICOM SCP container..."
-          docker stop dicom-scp-test || echo "SCP container already stopped or could not be stopped."
+          echo "--- Orthanc SCP Logs ---"
+          # Wait a tiny bit in case logs are still flushing
+          sleep 2
+          docker logs orthanc-scp-test || echo "Could not get Orthanc logs."
+
+      - name: Stop Orthanc SCP Container
+        if: always()
+        run: |
+          echo "Stopping Orthanc SCP container..."
+          docker stop orthanc-scp-test || echo "Orthanc container already stopped or could not be stopped."
+  
+        # Fail the overall job if the test script step failed
+      - name: Check test script outcome
+        if: steps.test_script.outcome != 'success'
+        run: |
+          echo "Test script failed!"
+          exit 1
