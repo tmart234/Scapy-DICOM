@@ -35,8 +35,7 @@ jobs:
       - name: Start DICOM SCP (Orthanc in Docker)
         run: |
           echo "Starting Orthanc container..."
-          # Use a specific version tag if desired, e.g., osimis/orthanc:23.11.2
-          # Configure Orthanc using environment variables
+          # Use the official team image with a specific tag
           docker run \
             --detach \
             --rm \
@@ -45,14 +44,10 @@ jobs:
             -e VERBOSE_ENABLED=true \
             -e DICOM_AET=ORTHANC_CI \
             -e DICOM_PORT=4242 \
-            osimis/orthanc --verbose # Start Orthanc in verbose mode
-
-            # -e DICOM_AET=ORTHANC_CI: Sets Orthanc's AE Title
-            # -e DICOM_PORT=4242: Sets the DICOM port *inside* the container
-            # --publish 4242:4242: Exposes the internal port 4242 to the runner's localhost:4242
+            orthancteam/orthanc:25.2.0 --verbose
 
           echo "Waiting for Orthanc to start..."
-          sleep 10 # Orthanc might take a bit longer to initialize than storescp
+          sleep 10 # Orthanc might take a bit longer to initialize
 
           echo "Checking if Orthanc container is running..."
           docker ps --filter name=orthanc-scp-test
