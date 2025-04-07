@@ -829,29 +829,62 @@ class DICOMSession:
         log.debug(f"AC Calling AE Title: {ac_pdu.calling_ae_title.decode().strip()}")
 
         # --- Manual parsing of Variable Items ---
-        # Get the raw bytes *after* the fixed A-ASSOCIATE-AC header (68 bytes)
-        # These bytes contain the concatenated Variable Items.
-        # Check if the A_ASSOCIATE_AC layer has payload bytes available
-        if not isinstance(ac_pdu.payload, (bytes, NoPayload)):
-             # Access payload differently if it's another Scapy layer (like Raw)
-             variable_items_bytes = bytes(ac_pdu.payload)
-        elif isinstance(ac_pdu.payload, bytes):
-             variable_items_bytes = ac_pdu.payload # Should ideally be bytes
-        else: # NoPayload or unexpected
-             log.warning("A-ASSOCIATE-AC PDU has no payload bytes containing variable items.")
-             variable_items_bytes = b''
+        # Extract the raw bytes containing the *remaining* variable items.
+        # These often end up in the payload (e.g., Raw layer) after Scapy's
+        # initial (often incomplete) dissection of the PacketListField.
+        variable_items_bytes = b''
+        first_item_bytes = b''
+
+        # 1. Check if Scapy dissected *any* items into the list field
+        if ac_pdu.variable_items:
+             # If Scapy put items here, we need to re-serialize the first one
+             # to get its bytes, as the rest will be in the payload.
+             # This assumes Scapy only manages to dissect the very first item correctly.
+             try:
+                 # Rebuild the first item Scapy found
+                 first_item_bytes = bytes(ac_pdu.variable_items[0])
+                 log.debug(f"Rebuilt bytes of first item dissected by Scapy (len={len(first_item_bytes)}).")
+             except Exception as e_build:
+                 log.warning(f"Could not rebuild first dissected variable item: {e_build}. Proceeding with payload only.")
+                 first_item_bytes = b'' # Reset if rebuild fails
+
+        # 2. Get the bytes from the payload (likely Raw layer)
+        payload_bytes = b''
+        if isinstance(ac_pdu.payload, (bytes, bytearray)):
+            payload_bytes = bytes(ac_pdu.payload)
+        elif hasattr(ac_pdu.payload, 'load') and isinstance(ac_pdu.payload.load, (bytes, bytearray)):
+            # Handles Raw layer or similar layers with a 'load' attribute
+            payload_bytes = bytes(ac_pdu.payload.load)
+        elif not isinstance(ac_pdu.payload, NoPayload):
+            # Attempt to convert other layer types to bytes, might be lossy
+            try:
+                 payload_bytes = bytes(ac_pdu.payload)
+                 log.warning(f"Converted unexpected payload type {type(ac_pdu.payload)} to bytes.")
+            except Exception:
+                 log.warning(f"Could not get bytes from unexpected payload type {type(ac_pdu.payload)}.")
 
 
-        log.debug(f"Manually parsing {len(variable_items_bytes)} bytes of AC variable items.")
+        # 3. Combine bytes from potentially dissected first item and the remaining payload
+        # This reconstructs the full byte sequence of all variable items.
+        variable_items_bytes = first_item_bytes + payload_bytes
+
+        if not variable_items_bytes:
+             log.warning("Could not extract any variable item bytes from A-ASSOCIATE-AC PDU.")
+             # Association might still be technically valid if peer sends 0 items? Unlikely.
+             return # Exit parsing if no bytes found
+
+
+        log.debug(f"Manually parsing {len(variable_items_bytes)} bytes of AC variable items (reconstructed).")
         offset = 0
         total_len = len(variable_items_bytes)
 
+        # --- The rest of the parsing loop remains the same ---
         while offset < total_len:
             # Check for sufficient bytes for header (Type, Res, Len)
             if offset + 4 > total_len:
                 log.warning(f"Truncated variable item header at offset {offset}. Stopping parse.")
                 break
-
+            # ... (rest of the while loop as before) ...
             # Read item header
             item_type, _, item_length = struct.unpack("!BBH", variable_items_bytes[offset:offset+4])
             item_data_offset = offset + 4
@@ -869,7 +902,6 @@ class DICOMSession:
             if item_type == 0x10: # Application Context
                  app_ctx_uid = UIDField("dummy", "").m2i(None, item_data_bytes)
                  log.debug(f"    Application Context UID: {app_ctx_uid}")
-                 # Optional: Verify it matches APP_CONTEXT_UID
 
             elif item_type == 0x21: # Presentation Context AC
                  self._parse_presentation_context_ac_item(item_data_bytes)
@@ -877,18 +909,14 @@ class DICOMSession:
             elif item_type == 0x50: # User Information
                  self._parse_user_information_item(item_data_bytes)
 
-            # Add elif for other item types if needed
-
             else:
                 log.debug(f"    Skipping unknown/unhandled variable item type 0x{item_type:02X}")
 
             # Move to the next item
             offset = item_end_offset
-        # --- End Manual Parsing Loop ---
 
         if offset != total_len:
             log.warning(f"Finished parsing AC variable items, but {total_len - offset} bytes remain unprocessed.")
-
 
     def _parse_presentation_context_ac_item(self, data_bytes):
         """Helper to parse the data part of a Presentation Context AC item."""
