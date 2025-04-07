@@ -186,8 +186,7 @@ def main():
             log.error("No response received from SCP after sending C-ECHO-RQ (connection likely closed).")
             sys.exit(1) # Exit, finally block handles cleanup
 
-        log.debug(f"Received response packet:\n{response_pdata.show(dump=True, show_indent=False)}")
-
+        log.debug(f"Received response packet:\n{response_pdata.show(dump=True)}")   
         # 7. Process the response
         if response_pdata.haslayer(P_DATA_TF):
             log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
