@@ -1287,24 +1287,28 @@ class DICOMSession:
         dicom_pkt = DICOM(pdu_type=0x04) / p_data_tf_pdu
 
         # Check PDU size against peer's max length if known
-        total_len = len(bytes(dicom_pkt))
+        total_len = len(bytes(dicom_pkt)) # Trigger serialization once for check
         if self.peer_max_pdu_length and total_len > self.peer_max_pdu_length:
             log.error(f"PDU size ({total_len} bytes) exceeds peer maximum ({self.peer_max_pdu_length} bytes). Cannot send.")
             # In a real application, you would fragment the data across multiple P-DATA-TFs
             return False
 
         log.info(f"Sending P-DATA-TF ({len(pdv_list)} PDV(s))")
-        log.debug(f"P-DATA-TF Details:\n{dicom_pkt.show(dump=True)}")
+        log.debug(f"P-DATA-TF Object Structure:\n{dicom_pkt.show(dump=True)}") # Keep this
 
         try:
-            self.stream.send(dicom_pkt)
+            final_bytes_to_send = bytes(dicom_pkt) # Serialize the packet
+            log.debug(f"Final Bytes Sent ({len(final_bytes_to_send)} bytes):")
+            log.debug(final_bytes_to_send.hex('.')) # Use hex with separator for readability
+
+            self.stream.send(final_bytes_to_send) # Send the already serialized bytes
             return True
         except Exception as e:
             log.error(f"Failed to send P-DATA-TF: {e}")
             # Consider aborting or attempting recovery depending on the error
             self.abort()
             return False
-
+        
     def release(self):
         """Sends A-RELEASE-RQ and waits for A-RELEASE-RP."""
         if not self.assoc_established:

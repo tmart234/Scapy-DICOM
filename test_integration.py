@@ -3,7 +3,6 @@ import sys
 import argparse
 import logging
 import socket
-import struct
 import time
 
 # Assuming scapy_DICOM.py is in the same directory or installable
@@ -18,6 +17,7 @@ try:
         build_c_echo_rq_dimse,
     )
     from scapy_DICOM import _uid_to_bytes, parse_dimse_status
+    from scapy.packet import NoPayload, Raw
 except ImportError:
     print("ERROR: Could not import from scapy_DICOM.py.")
     sys.exit(2)
@@ -106,12 +106,6 @@ def main():
         pdv_to_send.is_command = True # Mark as DIMSE command
         pdv_to_send.is_last = True    # Mark as last fragment
 
-        # --- REMOVED EXPLICIT LENGTH SETTING ---
-        # Let Scapy's post_build mechanism handle the length calculation for the PDV
-        # pdv_value_len = 1 + 1 + len(pdv_to_send.data)
-        # pdv_to_send.length = pdv_value_len
-        # log.debug(f"Explicitly setting PDV Item length field to: {pdv_to_send.length}")
-        # --- END REMOVAL ---
 
         # 5. Send the PDV Item via P-DATA-TF
         log.info(f"Sending C-ECHO-RQ (Message ID: {message_id}) on context {echo_ctx_id}...")
