@@ -647,9 +647,18 @@ class PresentationDataValueItem(Packet):
 
     def build_bytes(self):
         """Manually builds the complete byte representation including length prefix."""
-        # Build the value part using Scapy's field logic + self.data
-        value_payload = self.build_fields() + self.data
+        # Manually pack the defined fields (context_id and message_control_header)
+        # Ensure values are within byte range (0-255) if necessary, though defaults are safe.
+        try:
+            packed_fields = struct.pack("!BB", self.context_id & 0xFF, self.message_control_header & 0xFF)
+        except struct.error as e:
+             log.error(f"PDV build_bytes: Error packing fields (ContextID={self.context_id}, MsgHdr={self.message_control_header}): {e}")
+             packed_fields = b'\x00\x00' # Default to zeros on error
+
+        # Combine packed fields with self.data
+        value_payload = packed_fields + self.data
         pdv_value_len = len(value_payload)
+
         # Prepend the length
         full_pdv_bytes = struct.pack("!I", pdv_value_len) + value_payload
         log.debug(f"PDV build_bytes: ValueLen={pdv_value_len}. TotalBytes={len(full_pdv_bytes)}: {full_pdv_bytes.hex('.')}")
