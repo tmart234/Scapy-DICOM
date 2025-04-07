@@ -574,50 +574,6 @@ class P_DATA_TF(Packet):
         PacketListField("pdv_items", [], PresentationDataValueItem,
                         length_from=lambda pkt: pkt.underlayer.length)
     ]
-    def dissect_payload(self, s):
-        """Manually dissect PDV items from the payload"""
-        # Assumes underlayer (DICOM) has set the length correctly
-        total_payload_len = getattr(self.underlayer, 'length', len(s)) # Use length from UL PDU
-        payload_bytes = s[:total_payload_len]
-        remaining_bytes = s[total_payload_len:]
-
-        items = []
-        stream = BytesIO(payload_bytes) # Use BytesIO for easier reading
-
-        while True:
-            # Read PDV Length (4 bytes)
-            len_bytes = stream.read(4)
-            if len(len_bytes) < 4:
-                if len(len_bytes) > 0:
-                    log.warning("Trailing bytes found after last complete PDV item.")
-                    remaining_bytes = len_bytes + remaining_bytes # Prepend back
-                break # End of stream or truncated length
-
-            pdv_item_len = struct.unpack("!I", len_bytes)[0] # Length of ContextID+MsgHdr+Data
-
-            # Read the rest of the PDV item (ContextID+MsgHdr+Data)
-            pdv_item_data_bytes = stream.read(pdv_item_len)
-
-            if len(pdv_item_data_bytes) < pdv_item_len:
-                log.warning(f"PDV item truncated. Expected {pdv_item_len}, got {len(pdv_item_data_bytes)}.")
-                # Put back partially read bytes
-                remaining_bytes = len_bytes + pdv_item_data_bytes + remaining_bytes
-                break # Stop on truncation
-
-            # Attempt to dissect this item using PresentationDataValueItem class
-            try:
-                # Reconstruct full PDV bytes (Length field + rest) for dissection
-                full_pdv_bytes = len_bytes + pdv_item_data_bytes
-                pdv_pkt = PresentationDataValueItem(full_pdv_bytes) # Dissection happens here
-                items.append(pdv_pkt)
-                log.debug(f"Dissected PDV Item: {pdv_pkt.summary()}")
-            except Exception as e:
-                log.error(f"Failed to dissect PDV item: {e}")
-                # Append as Raw data?
-                items.append(Raw(len_bytes + pdv_item_data_bytes))
-
-        self.pdv_items = items # Assign the manually dissected list
-        self.payload = Raw(remaining_bytes) if remaining_bytes else NoPayload() # Assign any leftover bytes
 
 # --- Layer Binding ---
 bind_layers(TCP, DICOM, sport=DICOM_PORT)

@@ -184,45 +184,74 @@ def main():
 
         # 6. Wait for C-ECHO-RSP via P-DATA-TF
         log.info("Waiting for C-ECHO response...")
-        # Use the stream socket associated with the session to receive the response
         response_pdata = session.stream.recv()
 
         if not response_pdata:
             log.error("No response received from SCP after sending C-ECHO-RQ (connection likely closed).")
-            sys.exit(1) # Exit, finally block handles cleanup
+            sys.exit(1)
 
-        log.debug(f"Received response packet:\n{response_pdata.show(dump=True)}")   
+        log.debug(f"Received response packet:\n{response_pdata.show(dump=True)}")
+
         # 7. Process the response
         if response_pdata.haslayer(P_DATA_TF):
             log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
 
-            # --- Use Scapy's dissected list directly ---
-            # Remove the manual parsing loop here
+            # +++ RESTORE MANUAL PARSING of PDV Items +++
+            pdv_items_list = [] # Store manually parsed PDVs here
+            pdata_payload_bytes = b''
+            # Extract raw bytes from P_DATA_TF payload (often ends up in Raw)
+            pdata_tf_layer = response_pdata[P_DATA_TF]
+            if isinstance(pdata_tf_layer.payload, (bytes, bytearray)):
+                pdata_payload_bytes = bytes(pdata_tf_layer.payload)
+            elif hasattr(pdata_tf_layer.payload, 'load') and isinstance(pdata_tf_layer.payload.load, (bytes, bytearray)):
+                pdata_payload_bytes = bytes(pdata_tf_layer.payload.load)
+            elif not isinstance(pdata_tf_layer.payload, NoPayload):
+                 try:
+                     pdata_payload_bytes = bytes(pdata_tf_layer.payload)
+                     log.warning(f"Converted unexpected P_DATA_TF payload type {type(pdata_tf_layer.payload)} to bytes.")
+                 except Exception:
+                     log.warning(f"Could not get bytes from unexpected P_DATA_TF payload type {type(pdata_tf_layer.payload)}.")
 
+            log.debug(f"Manually parsing {len(pdata_payload_bytes)} bytes of P-DATA payload.")
+            offset = 0
+            total_len = len(pdata_payload_bytes)
+            while offset < total_len:
+                if offset + 4 > total_len: break # Need length field
+                pdv_len = struct.unpack("!I", pdata_payload_bytes[offset:offset+4])[0]
+                pdv_item_start_offset = offset + 4
+                pdv_item_end_offset = pdv_item_start_offset + pdv_len
+                if pdv_item_end_offset > total_len: break # Truncated item
+
+                # Extract the full bytes for this PDV item (including its length field)
+                full_pdv_bytes_for_dissection = pdata_payload_bytes[offset:pdv_item_end_offset]
+                try:
+                    # Create object *from bytes* - this triggers dissection including extract_padding
+                    parsed_pdv = PresentationDataValueItem(full_pdv_bytes_for_dissection)
+                    log.debug(f"Successfully parsed PDV item: {parsed_pdv.summary()}")
+                    pdv_items_list.append(parsed_pdv)
+                except Exception as e_pdv_parse:
+                    log.error(f"Failed to parse extracted PDV item bytes: {e_pdv_parse}")
+                offset = pdv_item_end_offset
+            # +++ END RESTORED MANUAL PARSING +++
+
+
+            # Now iterate through the MANUALLY parsed list
             rsp_pdv = None
-            # Iterate Scapy's dissected list
-            if not response_pdata[P_DATA_TF].pdv_items:
-                log.error("P-DATA-TF received, but Scapy dissection yielded no PDV items.")
-            else:
-                for pdv in response_pdata[P_DATA_TF].pdv_items:
-                    # Access fields directly, assuming dissection worked
-                    try:
-                        log.info(f"  PDV Context: {pdv.context_id}, Command: {pdv.is_command}, Last: {pdv.is_last}, Data Len: {len(pdv.data)}")
-                        if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
-                            if pdv.data:
-                                 rsp_pdv = pdv
-                                 break
-                            else:
-                                 log.warning("  Found matching PDV, but its data field is empty after Scapy dissection.")
-                    except AttributeError as e:
-                        log.error(f"  AttributeError accessing dissected PDV fields: {e}. PDV was: {pdv.summary() if hasattr(pdv, 'summary') else pdv}")
-                        # This might happen if dissection put Raw or something else in the list
-            # --- End direct access ---
-
+            for pdv in pdv_items_list: # Iterate parsed list
+                try:
+                    log.info(f"  PDV Context: {pdv.context_id}, Command: {pdv.is_command}, Last: {pdv.is_last}, Data Len: {len(pdv.data)}")
+                    if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
+                        if pdv.data:
+                             rsp_pdv = pdv
+                             break
+                        else:
+                             log.warning("  Found matching PDV, but its data field is empty after parsing.")
+                except AttributeError as e:
+                     # This shouldn't happen if parsing worked, but good to keep
+                     log.error(f"  AttributeError accessing manually parsed PDV fields: {e}. PDV was: {pdv.summary() if hasattr(pdv, 'summary') else pdv}")
 
             if rsp_pdv:
                 log.info("Found relevant PDV in response with data.")
-                # Validate the DIMSE status
                 if check_c_echo_rsp(rsp_pdv.data):
                     log.info("C-ECHO Response indicates SUCCESS!")
                     test_success = True
@@ -230,17 +259,12 @@ def main():
                     log.error("C-ECHO Response DIMSE status check failed (Status != Success or parse error).")
             else:
                  log.error("Did not find a suitable PDV (Command, Last, matching Context ID, with data) in the P-DATA-TF response.")
-                 # Test failed, finally block handles cleanup
 
         elif response_pdata.haslayer(A_ABORT):
-             # The peer aborted the association instead of responding normally
              log.error(f"Received A-ABORT from peer instead of P-DATA response:\n{response_pdata.show(dump=True)}")
-             # Test failed, session is already aborted/closed by peer logic? DICOMSession.close() will run anyway.
-             session.assoc_established = False # Ensure state reflects abort
+             session.assoc_established = False
         else:
-            # Received some other unexpected PDU type
             log.error(f"Received unexpected PDU type response: {response_pdata.summary()}\n{response_pdata.show(dump=True)}")
-            # Test failed, finally block handles cleanup
 
     except (socket.timeout) as timeout_err:
          log.error(f"Socket timeout during C-ECHO test: {timeout_err}")
