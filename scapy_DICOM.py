@@ -47,8 +47,21 @@ def _pad_ae_title(title):
     return title.ljust(16).encode('ascii')
 
 def _uid_to_bytes(uid):
-    """Encode UID string to bytes, handling potential trailing null byte."""
-    b_uid = uid.encode('ascii')
+    """Encode UID string to bytes, handling potential trailing null byte.
+       Also handles input that might already be bytes.
+    """
+    if isinstance(uid, bytes):
+        # If input is already bytes, just handle padding
+        b_uid = uid
+    elif isinstance(uid, str):
+        # If input is string, encode it
+        b_uid = uid.encode('ascii')
+    elif uid is None:
+        return b'' # Handle None input gracefully
+    else:
+        # Raise error for unexpected types
+        raise TypeError(f"Unsupported type for UID conversion: {type(uid)}")
+
     # DICOM UIDs may be padded with a single NULL byte (0x00) if their length is odd
     if len(b_uid) % 2 != 0:
         b_uid += b'\x00'
