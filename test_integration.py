@@ -214,12 +214,12 @@ def main():
 
         elif response_pdata.haslayer(A_ABORT):
              # The peer aborted the association instead of responding normally
-             log.error(f"Received A-ABORT from peer instead of P-DATA response:\n{response_pdata.show(dump=True, show_indent=False)}")
+             log.error(f"Received A-ABORT from peer instead of P-DATA response:\n{response_pdata.show(dump=True)}")
              # Test failed, session is already aborted/closed by peer logic? DICOMSession.close() will run anyway.
              session.assoc_established = False # Ensure state reflects abort
         else:
             # Received some other unexpected PDU type
-            log.error(f"Received unexpected PDU type response: {response_pdata.summary()}")
+            log.error(f"Received unexpected PDU type response: {response_pdata.summary()}\n{response_pdata.show(dump=True)}")
             # Test failed, finally block handles cleanup
 
     except (socket.timeout) as timeout_err:
