@@ -15,10 +15,9 @@ try:
         P_DATA_TF,
         A_ABORT,
         PresentationDataValueItem, 
-        parse_dimse_status
+        build_c_echo_rq_dimse,
     )
-    from scapy_DICOM import _uid_to_bytes
-    from scapy.packet import NoPayload, Raw
+    from scapy_DICOM import _uid_to_bytes, parse_dimse_status
 except ImportError:
     print("ERROR: Could not import from scapy_DICOM.py.")
     sys.exit(2)
@@ -27,39 +26,6 @@ except ImportError:
 log_format = '%(asctime)s - %(levelname)s - %(name)s - %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
 log = logging.getLogger("dicom_test")
-
-# --- Minimal DIMSE C-ECHO-RQ Builder ---
-# Creates C-ECHO RQ bytes using Implicit VR Little Endian
-def build_c_echo_rq_dimse(message_id=1):
-    """Builds raw bytes for a C-ECHO-RQ DIMSE command message using Implicit VR LE encoding."""
-    log.debug(f"Building C-ECHO-RQ DIMSE (Implicit VR LE) (Message ID: {message_id})")
-    # Build elements *before* calculating group length
-    elements_payload = b''
-    affected_sop_uid_bytes = _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)
-
-    # (0000,0002) Affected SOP Class UID - Tag(4), Len(4), Value(N)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0002) + struct.pack("<I", len(affected_sop_uid_bytes)) + affected_sop_uid_bytes
-
-    # (0000,0100) Command Field (C-ECHO-RQ = 0x0030) - Tag(4), Len(4)=2, Value(2)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0100) + struct.pack("<I", 2) + struct.pack("<H", 0x0030)
-
-    # (0000,0110) Message ID - Tag(4), Len(4)=2, Value(2)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0110) + struct.pack("<I", 2) + struct.pack("<H", message_id)
-
-    # (0000,0800) Command Data Set Type (0x0101 = No dataset) - Tag(4), Len(4)=2, Value(2)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0800) + struct.pack("<I", 2) + struct.pack("<H", 0x0101)
-
-    # Calculate group length (length of all elements built above)
-    cmd_group_len = len(elements_payload)
-
-    # (0000,0000) Command Group Length - Tag(4), Len(4)=4, Value(4)
-    group_length_element = struct.pack("<HH", 0x0000, 0x0000) + struct.pack("<I", 4) + struct.pack("<I", cmd_group_len)
-
-    # Prepend group length element to the other elements
-    dimse_command_set = group_length_element + elements_payload
-
-    log.debug(f"Built DIMSE Command Set (Implicit VR LE) (len={len(dimse_command_set)}): {dimse_command_set.hex()}")
-    return dimse_command_set
 
 
 def main():
