@@ -602,34 +602,58 @@ class DICOMSession:
         return False # Should not be reached if exceptions are raised
 
     def _build_presentation_contexts(self, requested_contexts):
-        """Build PresentationContextRQItems from a dict."""
+        """
+        Build PresentationContextRQItems from a dict and store mapping.
+        Uses manual byte packing for reliability with nested items.
+        """
         pc_items = []
-        current_context_id = self.next_context_id
+        self.requested_contexts_map = {} # Clear previous request map
+        current_context_id = self.next_context_id # Start with the next available odd ID
+
         for abstract_syntax, transfer_syntaxes in requested_contexts.items():
             if not isinstance(transfer_syntaxes, list):
                 transfer_syntaxes = [transfer_syntaxes]
+            if not transfer_syntaxes:
+                log.warning(f"No transfer syntaxes provided for {abstract_syntax}. Skipping context.")
+                continue
 
-            abs_syntax_item = AbstractSyntaxSubItem(abstract_syntax_uid=abstract_syntax)
-            trn_syntax_items = [TransferSyntaxSubItem(transfer_syntax_uid=ts) for ts in transfer_syntaxes]
+            # Store the request details before creating bytes
+            self.requested_contexts_map[current_context_id] = (abstract_syntax, transfer_syntaxes)
 
-            # Pack sub-items into the data field manually for PresentationContextRQItem
-            sub_items_bytes = bytes(abs_syntax_item) + b"".join(bytes(ts) for ts in trn_syntax_items)
-            data_len = 4 + len(sub_items_bytes)
+            # --- Create sub-item bytes DIRECTLY using helpers ---
+            # Abstract Syntax Sub-Item Bytes
+            abs_syntax_uid_bytes = _uid_to_bytes(abstract_syntax) # Use helper directly
+            abs_syntax_item_len = len(abs_syntax_uid_bytes)
+            # Format: Type(1) + Reserved(1) + Length(2) + Value(N)
+            abs_syntax_item_bytes_full = struct.pack("!BBH", 0x30, 0, abs_syntax_item_len) + abs_syntax_uid_bytes
 
-            pc_item_bytes = struct.pack("!BBH", 0x20, 0, data_len) # Type, Res, Len
-            pc_item_bytes += struct.pack("!BBBB", current_context_id, 0, 0, 0) # CtxID, Res, Res, Res
-            pc_item_bytes += sub_items_bytes
+            # Transfer Syntax Sub-Item Bytes
+            trn_syntax_items_bytes_full = b""
+            for ts in transfer_syntaxes:
+                ts_uid_bytes = _uid_to_bytes(ts) # Use helper directly
+                ts_item_len = len(ts_uid_bytes)
+                # Format: Type(1) + Reserved(1) + Length(2) + Value(N)
+                trn_syntax_items_bytes_full += struct.pack("!BBH", 0x40, 0, ts_item_len) + ts_uid_bytes
+            # --- End direct byte creation ---
 
-            # Create the packet object by parsing bytes (simpler than complex post_build)
-            # We use the generic DICOMVariableItem for this construction method
-            pc_item = DICOMVariableItem(pc_item_bytes)
+            # Combine sub-item bytes
+            sub_items_bytes = abs_syntax_item_bytes_full + trn_syntax_items_bytes_full
+
+            # Manually construct the 'data' part for the Presentation Context RQ item
+            # Data = Context ID (1) + Reserved (3) + Sub-items
+            pc_data_bytes = struct.pack("!BBBB", current_context_id, 0, 0, 0) + sub_items_bytes
+
+            # Create the Variable Item (Type 0x20) containing this raw data.
+            # Let DICOMVariableItem calculate its own length based on the data provided.
+            pc_item = DICOMVariableItem(item_type=0x20, data=pc_data_bytes)
             pc_items.append(pc_item)
 
             # Increment context ID (must be odd)
             current_context_id += 2
-        self.next_context_id = current_context_id # Update for next potential use
-        return pc_items
 
+        # Update the next ID to use for future associations (if any within the same session object)
+        self.next_context_id = current_context_id
+        return pc_items
 
     def _build_user_information(self, role_selection=None):
         """Build the UserInformationItem with standard sub-items."""
