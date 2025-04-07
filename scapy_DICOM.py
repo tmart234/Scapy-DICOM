@@ -658,7 +658,7 @@ class PresentationDataValueItem(Packet):
         value_payload = packed_fields + self.data
         pdv_value_len = len(value_payload)
         full_pdv_bytes = struct.pack("!I", pdv_value_len) + value_payload
-        log.debug(f"PDV build_bytes: ValueLen={pdv_value_len}. TotalBytes={len(full_pdv_bytes)}.") #: {full_pdv_bytes.hex('.')}") # Reduce log noise
+        log.debug(f"PDV build_bytes: ValueLen={pdv_value_len}. TotalBytes={len(full_pdv_bytes)}.")
         return full_pdv_bytes
 
     @staticmethod
@@ -743,28 +743,24 @@ class P_DATA_TF(Packet):
         Consume exactly the number of bytes specified by the DICOM UL length.
         """
         self.parsed_pdv_items = [] # Initialize for this instance
-        # Get total PDU payload length from the DICOM UL layer
-        # Default to length of s if underlayer or length is missing
         total_payload_len = getattr(self.underlayer, 'length', len(s))
         log.debug(f"P_DATA_TF.dissect_payload: Starting. UL length = {total_payload_len}. Available bytes = {len(s)}.")
 
         if total_payload_len > len(s):
-             log.warning(f"P_DATA_TF.dissect_payload: UL length {total_payload_len} > available bytes {len(s)}. Truncating.")
-             total_payload_len = len(s) # Adjust to available bytes
+             log.warning(f"P_DATA_TF.dissect_payload: UL length {total_payload_len} > available bytes {len(s)}. Processing available bytes.")
+             total_payload_len = len(s) # Process only what's available
 
         payload_bytes = s[:total_payload_len]
         remaining_s = s[total_payload_len:] # Bytes potentially for the next PDU
 
         offset = 0
-        parse_error = False
-        processed_bytes_count = 0
-
         while offset < len(payload_bytes):
             current_pdv_start_offset = offset
+            log.debug(f"  P_DATA_TF: Loop iteration, offset={offset}")
+
             if offset + 4 > len(payload_bytes):
-                log.warning(f"P-DATA-TF: Trailing bytes ({len(payload_bytes) - offset}) insufficient for PDV length field.")
-                parse_error = True
-                break
+                log.warning(f"  P_DATA_TF: Insufficient bytes remaining ({len(payload_bytes) - offset}) for PDV length field at offset {offset}.")
+                break # Cannot read length
 
             try:
                 pdv_value_len = struct.unpack("!I", payload_bytes[offset : offset + 4])[0]
@@ -774,52 +770,37 @@ class P_DATA_TF(Packet):
                 log.debug(f"  P_DATA_TF: PDV at offset {offset}. Declared value length={pdv_value_len}. Total item length={current_pdv_total_len}.")
 
                 if pdv_item_end_offset > len(payload_bytes):
-                    log.error(f"  P_DATA_TF: PDV item ends at {pdv_item_end_offset}, exceeding PDU payload length {len(payload_bytes)}.")
-                    parse_error = True
-                    break
+                    log.error(f"  P_DATA_TF: Calculated PDV end offset {pdv_item_end_offset} exceeds available payload bytes {len(payload_bytes)}.")
+                    break # Stop processing, remaining bytes will become Raw
 
                 pdv_full_bytes = payload_bytes[offset : pdv_item_end_offset]
+                log.debug(f"  P_DATA_TF: Attempting from_bytes on {len(pdv_full_bytes)} bytes.")
                 pdv_item_obj = PresentationDataValueItem.from_bytes(pdv_full_bytes)
+                log.debug(f"  P_DATA_TF: Result of from_bytes: {type(pdv_item_obj)}")
 
-                if pdv_item_obj:
+                if pdv_item_obj is not None: # Explicitly check for None
                     self.parsed_pdv_items.append(pdv_item_obj)
-                    log.debug(f"  P_DATA_TF: Successfully parsed PDV: {pdv_item_obj.summary()}")
-                    offset = pdv_item_end_offset # Advance offset
-                    processed_bytes_count += current_pdv_total_len
+                    log.debug(f"  P_DATA_TF: Successfully parsed and added PDV: {pdv_item_obj.summary()}")
+                    offset = pdv_item_end_offset # Advance offset *only on success*
                 else:
-                    log.warning(f"  P_DATA_TF: Failed to parse PDV item bytes at offset {current_pdv_start_offset}. Stopping dissection of this PDU.")
-                    parse_error = True
-                    break
+                    log.warning(f"  P_DATA_TF: from_bytes returned None for PDV at offset {current_pdv_start_offset}. Stopping dissection.")
+                    break # Stop processing this PDU
 
-            except struct.error as e:
-                 log.error(f"P-DATA-TF: Error unpacking PDV length at offset {offset}: {e}")
-                 parse_error = True
-                 break
             except Exception as e:
-                 log.error(f"P-DATA-TF: Unexpected error during PDV processing at offset {offset}: {e}", exc_info=True)
-                 parse_error = True
-                 break
+                 log.error(f"P-DATA-TF: Error during PDV processing at offset {offset}: {e}", exc_info=True)
+                 break # Stop processing this PDU on any exception
 
-        # Assign payload based on outcome
-        if parse_error:
-            # Unparsed portion of the *intended* payload becomes Raw
-            log.warning(f"P-DATA-TF: Assigning remaining {len(payload_bytes[offset:])} bytes of PDU payload as Raw due to parsing error.")
+        # Determine final payload after loop finishes or breaks
+        if offset < len(payload_bytes):
+            # Loop broke before processing all bytes declared by UL length
+            log.warning(f"P-DATA_TF: Assigning remaining {len(payload_bytes[offset:])} bytes of declared PDU payload as Raw.")
             self.payload = Raw(payload_bytes[offset:])
-            processed_bytes_count = offset # Only count bytes before the error
-        elif offset == len(payload_bytes):
-            # Successfully parsed everything up to the PDU length
-            self.payload = NoPayload()
-            processed_bytes_count = offset
         else:
-             # Should not happen if loop logic is correct, but handle defensively
-             log.error(f"P-DATA-TF: Dissection loop finished unexpectedly at offset {offset}/{len(payload_bytes)}.")
-             self.payload = Raw(payload_bytes[offset:])
-             processed_bytes_count = offset
+            # Successfully processed all bytes up to UL length
+            self.payload = NoPayload()
 
-        log.debug(f"P_DATA_TF.dissect_payload: Finished. Parsed {len(self.parsed_pdv_items)} items. Consumed {processed_bytes_count} bytes. Final payload type: {type(self.payload)}")
-
-        # Return the bytes that came *after* the declared PDU length
-        return remaining_s
+        log.debug(f"P_DATA_TF.dissect_payload: Finished. Parsed {len(self.parsed_pdv_items)} items. Consumed {offset} bytes. Final payload type: {type(self.payload)}")
+        return remaining_s # Return bytes *after* the PDU
 
 # --- Layer Binding ---
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
