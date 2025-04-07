@@ -622,43 +622,59 @@ class PresentationDataValueItem(Packet):
     """
     name = "PDV Item"
     fields_desc = [
-        # PDV Length: Length of the *following* fields (Context ID + Msg Hdr + Data)
-        IntField("length", None), # NETWORK BYTE ORDER (!I)
-        # --- Start of PDV Value (length bytes) ---
+        # Length field is handled entirely by pre_dissect/post_build
         ByteField("context_id", 0),
         ByteField("message_control_header", 0),
-        # The actual DIMSE message fragment (Command or Data Set)
-        # StrLenField should work if length is correct, but extract_padding gives control
+        # Data field length determined during dissection based on explicit length
         StrField("data", b""),
     ]
 
+    # Store the length read during dissection
+    pdv_value_len = 0
+
+    def pre_dissect(self, s):
+        """
+        Read the PDV Item Length from the raw bytes *before* Scapy tries
+        to dissect fields based on fields_desc. Store it and return the
+        rest of the bytes (the PDV value part) for dissection.
+        """
+        if len(s) < 4:
+            log.error("PDV pre_dissect: Not enough bytes for length field.")
+            return b'' # Return empty bytes to signal dissection failure
+        try:
+            # Store the length of the VALUE part (Context ID + Msg Hdr + Data)
+            self.pdv_value_len = struct.unpack("!I", s[:4])[0]
+            log.debug(f"PDV pre_dissect: Read PDV value length: {self.pdv_value_len}")
+            # Return the bytes *after* the length field for field dissection
+            return s[4:]
+        except struct.error as e:
+            log.error(f"PDV pre_dissect: Error unpacking length: {e}")
+            return b'' # Signal failure
+
     def extract_padding(self, s):
         """
-        Called after dissecting fixed fields. 's' contains the remaining bytes.
-        We use this to correctly extract the 'data' field based on pdv length.
+        Called after dissecting fixed fields (context_id, msg_hdr).
+        's' contains the remaining bytes *within the PDV value*.
+        We use the stored pdv_value_len to extract the correct data length.
         """
-        expected_data_len = 0
-        if self.length is not None:
-            # Data length = Total PDV Length - Context ID (1) - Msg Ctrl Hdr (1)
-            expected_data_len = self.length - 2
-        else:
-            # This can happen if the PDU is malformed or dissection fails upstream
-            log.warning("PDV Item length field is None during padding extraction.")
-            expected_data_len = len(s) # Consume rest if length unknown
+        # Fields already dissected: context_id (1), msg_hdr (1) = 2 bytes
+        # Calculate how many bytes SHOULD be data
+        expected_data_len = self.pdv_value_len - 2
+        expected_data_len = max(0, expected_data_len) # Ensure non-negative
 
-        # Ensure calculated length is not negative
-        expected_data_len = max(0, expected_data_len)
-
-        # Ensure we don't read past the end of available bytes 's'
+        # 's' contains the bytes potentially for 'data' and maybe padding beyond
         actual_data_len = min(expected_data_len, len(s))
 
         if actual_data_len < expected_data_len:
-             log.warning(f"PDV Item data is shorter ({actual_data_len} bytes) than expected ({expected_data_len} bytes based on length field {self.length}). Consuming available bytes.")
+             log.warning(f"PDV Item data is shorter ({actual_data_len} bytes) than expected ({expected_data_len} bytes based on PDV value length {self.pdv_value_len}). Consuming available bytes.")
 
         self.data = s[:actual_data_len]
-        # Return the remaining bytes (padding or next PDV item's start)
+        # Return the bytes *after* the consumed data, which should be padding
+        # or the start of the next PDV/PDU end. These are bytes that were
+        # part of the original PDV value but not part of the calculated data length.
         return s[actual_data_len:]
 
+    # --- is_last / is_command properties remain the same ---
     @property
     def is_last(self):
         return (self.message_control_header >> 1) & 0x01
@@ -675,19 +691,28 @@ class PresentationDataValueItem(Packet):
         else: self.message_control_header &= ~0x01
 
     def post_build(self, p, pay):
-        # Calculate PDV length if not provided
-        # p initially contains [context_id(1), msg_hdr(1), data(N)] based on fields_desc
-        # We need to prepend the length field (!I)
-        pdv_value_len = len(p) # Length of context_id + msg_hdr + data
-        p = struct.pack("!I", pdv_value_len) + p # Prepend length
-        return p + pay # Append outer payload if any
+        """
+        Calculate the length of the PDV value (fields in 'p') and
+        prepend the 4-byte length field.
+        'p' now contains [context_id(1), msg_hdr(1), data(N)]
+        """
+        pdv_value_len = len(p)
+        # Prepend length to the fields' bytes
+        p_with_len = struct.pack("!I", pdv_value_len) + p
+        # pdv_value_len should now be 70 for the C-ECHO RQ
+        # p should be [01][03][data(68)]
+        # p_with_len should be [00.00.00.46][01][03][data(68)]
+        log.debug(f"PDV post_build: Calculated value length: {pdv_value_len}. Final PDV item bytes (len={len(p_with_len)}): {p_with_len.hex('.')}")
+        return p_with_len + pay # Append outer payload if any
 
     def summary(self):
         cmd_data = "Command" if self.is_command else "Data"
         last = "Last" if self.is_last else "More"
         data_len = len(getattr(self, 'data', b''))
-        pdv_len_field = self.length if self.length is not None else "N/A"
-        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, LenField: {pdv_len_field}, DataLen: {data_len})"
+        # Use the stored value length if available after dissection
+        pdv_len_field_val = getattr(self, 'pdv_value_len', "N/A")
+        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, LenValue: {pdv_len_field_val}, DataLen: {data_len})"
+    
 class P_DATA_TF(Packet):
     """
     P-DATA-TF PDU (PS3.8 Section 9.3.5)
@@ -700,21 +725,9 @@ class P_DATA_TF(Packet):
     ]
 
     def post_build(self, p, pay):
-        """
-        Manually build the P-DATA-TF payload by concatenating
-        the bytes of each PDV item. This ensures each PDV item's
-        own post_build (which handles its length) is respected correctly.
-        'p' contains the fields defined in fields_desc (effectively empty here),
-        'pay' is the payload added externally (should be empty for P-DATA-TF).
-        """
         pdv_payload = b"".join(bytes(item) for item in self.pdv_items)
-
-        # The PDU length (calculated by DICOM.post_build) should be the length
-        # of this concatenated PDV payload.
-        # 'p' is initially empty because fields_desc is just the list.
-        # Return the concatenated bytes, let the DICOM layer add its header.
-        return pdv_payload + pay # Append outer payload if any (usually none)
-
+        log.debug(f"P_DATA_TF post_build: Concatenated PDV payload (len={len(pdv_payload)}): {pdv_payload.hex('.')}")
+        return pdv_payload + pay
 
     def dissect_payload(self, s):
         """
