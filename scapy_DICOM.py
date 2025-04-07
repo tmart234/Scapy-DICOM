@@ -26,6 +26,7 @@ from scapy.fields import (
 )
 from scapy.layers.inet import TCP
 from scapy.supersocket import StreamSocket
+from scapy.packet import NoPayload
 
 log = logging.getLogger("scapy.contrib.dicom")
 
