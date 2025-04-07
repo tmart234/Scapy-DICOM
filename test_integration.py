@@ -140,11 +140,20 @@ def main():
         pdv_to_send.is_command = True # Mark as DIMSE command
         pdv_to_send.is_last = True    # Mark as last fragment
 
+        # --- EXPLICITLY SET PDV LENGTH ---
+        # The PDV length field value is the length of the subsequent fields:
+        # context_id (1 byte) + message_control_header (1 byte) + data (N bytes)
+        pdv_value_len = 1 + 1 + len(pdv_to_send.data)
+        pdv_to_send.length = pdv_value_len
+        log.debug(f"Explicitly setting PDV Item length field to: {pdv_to_send.length}")
+        # --- END EXPLICIT SET ---
+
         # 5. Send the PDV Item via P-DATA-TF
         log.info(f"Sending C-ECHO-RQ (Message ID: {message_id}) on context {echo_ctx_id}...")
-        if not session.send_p_data(pdv_list=[pdv_to_send]):
+        # session.send_p_data expects a list of PDV items. We send just one here.
+        if not session.send_p_data(pdv_list=[pdv_to_send]): # Pass the modified pdv_to_send
             log.error("Failed to send C-ECHO-RQ P-DATA.")
-            # Abort/Close handled in 'finally'
+            # Exit if sending fails, finally block will handle cleanup
             sys.exit(1)
         log.info("C-ECHO-RQ sent successfully via P-DATA-TF.")
 
