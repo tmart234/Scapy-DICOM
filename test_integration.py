@@ -66,6 +66,14 @@ def main():
 
     test_success = False
     try:
+        status_map = {
+            0x0000: "Success", # Add success for completeness if needed elsewhere
+            0x0110: "Processing failure",
+            0x0112: "No such SOP Class",
+            0xA700: "Refused: Out of Resources",
+            0xA900: "Error: Data Set does not match SOP Class",
+            # Add more common C-ECHO statuses if needed
+        }
         # 1. Associate
         log.info("Attempting association...")
         if not session.associate(requested_contexts=verification_context):
@@ -136,23 +144,24 @@ def main():
             log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
             pdata_layer = response_pdata[P_DATA_TF]
 
-            # Check if the dissection populated pdv_items
-            if not pdata_layer.pdv_items:
-                log.error("P-DATA-TF received, but pdv_items list is empty after dissection.")
-                # Check for raw payload as a fallback indicator of dissection failure
+            # Check the new attribute where manually parsed items are stored
+            if not hasattr(pdata_layer, 'parsed_pdv_items') or not pdata_layer.parsed_pdv_items:
+                log.error("P-DATA-TF received, but parsed_pdv_items list is empty or missing after dissection.")
+                # Check for raw payload on P_DATA_TF itself as fallback
                 if isinstance(pdata_layer.payload, Raw) and pdata_layer.payload.load:
-                    log.warning(f"  P-DATA-TF payload contains raw bytes ({len(pdata_layer.payload.load)} bytes), indicating PDV dissection failed in the library.")
-                    log.warning(f"  Raw Payload Hex: {pdata_layer.payload.load.hex()}")
+                     log.warning(f"  P-DATA-TF payload contains raw bytes ({len(pdata_layer.payload.load)} bytes), possibly indicating dissection error before PDV parsing.")
+                     log.warning(f"  Raw Payload Hex: {pdata_layer.payload.load.hex()}")
                 elif not isinstance(pdata_layer.payload, NoPayload):
                      log.warning(f"  P-DATA-TF has unexpected payload type: {type(pdata_layer.payload)}")
                 sys.exit(1) # Fail the test if no PDVs were parsed
 
-            # --- Process the dissected PDV items ---
+            # --- Process the manually parsed PDV items ---
             rsp_processed = False
-            for pdv in pdata_layer.pdv_items:
-                # Check if it's a properly dissected PDV item (not Raw from failure)
+            # Iterate through the new list
+            for pdv in pdata_layer.parsed_pdv_items:
+                # Check if it's a properly parsed PDV item (not Raw from failure within the loop)
                 if not isinstance(pdv, PresentationDataValueItem):
-                    log.warning(f"Skipping non-PresentationDataValueItem found in pdv_items: {type(pdv)}")
+                    log.warning(f"Skipping non-PresentationDataValueItem found in parsed_pdv_items: {type(pdv)}")
                     if isinstance(pdv, Raw):
                         log.warning(f"  Raw Data Hex: {pdv.load.hex()}")
                     continue
@@ -160,12 +169,10 @@ def main():
                 log.info(f"  Processing PDV: Context={pdv.context_id}, Cmd={pdv.is_command}, Last={pdv.is_last}, DataLen={len(pdv.data)}")
 
                 # Check if this PDV matches our expectation for the C-ECHO-RSP
-                # It should be on the same context, be a command, and be the last fragment
                 if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
                     if pdv.data:
                         log.info("  Found relevant PDV. Parsing DIMSE status using library function...")
-                        # Use the imported parse_dimse_status function
-                        status = parse_dimse_status(pdv.data)
+                        status = parse_dimse_status(pdv.data) # Use the pdv.data attribute
 
                         if status is not None:
                             log.info(f"  Parsed DIMSE Status: 0x{status:04X}")
@@ -173,12 +180,7 @@ def main():
                                 log.info("  C-ECHO Response indicates SUCCESS!")
                                 test_success = True
                             else:
-                                # Log standard status codes if known, otherwise just hex
-                                status_map = {
-                                    0x0110: "Processing failure", 0x0112: "No such SOP Class",
-                                    0xA700: "Refused: Out of Resources", 0xA900: "Error: Data Set does not match SOP Class",
-                                    # Add more common C-ECHO statuses if needed
-                                }
+                                # ... (status code mapping remains the same) ...
                                 status_str = status_map.get(status, f"Unknown Status 0x{status:04X}")
                                 log.error(f"  C-ECHO Response DIMSE status indicates failure: {status_str} (0x{status:04X})")
                         else:
