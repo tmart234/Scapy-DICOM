@@ -14,11 +14,11 @@ try:
         DEFAULT_TRANSFER_SYNTAX_UID,
         P_DATA_TF,
         A_ABORT,
+        PresentationDataValueItem, 
     )
-    from scapy_DICOM import _uid_to_bytes # Import helper if needed
+    from scapy_DICOM import _uid_to_bytes
 except ImportError:
-    print("ERROR: Could not import DICOMSession from scapy_DICOM.py.")
-    print("Ensure scapy_DICOM.py is in the same directory or PYTHONPATH.")
+    print("ERROR: Could not import from scapy_DICOM.py.")
     sys.exit(2)
 
 # Configure logging for the test script
@@ -138,7 +138,7 @@ def main():
         log.info("Attempting association...")
         if not session.associate(requested_contexts=verification_context):
             log.error("Association failed.")
-            sys.exit(1)
+            sys.exit(1) # Exit if association fails
         log.info("Association established!")
 
         # 2. Prepare C-ECHO-RQ DIMSE Message
@@ -150,76 +150,105 @@ def main():
             if abs_syntax == VERIFICATION_SOP_CLASS_UID:
                  log.info(f"Found accepted context {ctx_id} for Verification ({trn_syntax})")
                  echo_ctx_id = ctx_id
-                 break
+                 break # Found the context, no need to check further
 
         if not echo_ctx_id:
             log.error("SCP did not accept the Presentation Context for Verification SOP Class.")
+            # No point continuing if we don't have the context
+            # The finally block will handle release/abort
             sys.exit(1)
 
-        # 4. Send C-ECHO-RQ via P-DATA-TF
+        # 4. Create the PresentationDataValueItem object for C-ECHO-RQ
+        # This object represents the data to be sent within a P-DATA-TF PDU.
+        pdv_to_send = PresentationDataValueItem(
+            context_id=echo_ctx_id,        # Which presentation context this data belongs to
+            data=dimse_command_bytes       # The actual DIMSE command bytes
+        )
+        # Set the flags within the PDV's message control header
+        pdv_to_send.is_command = True # Mark this data as a DIMSE command
+        pdv_to_send.is_last = True    # Mark this as the last (and only) fragment for this command
+
+        # 5. Send the PDV Item via P-DATA-TF using the session method
         log.info(f"Sending C-ECHO-RQ (Message ID: {message_id}) on context {echo_ctx_id}...")
-        if not session.send_p_data(context_id=echo_ctx_id, data=dimse_command_bytes, is_command=True, is_last=True):
+        # session.send_p_data expects a list of PDV items. We send just one here.
+        if not session.send_p_data(pdv_list=[pdv_to_send]):
             log.error("Failed to send C-ECHO-RQ P-DATA.")
+            # Exit if sending fails, finally block will handle cleanup
             sys.exit(1)
         log.info("C-ECHO-RQ sent successfully via P-DATA-TF.")
 
-        # 5. Wait for C-ECHO-RSP via P-DATA-TF
+        # 6. Wait for C-ECHO-RSP via P-DATA-TF
         log.info("Waiting for C-ECHO response...")
-        response_pdata = session.stream.recv() # Use the stream associated with the session
+        # Use the stream socket associated with the session to receive the response
+        response_pdata = session.stream.recv()
 
         if not response_pdata:
-            log.error("No response received from SCP after sending C-ECHO-RQ.")
-            sys.exit(1)
+            log.error("No response received from SCP after sending C-ECHO-RQ (connection likely closed).")
+            sys.exit(1) # Exit, finally block handles cleanup
 
         log.debug(f"Received response packet:\n{response_pdata.show(dump=True, show_indent=False)}")
 
+        # 7. Process the response
         if response_pdata.haslayer(P_DATA_TF):
             log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
-            # Basic validation: Check if it contains a PDV for the correct context
+            # Check the received PDV(s)
             rsp_pdv = None
             for pdv in response_pdata[P_DATA_TF].pdv_items:
                 log.info(f"  PDV Context: {pdv.context_id}, Command: {pdv.is_command}, Last: {pdv.is_last}, Data Len: {len(pdv.data)}")
+                # Check if this PDV matches our expectation for a C-ECHO response
                 if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
                     rsp_pdv = pdv
                     break # Found the likely response PDV
 
             if rsp_pdv:
                 log.info("Found relevant PDV in response.")
-                # Validate the DIMSE status
+                # Validate the DIMSE status within the received data
                 if check_c_echo_rsp(rsp_pdv.data):
                     log.info("C-ECHO Response indicates SUCCESS!")
-                    test_success = True
+                    test_success = True # Mark the test as successful
                 else:
                     log.error("C-ECHO Response DIMSE status check failed (Status != Success or parse error).")
+                    # Test failed, finally block handles cleanup
             else:
                  log.error("Did not find a suitable PDV (Command, Last, matching Context ID) in the P-DATA-TF response.")
+                 # Test failed, finally block handles cleanup
 
         elif response_pdata.haslayer(A_ABORT):
+             # The peer aborted the association instead of responding normally
              log.error(f"Received A-ABORT from peer instead of P-DATA response:\n{response_pdata.show(dump=True, show_indent=False)}")
+             # Test failed, session is already aborted/closed by peer logic? DICOMSession.close() will run anyway.
+             session.assoc_established = False # Ensure state reflects abort
         else:
+            # Received some other unexpected PDU type
             log.error(f"Received unexpected PDU type response: {response_pdata.summary()}")
+            # Test failed, finally block handles cleanup
 
-    except (socket.timeout):
-         log.error("Socket timeout during C-ECHO test.")
-         sys.exit(1)
+    except (socket.timeout) as timeout_err:
+         log.error(f"Socket timeout during C-ECHO test: {timeout_err}")
+         sys.exit(1) # Exit, finally block handles cleanup
     except (socket.error, ConnectionRefusedError, ConnectionResetError, BrokenPipeError) as sock_err:
         log.error(f"Socket error during test: {sock_err}")
-        sys.exit(1)
+        sys.exit(1) # Exit, finally block handles cleanup
     except Exception as e:
         log.exception(f"An unexpected error occurred: {e}") # Log stack trace
-        sys.exit(1)
+        sys.exit(1) # Exit, finally block handles cleanup
     finally:
+        # This block always runs, ensuring cleanup happens regardless of success or failure
+        log.debug("Entering finally block for cleanup...")
         # 6. Release Association (or Abort if needed)
-        if session.assoc_established:
+        if session and session.assoc_established:
             log.info("Releasing association...")
             if not session.release():
-                 log.warning("Association release failed or timed out. Aborting.")
-                 session.abort() # Attempt abort if release fails cleanly
-        elif session.stream: # If connection exists but not associated
+                 log.warning("Association release failed or timed out. Aborting instead.")
+                 # session.release() calls abort() internally on failure/timeout
+                 # but we call it again just to be sure connection is closed.
+                 session.abort()
+        elif session and session.stream: # If connection exists but not associated (e.g., associate failed, or release failed badly)
              log.info("Aborting connection (was not associated or release failed).")
              session.abort()
         else:
              log.info("No active association or connection to release/abort.")
+        log.debug("Cleanup finished.")
 
     # --- Final Verdict ---
     if test_success:
