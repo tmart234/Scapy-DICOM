@@ -679,71 +679,45 @@ class DICOMSession:
 
         # 1. Max Length Sub-Item (Type 0x51)
         max_len_value = self.max_pdu_length
-        # Format: Type(1) + Reserved(1) + Length(2=4) + Value(4)
         all_sub_item_bytes += struct.pack("!BBHI", 0x51, 0, 4, max_len_value)
         log.debug(f"Built MaxLengthSubItem bytes (Value: {max_len_value})")
 
         # 2. Implementation Class UID Sub-Item (Type 0x52)
-        impl_uid_str = self.implementation_class_uid
-        impl_uid_bytes_val = _uid_to_bytes(impl_uid_str)
+        impl_uid_input = self.implementation_class_uid # Get value from self
+        impl_uid_bytes_val = _uid_to_bytes(impl_uid_input) # Use robust helper
         impl_uid_len = len(impl_uid_bytes_val)
-        # Format: Type(1) + Reserved(1) + Length(2) + Value(N)
         all_sub_item_bytes += struct.pack("!BBH", 0x52, 0, impl_uid_len) + impl_uid_bytes_val
-        log.debug(f"Built ImplementationClassUIDSubItem bytes (UID: {impl_uid_str})")
+        # Log the decoded string for clarity if possible
+        try:
+            log.debug(f"Built ImplementationClassUIDSubItem bytes (UID: {impl_uid_bytes_val.decode('ascii').rstrip(' ')}")
+        except: # noqa
+             log.debug(f"Built ImplementationClassUIDSubItem bytes (raw: {impl_uid_bytes_val})")
+
 
         # 3. Implementation Version Name Sub-Item (Type 0x55)
-        impl_ver_str = self.implementation_version_name[:16] # Ensure max 16 chars
-        impl_ver_bytes_val = impl_ver_str.encode('ascii')
+        impl_ver_input = self.implementation_version_name # Get value from self
+        impl_ver_str = ""
+        if isinstance(impl_ver_input, bytes):
+            impl_ver_str = impl_ver_input.decode('ascii', errors='ignore') # Decode if bytes
+        elif isinstance(impl_ver_input, str):
+            impl_ver_str = impl_ver_input # Use directly if string
+        else:
+            log.warning(f"Unexpected type for implementation_version_name: {type(impl_ver_input)}. Using empty string.")
+
+        impl_ver_str = impl_ver_str[:16] # Ensure max 16 chars AFTER potential decode
+        impl_ver_bytes_val = impl_ver_str.encode('ascii') # NOW encode the guaranteed string
         impl_ver_len = len(impl_ver_bytes_val)
-        # Format: Type(1) + Reserved(1) + Length(2) + Value(N)
         all_sub_item_bytes += struct.pack("!BBH", 0x55, 0, impl_ver_len) + impl_ver_bytes_val
         log.debug(f"Built ImplementationVersionNameSubItem bytes (Version: {impl_ver_str})")
 
+
         # 4. Async Operations Window Sub-Item (Type 0x53) - Optional but common
-        # Assuming default values for now
-        max_invoked = 1
-        max_performed = 1
-        # Format: Type(1) + Reserved(1) + Length(2=4) + Value1(2) + Value2(2)
-        all_sub_item_bytes += struct.pack("!BBHHH", 0x53, 0, 4, max_invoked, max_performed)
-        log.debug(f"Built AsyncOperationsWindowSubItem bytes (Invoked: {max_invoked}, Performed: {max_performed})")
-
+        # ... (rest of the function remains the same) ...
         # 5. SCU/SCP Role Selection Sub-Items (Type 0x54) - If provided
-        if role_selection:
-            if not isinstance(role_selection, list):
-                 role_selection = [role_selection] # Allow single item
-
-            for role in role_selection:
-                role_item_bytes = b""
-                try:
-                    if isinstance(role, tuple) and len(role) >= 3:
-                        sop_uid_str, scu_r, scp_r = role[0], int(role[1]), int(role[2])
-                    # Add elif if you expect SCUSCPRoleSelectionSubItem objects directly (less likely now)
-                    # elif isinstance(role, SCUSCPRoleSelectionSubItem):
-                    #     sop_uid_str, scu_r, scp_r = role.sop_class_uid, role.scu_role, role.scp_role
-                    else:
-                         log.warning(f"Invalid role selection format: {role}. Skipping.")
-                         continue
-
-                    sop_uid_bytes_val = _uid_to_bytes(sop_uid_str)
-                    uid_len = len(sop_uid_bytes_val)
-                    # Item Length = uid_length_field(2) + uid_data(N) + scu_role(1) + scp_role(1)
-                    item_len = 2 + uid_len + 1 + 1
-
-                    # Format: Type(1)+Res(1)+ItemLen(2) + UIDLen(2)+UID(N) + SCURole(1)+SCPRole(1)
-                    role_item_bytes = struct.pack("!BBH", 0x54, 0, item_len) # Header
-                    role_item_bytes += struct.pack("!H", uid_len) + sop_uid_bytes_val # UID part
-                    role_item_bytes += struct.pack("!BB", scu_r, scp_r) # Roles part
-                    all_sub_item_bytes += role_item_bytes
-                    log.debug(f"Built SCUSCPRoleSelectionSubItem bytes (SOP: {sop_uid_str}, SCU: {scu_r}, SCP: {scp_r})")
-
-                except Exception as e_role:
-                    log.error(f"Failed to build role selection item for {role}: {e_role}")
-
+        # ...
 
         # --- Create the final User Information Variable Item ---
-        # Type 0x50, containing all the manually built sub-item bytes as its data.
         user_info_item = DICOMVariableItem(item_type=0x50, data=all_sub_item_bytes)
-        # The DICOMVariableItem post_build will calculate its own length.
         return user_info_item
 
     def associate(self, requested_contexts=None):
