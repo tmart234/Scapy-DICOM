@@ -17,6 +17,7 @@ try:
         PresentationDataValueItem, 
     )
     from scapy_DICOM import _uid_to_bytes
+    from scapy.packet import NoPayload
 except ImportError:
     print("ERROR: Could not import from scapy_DICOM.py.")
     sys.exit(2)
