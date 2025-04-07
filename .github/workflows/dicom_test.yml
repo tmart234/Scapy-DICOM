@@ -52,13 +52,14 @@ jobs:
           echo "Checking if Orthanc container is running..."
           docker ps --filter name=orthanc-scp-test
 
-      - name: Run DICOM Integration Test Script
+      - name: Run DICOM Integration Test Script against Orthanc
         run: |
           python test_integration.py \
-            --ip 127.0.0.1 \
-            --port 11112 \
-            --ae-title STORESCP \
-            --calling-ae SCAPY_CI_SCU
+              --ip 127.0.0.1 \
+              --port 4242 \
+              --ae-title ORTHANC_CI \
+              --calling-ae SCAPY_CI_SCU \
+              --debug
 
       - name: Show SCP Logs on Failure
         if: failure()
