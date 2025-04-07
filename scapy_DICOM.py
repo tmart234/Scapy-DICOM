@@ -732,7 +732,7 @@ class P_DATA_TF(Packet):
     def dissect_payload(self, s):
         """
         Manually dissect PDV items from the payload bytes 's'
-        using their explicit length field. (Existing logic is likely correct)
+        using their explicit length field.
         """
         items = []
         # Get total length from the DICOM UL layer if possible
@@ -747,47 +747,50 @@ class P_DATA_TF(Packet):
             if offset + 4 > len(payload_bytes):
                 if len(payload_bytes) - offset > 0:
                      log.warning(f"P-DATA-TF: Trailing bytes ({len(payload_bytes) - offset}) found, insufficient for PDV length field.")
-                     # Add leftover bytes within the PDU length to remaining_bytes
                      remaining_bytes = payload_bytes[offset:] + remaining_bytes
                 else:
                      log.debug("P-DATA-TF: Dissection complete, no trailing bytes within PDU length.")
                 break # Stop processing this PDU's payload
 
             # Read the PDV item's length (4 bytes, Network Byte Order)
-            pdv_value_len = struct.unpack("!I", payload_bytes[offset:offset+4])[0]
-            pdv_item_start_offset = offset + 4 # Start of Context ID
-            pdv_item_end_offset = pdv_item_start_offset + pdv_value_len # End of PDV data for *this* item
+            # This length is for the *value* part (Context ID + Msg Hdr + Data)
+            try:
+                pdv_value_len = struct.unpack("!I", payload_bytes[offset:offset+4])[0]
+            except struct.error as e:
+                 log.error(f"P-DATA-TF: Error unpacking PDV length at offset {offset}: {e}")
+                 remaining_bytes = payload_bytes[offset:] + remaining_bytes
+                 break # Stop processing
 
             # Calculate the total length of this PDV item (Length field + Value part)
             current_pdv_total_len = 4 + pdv_value_len
+            pdv_item_end_offset = offset + current_pdv_total_len # End offset for the *complete* item
 
-            log.debug(f"  PDV Item at offset {offset}: Declared value length={pdv_value_len}. Item should end at {pdv_item_end_offset} (relative to payload start).")
+            log.debug(f"  PDV Item at offset {offset}: Declared value length={pdv_value_len}. Total item length={current_pdv_total_len}. Item should end at {pdv_item_end_offset}.")
 
-            # Check if the calculated end offset exceeds the PDU payload bytes
+            # Check if the *full* item exceeds the PDU payload bytes
             if pdv_item_end_offset > len(payload_bytes):
-                log.error(f"P-DATA-TF: PDV item declared length ({pdv_value_len}) exceeds remaining PDU data ({len(payload_bytes) - pdv_item_start_offset} bytes available starting from context ID).")
-                # Store the problematic segment (including its length field) as Raw payload
-                # Combine with any bytes that might be *after* the declared PDU length
-                self.payload = Raw(payload_bytes[offset:] + remaining_bytes)
-                return # Stop dissection on error
+                log.error(f"P-DATA-TF: PDV item total length ({current_pdv_total_len}) exceeds remaining PDU data ({len(payload_bytes) - offset} bytes available).")
+                remaining_bytes = payload_bytes[offset:] + remaining_bytes
+                break # Stop processing
 
             # Extract the full bytes for this PDV item (its Length field + its Value part)
-            pdv_full_bytes = payload_bytes[offset:pdv_item_end_offset]
+            pdv_full_bytes = payload_bytes[offset : pdv_item_end_offset] # Use end offset of full item
 
             try:
+                # Dissect these bytes using the PresentationDataValueItem class
                 pdv_item = PresentationDataValueItem(pdv_full_bytes)
-                # Consistency check remains useful
-                if len(bytes(pdv_item)) != current_pdv_total_len:
-                    log.warning(f"PDV item dissection consumed {len(bytes(pdv_item))} bytes, but expected {current_pdv_total_len} bytes based on length field.")
+                # Add the dissected item
                 items.append(pdv_item)
                 log.debug(f"  Successfully dissected: {pdv_item.summary()}")
             except Exception as e:
-                log.error(f"Failed to dissect PDV item bytes ({len(pdv_full_bytes)} bytes starting at offset {offset}): {e}")
-                log.debug(f"PDV raw bytes: {pdv_full_bytes.hex()}")
+                # Catch exceptions during PresentationDataValueItem instantiation/dissection
+                log.error(f"Failed to dissect PDV item bytes ({len(pdv_full_bytes)} bytes starting at offset {offset}): {e}", exc_info=True) # Log traceback
+                log.debug(f"PDV raw bytes: {pdv_full_bytes.hex('.')}")
+                # Add the problematic segment as Raw data to avoid losing it
                 items.append(Raw(pdv_full_bytes))
 
             # Move offset to the beginning of the next PDV item
-            offset = pdv_item_end_offset
+            offset = pdv_item_end_offset # Move by the total length of the consumed item
 
         self.pdv_items = items # Assign the list of dissected items (or Raw chunks)
         # Assign any remaining bytes *after* the PDU length as payload
