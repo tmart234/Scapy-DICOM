@@ -60,79 +60,6 @@ def build_c_echo_rq_dimse(message_id=1):
     log.debug(f"Built DIMSE Command Set (Implicit VR LE) (len={len(dimse_command_set)}): {dimse_command_set.hex()}")
     return dimse_command_set
 
-# --- Minimal DIMSE C-ECHO-RSP Parser ---
-def check_c_echo_rsp(dimse_bytes):
-    """Checks for Success status (0x0000) in an Implicit VR LE DIMSE response."""
-    try:
-        offset = 0
-        log.debug(f"Checking DIMSE RSP (Implicit VR LE) (Len={len(dimse_bytes)}): {dimse_bytes.hex()}")
-        if len(dimse_bytes) < 8: # Need at least tag + len
-            log.warning("DIMSE response too short for Tag+Length.")
-            return False
-
-        # --- Response structure ---
-        # Command Group Length (0000,0000) UL 4 value=??
-        # Affected SOP Class UID (0000,0002) UI ?? value=?? (Optional in RSP)
-        # Command Field (0000,0100) US 2 value=0x8030 (RSP)
-        # Message ID Being Responded To (0000,0120) US 2 value=??
-        # Command Data Set Type (0000,0800) US 2 value=0x0101
-        # Status (0000,0900) US 2 value=0x0000 (Success)
-        # Optional fields (Error Comment, etc.)
-
-        # Read Command Group Length element (Tag + 4-byte Length)
-        tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset+4])
-        value_len = struct.unpack("<I", dimse_bytes[offset+4:offset+8])[0]
-        offset += 8 # Skip Tag and Len
-        log.debug(f"  Tag: (0000,0000), Len: 4, Value (GroupLen): {value_len}")
-        offset += value_len # Skip Group Length Value itself (we don't use it)
-
-        status_found = False
-        success_status = False
-        while offset < len(dimse_bytes):
-            if offset + 8 > len(dimse_bytes):
-                 log.warning(f"Truncated element header at offset {offset}.")
-                 break
-
-            # Read Tag (4 bytes) + Length (4 bytes) for Implicit VR
-            tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset+4])
-            value_len = struct.unpack("<I", dimse_bytes[offset+4:offset+8])[0]
-            data_offset = offset + 8
-            next_element_offset = data_offset + value_len
-
-            log.debug(f"  Tag: ({tag_group:04X},{tag_elem:04X}), Len: {value_len}, Data Offset: {data_offset}")
-
-            if next_element_offset > len(dimse_bytes):
-                log.warning(f"Element ({tag_group:04X},{tag_elem:04X}) length ({value_len}) exceeds available data ({len(dimse_bytes) - data_offset} left).")
-                break
-
-            if tag_group == 0x0000 and tag_elem == 0x0900: # Status tag
-                status_found = True
-                if value_len == 2: # Status is US (2 bytes)
-                    status_bytes = dimse_bytes[data_offset:next_element_offset]
-                    status = struct.unpack("<H", status_bytes)[0]
-                    log.info(f"Parsed Status (0000,0900): 0x{status:04X}")
-                    success_status = (status == 0x0000)
-                    break # Found status, no need to parse further for this check
-                else:
-                    log.warning(f"Status tag (0000,0900) found but value length is {value_len}, expected 2.")
-                    break # Treat unexpected length as failure
-
-            # Move to next element
-            offset = next_element_offset
-
-        if not status_found:
-            log.warning("Status tag (0000,0900) not found in response DIMSE.")
-
-        return success_status # Return True only if Success status was found
-
-    except struct.error as e:
-        log.error(f"Struct unpack error parsing DIMSE response: {e}")
-        log.error(f"DIMSE Data near offset {offset}: {dimse_bytes[max(0,offset-4):offset+12].hex()}")
-        return False
-    except Exception as e:
-        log.exception(f"Unexpected error parsing DIMSE response: {e}")
-        log.error(f"DIMSE Data: {dimse_bytes.hex()}")
-        return False
 
 def main():
     parser = argparse.ArgumentParser(description="DICOM C-ECHO Integration Test using Scapy")
@@ -162,7 +89,7 @@ def main():
         dst_port=scp_port,
         dst_ae=scp_ae,
         src_ae=my_ae,
-        read_timeout=15 # Reasonably short timeout for CI
+        read_timeout=20 #
     )
 
     # --- Define Context for Verification SOP Class ---
@@ -176,7 +103,8 @@ def main():
         log.info("Attempting association...")
         if not session.associate(requested_contexts=verification_context):
             log.error("Association failed.")
-            sys.exit(1) # Exit if association fails
+            # Abort/Close is handled in 'finally' block
+            sys.exit(1)
         log.info("Association established!")
 
         # 2. Prepare C-ECHO-RQ DIMSE Message
@@ -184,158 +112,156 @@ def main():
 
         # 3. Find accepted context ID for Verification
         echo_ctx_id = None
+        accepted_ts = None
         for ctx_id, (abs_syntax, trn_syntax) in session.accepted_contexts.items():
             if abs_syntax == VERIFICATION_SOP_CLASS_UID:
                  log.info(f"Found accepted context {ctx_id} for Verification ({trn_syntax})")
                  echo_ctx_id = ctx_id
-                 break # Found the context, no need to check further
+                 accepted_ts = trn_syntax # Store the accepted transfer syntax
+                 break
 
         if not echo_ctx_id:
             log.error("SCP did not accept the Presentation Context for Verification SOP Class.")
-            # No point continuing if we don't have the context
-            # The finally block will handle release/abort
+            # Abort/Close handled in 'finally'
             sys.exit(1)
 
-        # 4. Create the PresentationDataValueItem object for C-ECHO-RQ
-        # This object represents the data to be sent within a P-DATA-TF PDU.
-        pdv_to_send = PresentationDataValueItem(
-            context_id=echo_ctx_id,        # Which presentation context this data belongs to
-            data=dimse_command_bytes       # The actual DIMSE command bytes
-        )
-        # Set the flags within the PDV's message control header
-        pdv_to_send.is_command = True # Mark this data as a DIMSE command
-        pdv_to_send.is_last = True    # Mark this as the last (and only) fragment for this command
+        # Optional: Check if the accepted transfer syntax is the one we wanted (Implicit VR LE)
+        if accepted_ts != DEFAULT_TRANSFER_SYNTAX_UID:
+            log.warning(f"Accepted Transfer Syntax ({accepted_ts}) differs from requested default ({DEFAULT_TRANSFER_SYNTAX_UID}). DIMSE parsing might fail if not Implicit VR LE.")
+            # For this test, we assume the SCP accepts Implicit VR LE if it accepts the context.
+            # A more robust test might try negotiating Explicit VR LE as well.
 
-        # 5. Send the PDV Item via P-DATA-TF using the session method
+        # 4. Create the PresentationDataValueItem object for C-ECHO-RQ
+        pdv_to_send = PresentationDataValueItem(
+            context_id=echo_ctx_id,
+            data=dimse_command_bytes
+        )
+        pdv_to_send.is_command = True # Mark as DIMSE command
+        pdv_to_send.is_last = True    # Mark as last fragment
+
+        # 5. Send the PDV Item via P-DATA-TF
         log.info(f"Sending C-ECHO-RQ (Message ID: {message_id}) on context {echo_ctx_id}...")
-        # session.send_p_data expects a list of PDV items. We send just one here.
         if not session.send_p_data(pdv_list=[pdv_to_send]):
             log.error("Failed to send C-ECHO-RQ P-DATA.")
-            # Exit if sending fails, finally block will handle cleanup
+            # Abort/Close handled in 'finally'
             sys.exit(1)
         log.info("C-ECHO-RQ sent successfully via P-DATA-TF.")
 
         # 6. Wait for response
         log.info("Waiting for C-ECHO response...")
-        response_pdata = session.stream.recv()
+        response_pdata = session.stream.recv() # DICOMSession stream uses DICOM class for dissection
 
         if not response_pdata:
-            log.error("No response received from SCP after sending C-ECHO-RQ (connection likely closed).")
+            log.error("No response received from SCP after sending C-ECHO-RQ (timeout or connection closed).")
             sys.exit(1)
 
-        log.debug(f"Received response packet:\n{response_pdata.show(dump=True)}")
+        log.debug(f"Received response packet type: {type(response_pdata)}")
+        response_pdata.show() # Show summary
+        # log.debug(f"Received response packet details:\n{response_pdata.show(dump=True)}") # More verbose
 
-        # 7. Process the response
+        # 7. Process the response using the library's dissection
         if response_pdata.haslayer(P_DATA_TF):
             log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
+            pdata_layer = response_pdata[P_DATA_TF]
 
-            # +++ RESTORED MANUAL PARSING of PDV Items +++
-            pdv_items_list = []
-            pdata_payload_bytes = b''
-            pdata_tf_layer = response_pdata[P_DATA_TF]
+            # Check if the dissection populated pdv_items
+            if not pdata_layer.pdv_items:
+                log.error("P-DATA-TF received, but pdv_items list is empty after dissection.")
+                # Check for raw payload as a fallback indicator of dissection failure
+                if isinstance(pdata_layer.payload, Raw) and pdata_layer.payload.load:
+                    log.warning(f"  P-DATA-TF payload contains raw bytes ({len(pdata_layer.payload.load)} bytes), indicating PDV dissection failed in the library.")
+                    log.warning(f"  Raw Payload Hex: {pdata_layer.payload.load.hex()}")
+                elif not isinstance(pdata_layer.payload, NoPayload):
+                     log.warning(f"  P-DATA-TF has unexpected payload type: {type(pdata_layer.payload)}")
+                sys.exit(1) # Fail the test if no PDVs were parsed
 
-            # --- Revised Byte Extraction Logic ---
-            # Check if pdv_items field contains a Raw layer list element
-            if pdata_tf_layer.pdv_items and isinstance(pdata_tf_layer.pdv_items[0], Raw):
-                log.debug("Extracting P-DATA payload from Raw layer inside pdv_items list.")
-                # Assume all bytes are in the first Raw element if dissection failed this way
-                pdata_payload_bytes = bytes(pdata_tf_layer.pdv_items[0].load)
-            # Fallback: Check the generic payload attribute (might hold Raw)
-            elif hasattr(pdata_tf_layer.payload, 'load') and isinstance(pdata_tf_layer.payload.load, (bytes, bytearray)):
-                log.debug("Extracting P-DATA payload from Raw layer in generic payload.")
-                pdata_payload_bytes = bytes(pdata_tf_layer.payload.load)
-            # Fallback: Check if payload is bytes directly
-            elif isinstance(pdata_tf_layer.payload, (bytes, bytearray)):
-                log.debug("Extracting P-DATA payload from direct bytes payload.")
-                pdata_payload_bytes = bytes(pdata_tf_layer.payload)
-            elif not isinstance(pdata_tf_layer.payload, NoPayload):
-                 try:
-                     log.warning(f"Attempting byte conversion from unexpected P_DATA_TF payload type {type(pdata_tf_layer.payload)}.")
-                     pdata_payload_bytes = bytes(pdata_tf_layer.payload)
-                 except Exception:
-                     log.warning(f"Could not get bytes from unexpected P_DATA_TF payload type {type(pdata_tf_layer.payload)}.")
-            # --- End Revised Logic ---
+            # --- Process the dissected PDV items ---
+            rsp_processed = False
+            for pdv in pdata_layer.pdv_items:
+                # Check if it's a properly dissected PDV item (not Raw from failure)
+                if not isinstance(pdv, PresentationDataValueItem):
+                    log.warning(f"Skipping non-PresentationDataValueItem found in pdv_items: {type(pdv)}")
+                    if isinstance(pdv, Raw):
+                        log.warning(f"  Raw Data Hex: {pdv.load.hex()}")
+                    continue
 
-            if not pdata_payload_bytes:
-                 log.error("Failed to extract raw payload bytes for P-DATA-TF.")
-            else:
-                log.debug(f"Manually parsing {len(pdata_payload_bytes)} bytes of P-DATA payload.")
-                offset = 0
-                total_len = len(pdata_payload_bytes)
-                while offset < total_len:
-                    if offset + 4 > total_len: break
-                    pdv_len = struct.unpack("!I", pdata_payload_bytes[offset:offset+4])[0]
-                    pdv_item_start_offset = offset + 4
-                    pdv_item_end_offset = pdv_item_start_offset + pdv_len
-                    if pdv_item_end_offset > total_len: break
+                log.info(f"  Processing PDV: Context={pdv.context_id}, Cmd={pdv.is_command}, Last={pdv.is_last}, DataLen={len(pdv.data)}")
 
-                    full_pdv_bytes_for_dissection = pdata_payload_bytes[offset:pdv_item_end_offset]
-                    try:
-                        parsed_pdv = PresentationDataValueItem(full_pdv_bytes_for_dissection)
-                        log.debug(f"Successfully parsed PDV item: {parsed_pdv.summary()}")
-                        pdv_items_list.append(parsed_pdv)
-                    except Exception as e_pdv_parse:
-                        log.error(f"Failed to parse extracted PDV item bytes: {e_pdv_parse}")
-                    offset = pdv_item_end_offset
-            # +++ END RESTORED MANUAL PARSING +++
+                # Check if this PDV matches our expectation for the C-ECHO-RSP
+                # It should be on the same context, be a command, and be the last fragment
+                if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
+                    if pdv.data:
+                        log.info("  Found relevant PDV. Parsing DIMSE status using library function...")
+                        # Use the imported parse_dimse_status function
+                        status = parse_dimse_status(pdv.data)
 
-            # Now iterate through the MANUALLY parsed list
-            rsp_pdv = None
-            for pdv in pdv_items_list: # Iterate parsed list
-                try:
-                    # Access fields directly on the parsed object
-                    log.info(f"  PDV Context: {pdv.context_id}, Command: {pdv.is_command}, Last: {pdv.is_last}, Data Len: {len(pdv.data)}")
-                    if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
-                        if pdv.data:
-                             rsp_pdv = pdv
-                             break
+                        if status is not None:
+                            log.info(f"  Parsed DIMSE Status: 0x{status:04X}")
+                            if status == 0x0000:
+                                log.info("  C-ECHO Response indicates SUCCESS!")
+                                test_success = True
+                            else:
+                                # Log standard status codes if known, otherwise just hex
+                                status_map = {
+                                    0x0110: "Processing failure", 0x0112: "No such SOP Class",
+                                    0xA700: "Refused: Out of Resources", 0xA900: "Error: Data Set does not match SOP Class",
+                                    # Add more common C-ECHO statuses if needed
+                                }
+                                status_str = status_map.get(status, f"Unknown Status 0x{status:04X}")
+                                log.error(f"  C-ECHO Response DIMSE status indicates failure: {status_str} (0x{status:04X})")
                         else:
-                             log.warning("  Found matching PDV, but its data field is empty after parsing.")
-                except AttributeError as e:
-                     log.error(f"  AttributeError accessing manually parsed PDV fields: {e}. PDV was: {pdv.summary() if hasattr(pdv, 'summary') else pdv}")
+                            log.error("  Failed to parse DIMSE status from response PDV data using library function.")
+                            log.debug(f"  PDV DIMSE Data Hex: {pdv.data.hex()}")
+                    else:
+                        log.warning("  Found matching PDV, but its data field is empty.")
 
-            if rsp_pdv:
-                log.info("Found relevant PDV in response with data.")
-                # Validate the DIMSE status using the CORRECTED Implicit VR parser
-                if check_c_echo_rsp(rsp_pdv.data):
-                    log.info("C-ECHO Response indicates SUCCESS!")
-                    test_success = True
-                else:
-                    log.error("C-ECHO Response DIMSE status check failed (Status != Success or parse error).")
-            else:
-                 log.error("Did not find a suitable PDV (Command, Last, matching Context ID, with data) in the P-DATA-TF response.")
+                    rsp_processed = True # Mark that we found and processed the expected PDV
+                    break # Assume only one C-ECHO-RSP PDV is expected per P-DATA-TF
+
+            if not rsp_processed:
+                log.error("Did not find a suitable PDV (Command, Last, matching Context ID) in the P-DATA-TF response's items.")
 
         elif response_pdata.haslayer(A_ABORT):
-             log.error(f"Received A-ABORT from peer instead of P-DATA response:\n{response_pdata.show(dump=True)}")
-             session.assoc_established = False
+             log.error(f"Received A-ABORT from peer instead of P-DATA response:")
+             response_pdata.show()
+             # A-ABORT details (source, reason) are useful
+             abort_layer = response_pdata[A_ABORT]
+             log.error(f"  Abort Source: {abort_layer.get_field('source').i2s[abort_layer.source]} ({abort_layer.source})")
+             log.error(f"  Abort Reason: {abort_layer.get_field('reason_diag').i2s[abort_layer.reason_diag]} ({abort_layer.reason_diag})")
+             session.assoc_established = False # Mark association as terminated
         else:
-            log.error(f"Received unexpected PDU type response: {response_pdata.summary()}\n{response_pdata.show(dump=True)}")
+            log.error(f"Received unexpected PDU type response: {response_pdata.summary()}")
+            response_pdata.show() # Show the unexpected packet
 
     except (socket.timeout) as timeout_err:
-         log.error(f"Socket timeout during C-ECHO test: {timeout_err}")
-         sys.exit(1) # Exit, finally block handles cleanup
+         log.error(f"Socket timeout during C-ECHO test (read_timeout={session.read_timeout}s): {timeout_err}")
+         # Attempt abort, then exit in finally block
+         if session and session.stream: session.abort()
+         sys.exit(1)
     except (socket.error, ConnectionRefusedError, ConnectionResetError, BrokenPipeError) as sock_err:
         log.error(f"Socket error during test: {sock_err}")
-        sys.exit(1) # Exit, finally block handles cleanup
+        # Abort/Close handled in 'finally'
+        sys.exit(1)
     except Exception as e:
         log.exception(f"An unexpected error occurred: {e}") # Log stack trace
-        sys.exit(1) # Exit, finally block handles cleanup
+        # Attempt abort, then exit in finally block
+        if session and session.stream: session.abort()
+        sys.exit(1)
     finally:
-        # This block always runs, ensuring cleanup happens regardless of success or failure
+        # --- Reliable Cleanup ---
         log.debug("Entering finally block for cleanup...")
-        # 6. Release Association (or Abort if needed)
-        if session and session.assoc_established:
-            log.info("Releasing association...")
-            if not session.release():
-                 log.warning("Association release failed or timed out. Aborting instead.")
-                 # session.release() calls abort() internally on failure/timeout
-                 # but we call it again just to be sure connection is closed.
+        if session:
+            if session.assoc_established:
+                log.info("Releasing association...")
+                if not session.release():
+                    log.warning("Association release failed or timed out. Aborting connection.")
+                    # session.release() should call abort() on failure, but call again if needed
+                    session.abort() # Ensures socket is closed even if release failed internally
+            elif session.stream: # Connection exists but not associated
+                 log.info("Aborting connection (association not established or release failed).")
                  session.abort()
-        elif session and session.stream: # If connection exists but not associated (e.g., associate failed, or release failed badly)
-             log.info("Aborting connection (was not associated or release failed).")
-             session.abort()
-        else:
-             log.info("No active association or connection to release/abort.")
+            else:
+                 log.info("No active association or connection to release/abort.")
         log.debug("Cleanup finished.")
 
     # --- Final Verdict ---

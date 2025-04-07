@@ -70,6 +70,91 @@ def _uid_to_bytes(uid):
         b_uid += b'\x00'
     return b_uid
 
+def parse_dimse_status(dimse_bytes):
+    """
+    Parses the Status (0000,0900) from DIMSE bytes (Implicit VR Little Endian).
+
+    Args:
+        dimse_bytes (bytes): The raw bytes of the DIMSE message (starting with Group 0 Length).
+
+    Returns:
+        int or None: The Status value (e.g., 0x0000 for Success) if found,
+                     otherwise None (if tag not found, wrong format, or parse error).
+    """
+    try:
+        offset = 0
+        # Check minimum length for Group 0 Length element (Tag + Len + Value)
+        if len(dimse_bytes) < 12:
+            log.debug("parse_dimse_status: DIMSE bytes too short for Group Length.")
+            return None
+
+        # Check Group 0 Length Tag and Length Field Length
+        tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset+4])
+        value_len_field_len = struct.unpack("<I", dimse_bytes[offset+4:offset+8])[0]
+        if not (tag_group == 0x0000 and tag_elem == 0x0000 and value_len_field_len == 4):
+            log.debug(f"parse_dimse_status: Expected Group Length Tag (0000,0000) with UL VR (len=4), got ({tag_group:04X},{tag_elem:04X}) Len={value_len_field_len}.")
+            return None # Not starting with a valid Group Length element
+
+        # Read the group length value
+        cmd_group_len = struct.unpack("<I", dimse_bytes[offset+8:offset+12])[0]
+        offset += 12 # Move past the Group Length element
+
+        # Define the end boundary for searching within this group
+        group_end_offset = offset + cmd_group_len
+
+        log.debug(f"parse_dimse_status: Searching for Status (0000,0900) within group length {cmd_group_len} (ends at offset {group_end_offset}).")
+
+        while offset < group_end_offset and offset < len(dimse_bytes):
+            # Check minimum length for next element header (Tag + Len)
+            if offset + 8 > len(dimse_bytes):
+                log.debug(f"parse_dimse_status: Truncated element header at offset {offset}.")
+                break
+
+            # Read Tag and Value Length (Implicit VR LE)
+            tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset+4])
+            value_len = struct.unpack("<I", dimse_bytes[offset+4:offset+8])[0]
+            data_offset = offset + 8
+            next_element_offset = data_offset + value_len
+
+            log.debug(f"  Checking Tag: ({tag_group:04X},{tag_elem:04X}), Len: {value_len}, Data Offset: {data_offset}")
+
+            # Check if element exceeds group boundary or available data
+            if next_element_offset > len(dimse_bytes):
+                 log.warning(f"parse_dimse_status: Element ({tag_group:04X},{tag_elem:04X}) length ({value_len}) exceeds available data.")
+                 break
+            # No need to check group_end_offset strictly here, as elements *should* fit,
+            # but it's good practice if parsing more complex structures.
+
+            if tag_group == 0x0000 and tag_elem == 0x0900: # Status tag found
+                log.debug("  Status tag (0000,0900) found.")
+                if value_len == 2: # Status is US (2 bytes)
+                    if data_offset + 2 <= len(dimse_bytes):
+                        status_bytes = dimse_bytes[data_offset:data_offset+2]
+                        status = struct.unpack("<H", status_bytes)[0]
+                        log.debug(f"  Parsed Status value: 0x{status:04X}")
+                        return status # Return the found status
+                    else:
+                         log.warning("  Status tag (0000,0900) found, but value is truncated.")
+                         return None # Indicate parse error
+                else:
+                    log.warning(f"  Status tag (0000,0900) found but value length is {value_len}, expected 2.")
+                    return None # Indicate parse error (unexpected length)
+
+            # Move to next element
+            offset = next_element_offset
+
+        log.debug("parse_dimse_status: Status tag (0000,0900) not found within the command group.")
+        return None # Status tag not found in the group
+
+    except struct.error as e:
+        log.error(f"Struct unpack error parsing DIMSE status: {e}")
+        log.error(f"DIMSE Data near error: {dimse_bytes[max(0,offset-4):offset+12].hex()}")
+        return None
+    except Exception as e:
+        log.exception(f"Unexpected error parsing DIMSE status: {e}") # Log stack trace
+        return None
+
+
 # --- DICOM Base PDU ---
 class DICOM(Packet):
     """
@@ -495,13 +580,12 @@ class PresentationDataValueItem(Packet):
     name = "PDV Item"
     fields_desc = [
         # PDV Length: Length of the *following* fields (Context ID + Msg Hdr + Data)
-        IntField("length", None),
+        IntField("length", None), # NETWORK BYTE ORDER (!I)
         # --- Start of PDV Value (length bytes) ---
         ByteField("context_id", 0),
         ByteField("message_control_header", 0),
         # The actual DIMSE message fragment (Command or Data Set)
-        # We will use extract_padding to handle this field's length correctly.
-        # Define it initially as empty; extract_padding will populate it.
+        # StrLenField should work if length is correct, but extract_padding gives control
         StrField("data", b""),
     ]
 
@@ -515,24 +599,23 @@ class PresentationDataValueItem(Packet):
             # Data length = Total PDV Length - Context ID (1) - Msg Ctrl Hdr (1)
             expected_data_len = self.length - 2
         else:
-            # Should not happen if dissection works, but handle defensively
+            # This can happen if the PDU is malformed or dissection fails upstream
             log.warning("PDV Item length field is None during padding extraction.")
             expected_data_len = len(s) # Consume rest if length unknown
 
         # Ensure calculated length is not negative
         expected_data_len = max(0, expected_data_len)
 
-        # Ensure we don't read past the end of available bytes
+        # Ensure we don't read past the end of available bytes 's'
         actual_data_len = min(expected_data_len, len(s))
 
         if actual_data_len < expected_data_len:
-             log.warning(f"PDV Item data is shorter ({actual_data_len} bytes) than expected ({expected_data_len} bytes based on length field {self.length}).")
+             log.warning(f"PDV Item data is shorter ({actual_data_len} bytes) than expected ({expected_data_len} bytes based on length field {self.length}). Consuming available bytes.")
 
         self.data = s[:actual_data_len]
-        # Return the remaining bytes (padding, should be empty)
+        # Return the remaining bytes (padding or next PDV item's start)
         return s[actual_data_len:]
 
-    # --- is_last, is_command properties remain the same ---
     @property
     def is_last(self):
         return (self.message_control_header >> 1) & 0x01
@@ -550,19 +633,18 @@ class PresentationDataValueItem(Packet):
 
     def post_build(self, p, pay):
         # Calculate PDV length if not provided
-        if self.length is None:
-            length = 1 + 1 + len(self.data)
-            p = struct.pack("!I", length) + p[4:]
-        # Manually ensure order if needed (Scapy usually handles this)
-        p = p[:4] + bytes([self.context_id]) + bytes([self.message_control_header]) + self.data
-        return p + pay
+        # p initially contains [context_id(1), msg_hdr(1), data(N)] based on fields_desc
+        # We need to prepend the length field (!I)
+        pdv_value_len = len(p) # Length of context_id + msg_hdr + data
+        p = struct.pack("!I", pdv_value_len) + p # Prepend length
+        return p + pay # Append outer payload if any
 
     def summary(self):
         cmd_data = "Command" if self.is_command else "Data"
         last = "Last" if self.is_last else "More"
-        # Use getattr to avoid errors if data is not bytes (should be)
         data_len = len(getattr(self, 'data', b''))
-        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, Len: {self.length}, DataLen: {data_len})"
+        pdv_len_field = self.length if self.length is not None else "N/A"
+        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, LenField: {pdv_len_field}, DataLen: {data_len})"
 class P_DATA_TF(Packet):
     """
     P-DATA-TF PDU (PS3.8 Section 9.3.5)
@@ -570,10 +652,77 @@ class P_DATA_TF(Packet):
     """
     name = "P-DATA-TF"
     fields_desc = [
-        # The payload of this PDU consists of one or more concatenated PDV Items
+        # Keep PacketListField for building convenience, but override dissection
         PacketListField("pdv_items", [], PresentationDataValueItem,
-                        length_from=lambda pkt: pkt.underlayer.length)
+                        length_from=lambda pkt: pkt.underlayer.length if pkt.underlayer else None)
     ]
+
+    def dissect_payload(self, s):
+        """
+        Manually dissect PDV items from the payload bytes 's'
+        using their explicit length field.
+        """
+        items = []
+        total_len = len(s)
+        offset = 0
+        log.debug(f"P_DATA_TF.dissect_payload: Starting dissection of {total_len} bytes.")
+
+        while offset < total_len:
+            # Check if there are enough bytes for the PDV length field (4 bytes)
+            if offset + 4 > total_len:
+                if total_len - offset > 0:
+                     log.warning(f"P-DATA-TF: Trailing bytes ({total_len - offset}) found, insufficient for PDV length field.")
+                     self.payload = Raw(s[offset:]) # Store remaining as Raw
+                else:
+                     log.debug("P-DATA-TF: Dissection complete, no trailing bytes.")
+                     self.payload = NoPayload()
+                break
+
+            # Read the PDV item's length (4 bytes, Network Byte Order)
+            # This length is for the *value* part (Context ID + Msg Hdr + Data)
+            pdv_value_len = struct.unpack("!I", s[offset:offset+4])[0]
+            pdv_item_start_offset = offset + 4 # Start of Context ID
+            pdv_item_end_offset = pdv_item_start_offset + pdv_value_len # End of PDV data for *this* item
+
+            # Calculate the total length of this PDV item (Length field + Value part)
+            current_pdv_total_len = 4 + pdv_value_len
+
+            log.debug(f"  PDV Item at offset {offset}: Declared value length={pdv_value_len}. Item should end at {pdv_item_end_offset}.")
+
+            # Check if the calculated end offset exceeds the total available bytes
+            if pdv_item_end_offset > total_len:
+                log.error(f"P-DATA-TF: PDV item declared length ({pdv_value_len}) exceeds remaining PDU data ({total_len - pdv_item_start_offset} bytes available starting from context ID).")
+                # Store the problematic segment (including its length field) as Raw payload
+                self.payload = Raw(s[offset:])
+                break
+
+            # Extract the full bytes for this PDV item (its Length field + its Value part)
+            pdv_full_bytes = s[offset:pdv_item_end_offset]
+
+            try:
+                # Dissect these bytes using the PresentationDataValueItem class
+                # The PresentationDataValueItem constructor expects the full bytes (Length + Value)
+                pdv_item = PresentationDataValueItem(pdv_full_bytes)
+                # Check consistency: did dissection consume all bytes we gave it?
+                if len(bytes(pdv_item)) != current_pdv_total_len:
+                    log.warning(f"PDV item dissection consumed {len(bytes(pdv_item))} bytes, but expected {current_pdv_total_len} bytes based on length field. This might indicate an internal parsing issue in PresentationDataValueItem.")
+                    # Still add the item, but be wary.
+                items.append(pdv_item)
+                log.debug(f"  Successfully dissected: {pdv_item.summary()}")
+            except Exception as e:
+                log.error(f"Failed to dissect PDV item bytes ({len(pdv_full_bytes)} bytes starting at offset {offset}): {e}")
+                log.debug(f"PDV raw bytes: {pdv_full_bytes.hex()}")
+                # Add the problematic segment as Raw data to avoid losing it
+                items.append(Raw(pdv_full_bytes))
+
+            # Move offset to the beginning of the next PDV item
+            offset = pdv_item_end_offset
+
+        self.pdv_items = items # Assign the list of dissected items (or Raw chunks)
+        # If the loop finished because offset == total_len, ensure payload is empty
+        if offset == total_len and not self.payload: # Check if payload wasn't set by an error condition
+            self.payload = NoPayload()
+        log.debug(f"P_DATA_TF.dissect_payload: Finished dissection. Parsed {len(items)} items. Remaining payload type: {type(self.payload)}")
 
 # --- Layer Binding ---
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
