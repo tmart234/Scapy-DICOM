@@ -614,7 +614,6 @@ class A_ABORT(Packet):
         }) # Reason/Diag - interpretation depends on source
     ]
 class PresentationDataValueItem(Packet):
-# --- Data Transfer Service PDU ---class PresentationDataValueItem(Packet):
     """
     Represents a single PDV Item conceptually.
     Serialization and parsing handle the explicit length field.
