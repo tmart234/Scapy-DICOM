@@ -57,8 +57,9 @@ jobs:
       - name: Start tcpdump capture
         id: start_tcpdump 
         run: |
-          sudo tcpdump -i lo -s 0 -w dicom_capture.pcap 'tcp port 4242' &
-          echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT # Use GITHUB_OUTPUT later
+          sudo tcpdump -i any -s 0 -w dicom_capture.pcap 'tcp port 4242' &
+          pid=$!
+          echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
           sleep 2 # Give tcpdump a moment to start
 
       - name: Run DICOM Integration Test Script against Orthanc
