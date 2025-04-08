@@ -37,7 +37,11 @@ jobs:
       - name: Start tcpdump capture
         id: start_tcpdump 
         run: |
-          sudo tcpdump -i any -s 0 -w dicom_capture.pcap 'tcp port 4242' &
+          echo "Available network interfaces:"
+          ip addr show
+          echo "----------"
+          sudo tcpdump -D
+          sudo tcpdump port 4242 -i lo -s 0 -w dicom_capture.pcap &
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
 
       - name: Start DICOM SCP (Orthanc in Docker)
