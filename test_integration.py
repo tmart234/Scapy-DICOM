@@ -8,6 +8,7 @@ import time
 # Assuming scapy_DICOM.py is in the same directory or installable
 try:
     from scapy_DICOM import (
+        DICOM,
         DICOMSession,
         VERIFICATION_SOP_CLASS_UID,
         DEFAULT_TRANSFER_SYNTAX_UID,
@@ -126,15 +127,39 @@ def main():
 
         # 6. Wait for response
         log.info("Waiting for C-ECHO response...")
-        response_pdata = session.stream.recv() # DICOMSession stream uses DICOM class for dissection
+        # --- MODIFICATION START ---
+        # Replace: response_pdata = session.stream.recv()
+        # With manual receive and dissection:
+        raw_response_bytes = None
+        try:
+            # Receive raw bytes from the underlying socket
+            # Use a reasonably large buffer size
+            raw_response_bytes = session.sock.recv(8192)
+        except socket.timeout:
+             log.error(f"Socket timeout ({session.read_timeout}s) waiting for C-ECHO response bytes.")
+             # Abort/Close handled in 'finally'
+             sys.exit(1)
+        except Exception as sock_err:
+             log.error(f"Socket error receiving C-ECHO response bytes: {sock_err}")
+             # Abort/Close handled in 'finally'
+             sys.exit(1)
 
-        if not response_pdata:
-            log.error("No response received from SCP after sending C-ECHO-RQ (timeout or connection closed).")
+        if not raw_response_bytes:
+            log.error("No raw response bytes received from SCP after sending C-ECHO-RQ (connection closed?).")
+            sys.exit(1)
+
+        log.debug(f"Received {len(raw_response_bytes)} raw bytes. Attempting dissection...")
+        # Explicitly dissect the received bytes using the DICOM base layer
+        response_pdata = DICOM(raw_response_bytes)
+
+        if not response_pdata: # Should not happen if raw_response_bytes existed, but check anyway
+            log.error("Failed to dissect received bytes into DICOM PDU.")
             sys.exit(1)
 
         log.debug(f"Received response packet type: {type(response_pdata)}")
         response_pdata.show() # Show summary
-        # log.debug(f"Received response packet details:\n{response_pdata.show(dump=True)}") # More verbose
+        log.debug(f"Received response packet details:\n{response_pdata.show(dump=True)}") # More verbose
+
 
         # 7. Process the response using the library's dissection
         if response_pdata.haslayer(P_DATA_TF):
