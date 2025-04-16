@@ -350,7 +350,7 @@ class PresentationContextRQItem(DICOMVariableItem):
         ByteField("reserved4", 0),
         # Abstract Syntax and Transfer Syntax items follow here conceptually
         # PacketListField isn't easily usable for direct dissection here
-        Raw("sub_item_data", b"", length_from=lambda x: x.length - 4)
+        Raw("sub_item_data")
     ]
 
 class PresentationContextACItem(DICOMVariableItem):
@@ -375,7 +375,7 @@ class PresentationContextACItem(DICOMVariableItem):
         }),
         ByteField("reserved3", 0),
         # Accepted Transfer Syntax item follows here conceptually
-        Raw("sub_item_data", b"", length_from=lambda x: x.length - 4)
+        Raw("sub_item_data")
     ]
 
 # --- User Information Item and Sub-items ---
@@ -391,7 +391,7 @@ class UserInformationItem(DICOMVariableItem):
         ByteField("reserved", 0),
         ShortField("length", None),
         # User Data Sub-Items follow here conceptually
-        Raw("user_data_subitems", b"", length_from=lambda x: x.length)
+        Raw("user_data_subitems")
     ]
 
 

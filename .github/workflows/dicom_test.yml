@@ -27,10 +27,10 @@ jobs:
             env_vars: "" 
 
             command: >
-              python -m pynetdicom storescp
+              python -m pynetdicom echoscp
               --ae-title PYDICOM_SCP
               --port 11112
-              --implement-verification
+              -v
 
     steps:
       - name: Checkout repository
@@ -82,7 +82,7 @@ jobs:
             ${{ matrix.dicom_server.command }}
 
           echo "Waiting for ${{ matrix.dicom_server.name }} to start..."
-          sleep 15 # Allow more time for potentially slower SCPs
+          sleep 20
 
           echo "Checking if container is running..."
           docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }}
