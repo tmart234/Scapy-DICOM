@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--ae-title", required=True, help="AE Title of the DICOM SCP (Called AE Title)")
     parser.add_argument("--calling-ae", default="SCAPY_TEST_SCU", help="Calling AE Title for this SCU")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    parser.add_argument("--timeout", type=int, default=20, help="Association and read timeout in seconds")
     args = parser.parse_args()
 
     if args.debug:
@@ -56,7 +57,7 @@ def main():
         dst_port=scp_port,
         dst_ae=scp_ae,
         src_ae=my_ae,
-        read_timeout=20 #
+        read_timeout=args.timeout
     )
 
     # --- Define Context for Verification SOP Class ---
