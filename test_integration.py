@@ -108,15 +108,11 @@ def main():
             # A more robust test might try negotiating Explicit VR LE as well.
 
         # 4. Create the PresentationDataValueItem object for C-ECHO-RQ
-        pdv_to_send = PresentationDataValueItem(
-            context_id=echo_ctx_id
-            # message_control_header can be set via properties later
-        )
-        # Assign data and flags explicitly as attributes
-        pdv_to_send.data = dimse_command_bytes # Assign data directly
-        pdv_to_send.is_command = True # Mark as DIMSE command
-        pdv_to_send.is_last = True    # Mark as last fragment
-
+        pdv_to_send = PresentationDataValueItem() # Create instance first
+        pdv_to_send.context_id = echo_ctx_id      
+        pdv_to_send.data = dimse_command_bytes  
+        pdv_to_send.is_command = True             
+        pdv_to_send.is_last = True               
 
         # 5. Send the PDV Item via P-DATA-TF
         log.info(f"Sending C-ECHO-RQ (Message ID: {message_id}) on context {echo_ctx_id}...")
