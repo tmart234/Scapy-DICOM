@@ -1101,25 +1101,36 @@ class DICOMSession:
             self.close(); return False
                     
     def send_p_data(self, pdv_list):
-        """Sends one or more PDV items within a P-DATA-TF PDU."""
+        """Sends one or more PDV items within a P-DATA-TF PDU by manually building the payload."""
         if not self.assoc_established or not self.stream:
             log.error("Cannot send P-DATA: Association not established.")
             return False
 
-        # Create P-DATA-TF packet
-        p_data_tf = DICOM()/P_DATA_TF()
-        # Assign PDV items to the list that build_payload uses
-        p_data_tf[P_DATA_TF].parsed_pdv_items = pdv_list
+        # --- Manual Payload Construction ---
+        # Create a temporary P_DATA_TF layer instance just to use its build_payload method
+        p_data_tf_layer_builder = P_DATA_TF()
+        p_data_tf_layer_builder.parsed_pdv_items = pdv_list
+
+        # Manually build the payload bytes for this layer
+        pdata_payload_bytes = p_data_tf_layer_builder.build_payload()
+        log.debug(f"Manually built P-DATA payload length: {len(pdata_payload_bytes)}")
+        # --- End Manual Payload Construction ---
+
+        # Create the full PDU: DICOM UL header wrapping the manually built payload as Raw data.
+        # The DICOM UL layer will calculate its 'length' field based on this Raw payload.
+        full_pdu = DICOM() / Raw(load=pdata_payload_bytes)
+        # Explicitly set the PDU type for the DICOM UL header
+        full_pdu.pdu_type = 0x04 # P-DATA-TF
 
         log.info(f"Sending P-DATA-TF ({len(pdv_list)} PDV(s))")
-        # The build process will call P_DATA_TF.build_payload(),
-        # then DICOM.post_build() will calculate the overall PDU length.
+
         try:
-            # Use send() for P-DATA as we don't necessarily expect an immediate layer 7 response
-            # sr1 might work but send is more appropriate for data transfer phases
-            sent_len = self.stream.send(p_data_tf)
+            # Send the manually constructed PDU
+            sent_len = self.stream.send(full_pdu)
+
             # Optional: Log the raw bytes sent for debugging
-            final_bytes = bytes(p_data_tf)
+            # We need to re-build the packet to get the final bytes including the calculated length
+            final_bytes = bytes(full_pdu)
             log.debug(f"Final Bytes Sent ({len(final_bytes)} bytes):")
             log.debug(final_bytes.hex('.')) # Use hex with separator for readability
             return sent_len > 0
