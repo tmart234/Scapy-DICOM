@@ -52,62 +52,67 @@ jobs:
           sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w dicom_capture_${{ matrix.dicom_server.name }}.pcap &
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
 
-      - name: Start DICOM SCP (${{ matrix.dicom_server.name }})
-        id: start_scp
-        run: |
-          echo "Starting ${{ matrix.dicom_server.name }} container..."
-          # Build ENV flags array dynamically
-          ENV_FLAGS=()
-          if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
-            ENV_FLAGS+=("-e" "VERBOSE_ENABLED=true")
-            ENV_FLAGS+=("-e" "DICOM_AET=${{ matrix.dicom_server.aet }}")
-            ENV_FLAGS+=("-e" "DICOM_PORT=${{ matrix.dicom_server.port }}")
-            ENV_FLAGS+=("-e" "ORTHANC__ACCEPT_UNKNOWN_PEERS=true")
-          fi
-          echo "Using Env Vars: ${ENV_FLAGS[@]}"
-          echo "Using Command: ${{ matrix.dicom_server.command }}"
-
-          docker run \
-            --detach \
-            --rm \
-            --name dicom-scp-test-${{ matrix.dicom_server.name }} \
-            --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
-            "${ENV_FLAGS[@]}" \
-            ${{ matrix.dicom_server.image }} \
-            ${{ matrix.dicom_server.command }} \
-            || { echo "::error::Failed to start container ${{ matrix.dicom_server.name }}"; exit 1; }
-
-          # === Simplified & Corrected Port Check Logic ===
-          echo "Waiting for ${{ matrix.dicom_server.name }} (port ${{ matrix.dicom_server.port }}) to become available..."
-          # Use timeout on a bash subshell. The subshell loops until the port is open OR the container disappears.
-          # The outer 'if !' checks the exit code of the 'timeout' command.
-          if ! timeout 60 bash -c '
-              echo "Starting port check loop..."
-              while ! printf "" > /dev/tcp/127.0.0.1/${{ matrix.dicom_server.port }} 2>/dev/null; do
-                # Check if container is still running
+          - name: Start DICOM SCP (${{ matrix.dicom_server.name }})
+            id: start_scp
+            run: |
+              echo "Starting ${{ matrix.dicom_server.name }} container..."
+              # Build ENV flags array dynamically
+              ENV_FLAGS=()
+              if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
+                ENV_FLAGS+=("-e" "VERBOSE_ENABLED=true")
+                ENV_FLAGS+=("-e" "DICOM_AET=${{ matrix.dicom_server.aet }}")
+                ENV_FLAGS+=("-e" "DICOM_PORT=${{ matrix.dicom_server.port }}")
+                ENV_FLAGS+=("-e" "ORTHANC__ACCEPT_UNKNOWN_PEERS=true")
+              fi
+              echo "Using Env Vars: ${ENV_FLAGS[@]}"
+              echo "Using Command: ${{ matrix.dicom_server.command }}"
+    
+              docker run \
+                --detach \
+                --rm \
+                --name dicom-scp-test-${{ matrix.dicom_server.name }} \
+                --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
+                "${ENV_FLAGS[@]}" \
+                ${{ matrix.dicom_server.image }} \
+                ${{ matrix.dicom_server.command }} \
+                || { echo "::error::Failed to start container ${{ matrix.dicom_server.name }}"; exit 1; }
+    
+              # === Simplified Port Check Logic with Manual Timeout ===
+              echo "Waiting for ${{ matrix.dicom_server.name }} (port ${{ matrix.dicom_server.port }}) to become available (max 60s)..."
+              count=0
+              max_wait=120 # 120 * 0.5s = 60 seconds
+              port_open=0
+              while [ $count -lt $max_wait ]; do
+                # Check if container is still running first
                 if ! docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }} --format "{{.ID}}" | grep -q .; then
+                  echo "" # Newline
                   echo "::error::Container exited while waiting for port." >&2
-                  exit 1 # Exit subshell with error if container gone
+                  exit 1 # Fail the step
                 fi
+    
+                # Attempt TCP connection (redirect errors to null)
+                if printf "" > /dev/tcp/127.0.0.1/${{ matrix.dicom_server.port }} 2>/dev/null; then
+                  port_open=1
+                  break # Exit loop if port is open
+                fi
+    
                 echo -n "." # Print progress dot
                 sleep 0.5
+                count=$((count + 1))
               done
-              echo " Port detected as open." # Loop succeeded
-              exit 0 # Explicitly exit subshell with success
-              '; then
-              # This block runs if timeout occurred OR if the subshell exited with non-zero status (container gone)
               echo "" # Newline after dots
-              echo "::error::Timeout or container exit occurred while waiting for port ${{ matrix.dicom_server.port }}." >&2
-              # Attempt to get logs on failure
-              echo "Attempting to get logs on failure..." >&2
-              docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not retrieve logs on failure." >&2
-              exit 1 # Fail the main step
-          fi
-          echo "" # Newline after dots if loop succeeded quickly
-
-          echo "${{ matrix.dicom_server.name }} port is open and container appears running."
-          sleep 2 # Keep the short grace period
-
+    
+              if [ $port_open -eq 0 ]; then
+                echo "::error::Timeout waiting for port ${{ matrix.dicom_server.port }}." >&2
+                # Attempt to get logs on failure
+                echo "Attempting to get logs on failure..." >&2
+                docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not retrieve logs on failure." >&2
+                exit 1 # Fail the step
+              fi
+    
+              echo "${{ matrix.dicom_server.name }} port is open and container appears running."
+              sleep 2 # Keep the short grace period
+              
       - name: Run DICOM Integration Test Script against ${{ matrix.dicom_server.name }}
         id: test_script
         continue-on-error: true

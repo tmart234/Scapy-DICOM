@@ -926,67 +926,62 @@ class DICOMSession:
             if not self.connect():
                 return False
 
+        # *** DEBUGGING: Temporarily disable sending presentation contexts ***
+        send_presentation_contexts = False # Set to False for this test
+        # *** END DEBUGGING ***
+
         if requested_contexts is None:
-            # Default: Request Verification SOP Class with Implicit VR LE
              requested_contexts = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
 
         # --- Build Variable Items ---
         # 1. Application Context Item
         app_context = DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))
-        # Manually calculate app_context length and ensure correct build (optional but safer)
         app_context.length = len(app_context.data)
 
-
-        # 2. Presentation Context Items
+        # 2. Presentation Context Items (Conditionally build)
         pres_items_list = []
-        context_id_counter = 1 # Context IDs must be odd
-        for abs_syntax, trn_syntaxes in requested_contexts.items():
-            # Build Abstract Syntax Sub-item
-            abs_syntax_item = AbstractSyntaxSubItem(abstract_syntax_uid=abs_syntax)
-            abs_syntax_bytes = bytes(abs_syntax_item) # Build bytes early
-
-            # Build Transfer Syntax Sub-items list
-            trn_syntax_items_bytes = b"".join(
-                bytes(TransferSyntaxSubItem(transfer_syntax_uid=ts)) for ts in trn_syntaxes
-            ) # Build bytes early
-
-            # Combine sub-items into Presentation Context 'data'
-            # Fixed part (context_id, reserved) + abstract syntax bytes + transfer syntax bytes
-            pres_data_header = struct.pack("!BBBB", context_id_counter, 0, 0, 0)
-            pres_total_data = pres_data_header + abs_syntax_bytes + trn_syntax_items_bytes
-
-            # *** FIX: Explicitly create and set length for the Pres Context Item ***
-            pres_item = DICOMVariableItem(item_type=0x20) # Create item
-            pres_item.data = pres_total_data            # Set data
-            pres_item.length = len(pres_total_data)     # Explicitly set length
-
-            pres_items_list.append(pres_item)
-            context_id_counter += 2 # Increment by 2 to keep it odd
+        if send_presentation_contexts: # Only build if flag is True
+            context_id_counter = 1
+            for abs_syntax, trn_syntaxes in requested_contexts.items():
+                abs_syntax_item = AbstractSyntaxSubItem(abstract_syntax_uid=abs_syntax)
+                abs_syntax_bytes = bytes(abs_syntax_item)
+                trn_syntax_items_bytes = b"".join(
+                    bytes(TransferSyntaxSubItem(transfer_syntax_uid=ts)) for ts in trn_syntaxes
+                )
+                pres_data_header = struct.pack("!BBBB", context_id_counter, 0, 0, 0)
+                pres_total_data = pres_data_header + abs_syntax_bytes + trn_syntax_items_bytes
+                pres_item = DICOMVariableItem(item_type=0x20)
+                pres_item.data = pres_total_data
+                pres_item.length = len(pres_total_data)
+                pres_items_list.append(pres_item)
+                context_id_counter += 2
 
         # 3. User Information Item
         user_info_subitems = [
-            MaxLengthSubItem(max_length_received=16384), # Let peer know our max receive size
-            ImplementationClassUIDSubItem(), # Uses Scapy's default
-            ImplementationVersionNameSubItem() # Uses Scapy's default
+            MaxLengthSubItem(max_length_received=16384),
+            ImplementationClassUIDSubItem(),
+            ImplementationVersionNameSubItem()
         ]
         user_info_data = b"".join(bytes(item) for item in user_info_subitems)
         user_info_item = DICOMVariableItem(item_type=0x50, data=user_info_data)
-        # Manually calculate user_info length and ensure correct build (optional but safer)
         user_info_item.length = len(user_info_item.data)
-        # Combine all variable items
+
+        # Combine all variable items (pres_items_list might be empty now)
         all_variable_items = [app_context] + pres_items_list + [user_info_item]
 
         # --- Build A-ASSOCIATE-RQ PDU ---
         assoc_rq = DICOM()/A_ASSOCIATE_RQ(
-            called_ae_title=self.dst_ae,
-            calling_ae_title=self.src_ae,
+             called_ae_title=self.dst_ae,
+             calling_ae_title=self.src_ae,
         )
-        # Assign manually built items
         assoc_rq[A_ASSOCIATE_RQ].variable_items = all_variable_items
 
         log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port}")
+        # *** DEBUG: Log if presentation contexts are being sent ***
+        log.debug(f"Sending A-ASSOCIATE-RQ (Presentation Contexts Included: {send_presentation_contexts})")
+        # *** END DEBUGGING ***
         log.debug(f"A-ASSOCIATE-RQ Details:\n{assoc_rq.show(dump=True)}")
-
+        
         try:
             response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=False)
         except KeyboardInterrupt:
