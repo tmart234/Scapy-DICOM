@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install scapy
-          sudo apt-get update && sudo apt-get install -y tcpdump
+          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk
 
       - name: Start tcpdump capture
         id: start_tcpdump
@@ -112,6 +112,14 @@ jobs:
 
           echo "${{ matrix.dicom_server.name }} port is open and container appears running."
           sleep 2 # Keep the short grace period
+
+      - name: Run echoscu Test against ${{ matrix.dicom_server.name }}
+        run: |
+          echo "Running echoscu -v -aet SCAPY_CI_SCU -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }}"
+          # Run echoscu with a timeout (e.g., 15 seconds)
+          # Use timeout command for echoscu itself
+          timeout 15 echoscu -v -aet SCAPY_CI_SCU -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }} \
+            || echo "::warning::echoscu command failed or timed out (exit code $?). This might indicate an issue with the SCP container or environment."
 
       - name: Run DICOM Integration Test Script against ${{ matrix.dicom_server.name }}
         id: test_script
