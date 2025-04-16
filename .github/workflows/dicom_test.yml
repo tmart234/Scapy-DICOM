@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install scapy
-          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk netcat-openbsd wireshark-common
+          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk netcat-openbsd tshark 
 
       - name: Start tcpdump capture
         id: start_tcpdump
@@ -163,7 +163,6 @@ jobs:
           PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
           if [[ -f "$PCAP_FILE" ]]; then
             echo "--- PCAP Info for $PCAP_FILE ---"
-            capinfos "$PCAP_FILE"
             tshark -r "$PCAP_FILE" -c 150
           else
             echo "PCAP file $PCAP_FILE not found."
