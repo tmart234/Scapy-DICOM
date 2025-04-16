@@ -102,7 +102,7 @@ jobs:
         id: test_script
         continue-on-error: true # Allow subsequent cleanup steps even if test fails
         run: |
-          python Scapy-DICOM/test_integration.py \
+          python test_integration.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
