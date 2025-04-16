@@ -34,7 +34,7 @@ from scapy.packet import NoPayload, Raw
 # Use scapy's logger for consistency if desired, or keep this one
 log = logging.getLogger("scapy.contrib.dicom")
 # Ensure logs are visible if running standalone
-# logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 
 
 # --- Constants ---
