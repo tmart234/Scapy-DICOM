@@ -45,13 +45,13 @@ jobs:
           pip install scapy
           sudo apt-get update && sudo apt-get install -y tcpdump
 
-          - name: Start tcpdump capture
-          id: start_tcpdump
-          run: |
-            echo "Starting tcpdump capture for port ${{ matrix.dicom_server.port }}..."
-            sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w dicom_capture_${{ matrix.dicom_server.name }}.pcap &
-            echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
-  
+      - name: Start tcpdump capture
+        id: start_tcpdump
+        run: |
+          echo "Starting tcpdump capture for port ${{ matrix.dicom_server.port }}..."
+          sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w dicom_capture_${{ matrix.dicom_server.name }}.pcap &
+          echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
+
       - name: Start DICOM SCP (${{ matrix.dicom_server.name }})
         id: start_scp
         run: |
