@@ -921,186 +921,207 @@ class DICOMSession:
         return False # Should not be reached
 
     def associate(self, requested_contexts=None):
-        """Sends A-ASSOCIATE-RQ and waits for A-ASSOCIATE-AC."""
-        if not self.stream:
-            if not self.connect():
-                return False
+            """Sends A-ASSOCIATE-RQ and waits for A-ASSOCIATE-AC using manual PDU build."""
+            if not self.stream:
+                if not self.connect():
+                    return False
 
-        # *** DEBUGGING: Temporarily disable sending presentation contexts ***
-        send_presentation_contexts = False # Set to False for this test
-        # *** END DEBUGGING ***
+            if requested_contexts is None:
+                requested_contexts = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
 
-        if requested_contexts is None:
-             requested_contexts = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
+            # --- Manually Build Variable Items Byte Payload ---
+            variable_items_payload = b''
+            context_id_map = {} # To map abstract syntax to context id for AC parsing
 
-        # --- Build Variable Items ---
-        # 1. Application Context Item
-        app_context = DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))
-        app_context.length = len(app_context.data)
+            # 1. Application Context Item (Type 0x10)
+            app_context_uid_bytes = _uid_to_bytes(APP_CONTEXT_UID)
+            app_context_len = len(app_context_uid_bytes)
+            variable_items_payload += struct.pack("!BBH", 0x10, 0, app_context_len) + app_context_uid_bytes
+            log.debug(f"Packed App Context Item: Type=0x10, Len={app_context_len}, Data={app_context_uid_bytes.hex()}")
 
-        # 2. Presentation Context Items (Conditionally build)
-        pres_items_list = []
-        if send_presentation_contexts: # Only build if flag is True
-            context_id_counter = 1
+            # 2. Presentation Context Items (Type 0x20)
+            context_id_counter = 1 # Context IDs must be odd
             for abs_syntax, trn_syntaxes in requested_contexts.items():
-                abs_syntax_item = AbstractSyntaxSubItem(abstract_syntax_uid=abs_syntax)
-                abs_syntax_bytes = bytes(abs_syntax_item)
-                trn_syntax_items_bytes = b"".join(
-                    bytes(TransferSyntaxSubItem(transfer_syntax_uid=ts)) for ts in trn_syntaxes
-                )
-                pres_data_header = struct.pack("!BBBB", context_id_counter, 0, 0, 0)
-                pres_total_data = pres_data_header + abs_syntax_bytes + trn_syntax_items_bytes
-                pres_item = DICOMVariableItem(item_type=0x20)
-                pres_item.data = pres_total_data
-                pres_item.length = len(pres_total_data)
-                pres_items_list.append(pres_item)
+                context_id_map[context_id_counter] = abs_syntax # Store mapping for AC response
+
+                # 2a. Abstract Syntax Sub-Item (Type 0x30)
+                abs_syntax_uid_bytes = _uid_to_bytes(abs_syntax)
+                abs_syntax_subitem_len = len(abs_syntax_uid_bytes)
+                abs_syntax_subitem_bytes = struct.pack("!BBH", 0x30, 0, abs_syntax_subitem_len) + abs_syntax_uid_bytes
+
+                # 2b. Transfer Syntax Sub-Items (Type 0x40) - Concatenated
+                trn_syntax_subitems_bytes = b''
+                for ts_uid in trn_syntaxes:
+                    ts_uid_bytes = _uid_to_bytes(ts_uid)
+                    ts_subitem_len = len(ts_uid_bytes)
+                    trn_syntax_subitems_bytes += struct.pack("!BBH", 0x40, 0, ts_subitem_len) + ts_uid_bytes
+
+                # 2c. Combine Sub-Items for Presentation Context Data
+                pres_context_data_header = struct.pack("!BBBB", context_id_counter, 0, 0, 0)
+                pres_context_data = pres_context_data_header + abs_syntax_subitem_bytes + trn_syntax_subitems_bytes
+                pres_context_len = len(pres_context_data)
+
+                # 2d. Pack Presentation Context Item (Type 0x20)
+                variable_items_payload += struct.pack("!BBH", 0x20, 0, pres_context_len) + pres_context_data
+                log.debug(f"Packed Pres Context Item {context_id_counter}: Type=0x20, Len={pres_context_len}")
                 context_id_counter += 2
 
-        # 3. User Information Item
-        user_info_subitems = [
-            MaxLengthSubItem(max_length_received=16384),
-            ImplementationClassUIDSubItem(),
-            ImplementationVersionNameSubItem()
-        ]
-        user_info_data = b"".join(bytes(item) for item in user_info_subitems)
-        user_info_item = DICOMVariableItem(item_type=0x50, data=user_info_data)
-        user_info_item.length = len(user_info_item.data)
+            # 3. User Information Item (Type 0x50)
+            user_info_subitems_payload = b''
+            # 3a. Max Length Sub-Item (Type 0x51)
+            max_len_data = struct.pack("!I", 16384) # Value is 4 bytes, Big Endian
+            user_info_subitems_payload += struct.pack("!BBH", 0x51, 0, 4) + max_len_data # Length is fixed at 4
 
-        # Combine all variable items (pres_items_list might be empty now)
-        all_variable_items = [app_context] + pres_items_list + [user_info_item]
+            # 3b. Implementation Class UID Sub-Item (Type 0x52)
+            impl_class_uid_str = "1.2.826.0.1.3680043.9.3811.1.0" # Example fixed UID
+            impl_class_uid_bytes = _uid_to_bytes(impl_class_uid_str)
+            impl_class_uid_len = len(impl_class_uid_bytes)
+            user_info_subitems_payload += struct.pack("!BBH", 0x52, 0, impl_class_uid_len) + impl_class_uid_bytes
 
-        # --- Build A-ASSOCIATE-RQ PDU ---
-        assoc_rq = DICOM()/A_ASSOCIATE_RQ(
-             called_ae_title=self.dst_ae,
-             calling_ae_title=self.src_ae,
-        )
-        assoc_rq[A_ASSOCIATE_RQ].variable_items = all_variable_items
+            # 3c. Implementation Version Name Sub-Item (Type 0x55)
+            impl_version_name = b"SCAPY_DICOM_TEST" # Fixed, max 16 bytes
+            impl_version_name = impl_version_name[:16] # Ensure max length
+            impl_version_name_len = len(impl_version_name)
+            user_info_subitems_payload += struct.pack("!BBH", 0x55, 0, impl_version_name_len) + impl_version_name
 
-        log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port}")
-        # *** DEBUG: Log if presentation contexts are being sent ***
-        log.debug(f"Sending A-ASSOCIATE-RQ (Presentation Contexts Included: {send_presentation_contexts})")
-        # *** END DEBUGGING ***
-        log.debug(f"A-ASSOCIATE-RQ Details:\n{assoc_rq.show(dump=True)}")
-        
-        try:
-            response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=False)
-        except KeyboardInterrupt:
-             log.warning("Operation interrupted by user during association.")
-             self.close()
-             return False
-        except Exception as e:
-            log.error(f"Error sending/receiving association request: {e}", exc_info=True)
-            self.close()
-            return False
+            # 3d. Pack User Information Item (Type 0x50)
+            user_info_len = len(user_info_subitems_payload)
+            variable_items_payload += struct.pack("!BBH", 0x50, 0, user_info_len) + user_info_subitems_payload
+            log.debug(f"Packed User Info Item: Type=0x50, Len={user_info_len}")
 
+            # --- Manually build the fixed part of A-ASSOCIATE-RQ ---
+            fixed_part = struct.pack("!HH", 1, 0) # Protocol version (1), reserved
+            fixed_part += self.dst_ae # Called AE Title (already padded)
+            fixed_part += self.src_ae # Calling AE Title (already padded)
+            fixed_part += b'\x00' * 32 # Reserved
 
-        if not response:
-            log.error("No response received for A-ASSOCIATE-RQ (timeout).")
-            self.close()
-            return False
+            # --- Manually build the DICOM UL PDU header ---
+            a_associate_rq_payload = fixed_part + variable_items_payload
+            pdu_length = len(a_associate_rq_payload)
+            pdu_header = struct.pack("!BBI", 0x01, 0, pdu_length) # Type (0x01), reserved, length (!I)
 
-        log.debug("Received Response:")
-        log.debug(response.show(dump=True))
+            # --- Final raw PDU bytes to send ---
+            raw_pdu_to_send = pdu_header + a_associate_rq_payload
+            log.debug(f"Raw A-ASSOCIATE-RQ PDU length: {len(raw_pdu_to_send)}")
+            log.debug(f"Raw PDU Hex: {raw_pdu_to_send.hex('.')}")
 
-        if response.haslayer(A_ASSOCIATE_AC):
-            ac_layer = response[A_ASSOCIATE_AC]
-            log.info("Association Accepted (A-ASSOCIATE-AC received)")
-            # --- Manually Parse AC Variable Items ---
-            # (Scapy's dissection might be okay now, but manual parsing is safer)
-            self.accepted_contexts = {}
+            log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port} (manual build)")
+
             try:
-                # Use the manually parsed list from dissect_payload
-                ac_variable_items = getattr(ac_layer, 'variable_items', [])
-                log.debug(f"Rebuilt bytes of first item dissected by Scapy (len={len(bytes(ac_variable_items[0])) if ac_variable_items else 0}).")
-                total_ac_var_bytes = b''.join(bytes(item) for item in ac_variable_items) # Reconstruct bytes
-                log.debug(f"Manually parsing {len(total_ac_var_bytes)} bytes of AC variable items (reconstructed).")
-                ac_stream = BytesIO(total_ac_var_bytes)
+                # --- Send the raw bytes and wait for response ---
+                self.stream.send(raw_pdu_to_send)
+                log.info("Waiting for association response...")
+                response_raw = self.stream.raw_recv()
+                if not response_raw:
+                    log.error("No response received for A-ASSOCIATE-RQ (timeout).")
+                    self.close()
+                    return False
 
-                while True:
-                    header = ac_stream.read(4)
-                    if len(header) < 4: break
-                    item_type, _, item_length = struct.unpack("!BBH", header)
-                    item_data = ac_stream.read(item_length)
-                    if len(item_data) < item_length: break # Truncated
+                # Attempt to dissect the raw response using Scapy
+                response = DICOM(response_raw)
+                log.debug("Received Response:")
+                log.debug(response.show(dump=True))
 
-                    log.debug(f"  Found Item Type: 0x{item_type:02X}, Length: {item_length}")
-
-                    if item_type == 0x10: # Application Context
-                        uid = item_data.rstrip(b'\x00').decode('ascii')
-                        log.debug(f"    Application Context UID: {uid}")
-                        if uid != APP_CONTEXT_UID: log.warning("Peer accepted different App Context UID!")
-
-                    elif item_type == 0x21: # Presentation Context AC
-                        if len(item_data) >= 4:
-                            ctx_id, _, result, _ = struct.unpack("!BBBB", item_data[:4])
-                            log.debug(f"    Presentation Context AC Item (ID: {ctx_id}):")
-                            log.debug(f"      Result: {result}")
-                            if result == 0: # Acceptance
-                                log.info(f"      Presentation Context ID {ctx_id} ACCEPTED")
-                                # Parse nested Transfer Syntax Item
-                                ts_item_bytes = item_data[4:]
-                                if len(ts_item_bytes) >= 4:
-                                    ts_type, _, ts_len = struct.unpack("!BBH", ts_item_bytes[:4])
-                                    if ts_type == 0x40 and len(ts_item_bytes) >= 4 + ts_len:
-                                        ts_uid_bytes = ts_item_bytes[4:4 + ts_len]
-                                        ts_uid = ts_uid_bytes.rstrip(b'\x00').decode('ascii')
-                                        log.info(f"        Transfer Syntax: {ts_uid}")
-                                        # Find matching requested abstract syntax (requires storing original request)
-                                        # For now, just store accepted context ID and TS UID
-                                        # Need original request details to map abs_syntax
-                                        self.accepted_contexts[ctx_id] = ("<Unknown Abstract Syntax>", ts_uid)
-                                    else: log.warning(f"      Malformed Transfer Syntax sub-item in AC Context {ctx_id}")
-                                else: log.warning(f"      Missing Transfer Syntax sub-item in AC Context {ctx_id}")
-                            else:
-                                log.warning(f"      Presentation Context ID {ctx_id} REJECTED (Reason: {result})")
-                        else: log.warning("    Malformed Presentation Context AC item.")
-
-                    elif item_type == 0x50: # User Information
-                        log.debug("    User Information Item:")
-                        ui_stream = BytesIO(item_data)
-                        while True:
-                             sub_header = ui_stream.read(4)
-                             if len(sub_header) < 4: break
-                             sub_type, _, sub_len = struct.unpack("!BBH", sub_header)
-                             sub_data = ui_stream.read(sub_len)
-                             if len(sub_data) < sub_len: break # Truncated
-
-                             if sub_type == 0x51: # Max Length
-                                 if sub_len == 4:
-                                     max_len = struct.unpack("!I", sub_data)[0]
-                                     self.peer_max_pdu = max_len
-                                     log.info(f"        Peer maximum PDU length: {max_len}")
-                                 else: log.warning(f"        Malformed Max Length sub-item (len={sub_len})")
-                             elif sub_type == 0x52: # Impl Class UID
-                                 uid = sub_data.rstrip(b'\x00').decode('ascii')
-                                 log.info(f"        Peer Implementation Class UID: {uid}")
-                             elif sub_type == 0x55: # Impl Version Name
-                                 name = sub_data.decode('ascii')
-                                 log.info(f"        Peer Implementation Version Name: {name}")
-                             # Add parsing for other User Info sub-items if needed (0x53, 0x54)
+            except KeyboardInterrupt:
+                log.warning("Operation interrupted by user during association.")
+                self.close()
+                return False
             except Exception as e:
-                 log.error(f"Error parsing A-ASSOCIATE-AC variable items manually: {e}", exc_info=True)
-            # Need to retrieve Abstract Syntax UIDs from original request to fully populate accepted_contexts
-            # This requires storing `requested_contexts` or parsing the sent RQ packet.
-            # For now, we mark abstract syntax as unknown in `self.accepted_contexts`.
+                log.error(f"Error sending/receiving association request: {e}", exc_info=True)
+                self.close()
+                return False
 
-            self.assoc_established = True
-            return True
+            # --- Process Response ---
+            if response.haslayer(A_ASSOCIATE_AC):
+                ac_layer = response[A_ASSOCIATE_AC]
+                log.info("Association Accepted (A-ASSOCIATE-AC received)")
+                self.accepted_contexts = {}
+                try:
+                    # Manually parse AC variable items payload (Scapy dissection might be incomplete)
+                    ac_payload_bytes = bytes(ac_layer.payload) # Get raw payload after fixed AC fields
+                    ac_stream = BytesIO(ac_payload_bytes)
+                    while True:
+                        header = ac_stream.read(4)
+                        if len(header) < 4: break
+                        item_type, _, item_length = struct.unpack("!BBH", header)
+                        item_data = ac_stream.read(item_length)
+                        if len(item_data) < item_length:
+                            log.warning(f"Truncated item 0x{item_type:02X} in A-ASSOCIATE-AC")
+                            break
 
-        elif response.haslayer(A_ASSOCIATE_RJ):
-            rj = response[A_ASSOCIATE_RJ]
-            log.error("Association Rejected (A-ASSOCIATE-RJ received)")
-            log.error(f"  Result: {rj.result} ({rj.get_field('result').i2s[rj.result]})")
-            log.error(f"  Source: {rj.source} ({rj.get_field('source').i2s[rj.source]})")
-            # Need careful handling of reason_diag enum keys if they were changed
-            reason_str = rj.get_field('reason_diag').i2s.get(rj.reason_diag, f"Unknown ({rj.reason_diag})")
-            log.error(f"  Reason: {rj.reason_diag} ({reason_str})")
-            self.close()
-            return False
-        else:
-            log.error(f"Unexpected response received for A-ASSOCIATE-RQ: {response.summary()}")
-            self.close()
-            return False
+                        log.debug(f"  Parsing AC Item Type: 0x{item_type:02X}, Length: {item_length}")
+
+                        if item_type == 0x10: # Application Context
+                            uid = item_data.rstrip(b'\x00').decode('ascii')
+                            log.debug(f"    Application Context UID: {uid}")
+                        elif item_type == 0x21: # Presentation Context AC
+                            if len(item_data) >= 4:
+                                ctx_id, _, result, _ = struct.unpack("!BBBB", item_data[:4])
+                                log.debug(f"    Presentation Context AC Item (ID: {ctx_id}): Result: {result}")
+                                if result == 0: # Acceptance
+                                    log.info(f"      Presentation Context ID {ctx_id} ACCEPTED")
+                                    # Parse nested Transfer Syntax Item from item_data[4:]
+                                    ts_item_bytes = item_data[4:]
+                                    if len(ts_item_bytes) >= 4:
+                                        ts_type, _, ts_len = struct.unpack("!BBH", ts_item_bytes[:4])
+                                        if ts_type == 0x40 and len(ts_item_bytes) >= 4 + ts_len:
+                                            ts_uid_bytes = ts_item_bytes[4:4 + ts_len]
+                                            ts_uid = ts_uid_bytes.rstrip(b'\x00').decode('ascii')
+                                            log.info(f"        Transfer Syntax: {ts_uid}")
+                                            # Map back to Abstract Syntax using context_id_map
+                                            abs_syntax = context_id_map.get(ctx_id, "<Unknown Abstract Syntax>")
+                                            self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
+                                        else: log.warning(f"      Malformed/Truncated TS sub-item in AC Ctx {ctx_id}")
+                                    else: log.warning(f"      Missing/Truncated TS sub-item in AC Ctx {ctx_id}")
+                                else: log.warning(f"      Presentation Context ID {ctx_id} REJECTED (Reason: {result})")
+                            else: log.warning("    Malformed/Truncated Pres Context AC item data.")
+                        elif item_type == 0x50: # User Information
+                            log.debug("    User Information Item:")
+                            ui_stream = BytesIO(item_data)
+                            while True: # Loop through sub-items
+                                sub_header = ui_stream.read(4)
+                                if len(sub_header) < 4: break
+                                sub_type, _, sub_len = struct.unpack("!BBH", sub_header)
+                                sub_data = ui_stream.read(sub_len)
+                                if len(sub_data) < sub_len:
+                                    log.warning(f"      Truncated user info sub-item 0x{sub_type:02X}")
+                                    break
+                                if sub_type == 0x51: # Max Length
+                                    if sub_len == 4:
+                                        max_len = struct.unpack("!I", sub_data)[0]
+                                        self.peer_max_pdu = max_len
+                                        log.info(f"        Peer maximum PDU length: {max_len}")
+                                    else: log.warning(f"        Malformed Max Length sub-item (len={sub_len})")
+                                elif sub_type == 0x52: # Impl Class UID
+                                    uid = sub_data.rstrip(b'\x00').decode('ascii')
+                                    log.info(f"        Peer Implementation Class UID: {uid}")
+                                elif sub_type == 0x55: # Impl Version Name
+                                    try:
+                                        name = sub_data.decode('ascii')
+                                        log.info(f"        Peer Implementation Version Name: {name}")
+                                    except UnicodeDecodeError:
+                                        log.warning(f"        Peer Implementation Version Name contains non-ASCII data: {sub_data.hex()}")
+                                # Add parsing for other sub-items if needed
+
+                except Exception as e:
+                    log.error(f"Error parsing A-ASSOCIATE-AC variable items manually: {e}", exc_info=True)
+
+                self.assoc_established = True
+                return True
+
+            elif response.haslayer(A_ASSOCIATE_RJ):
+                rj = response[A_ASSOCIATE_RJ]
+                log.error("Association Rejected (A-ASSOCIATE-RJ received)")
+                log.error(f"  Result: {rj.result} ({rj.get_field('result').i2s.get(rj.result, 'Unknown')})")
+                log.error(f"  Source: {rj.source} ({rj.get_field('source').i2s.get(rj.source, 'Unknown')})")
+                reason_str = rj.get_field('reason_diag').i2s.get(rj.reason_diag, f"Unknown ({rj.reason_diag})")
+                log.error(f"  Reason: {rj.reason_diag} ({reason_str})")
+                self.close()
+                return False
+            else:
+                log.error(f"Unexpected response PDU type received: {response.summary()}")
+                self.close()
+                return False
 
     def send_p_data(self, pdv_list):
         """Sends one or more PDV items within a P-DATA-TF PDU."""

@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install scapy
-          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk
+          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk netcat-openbsd
 
       - name: Start tcpdump capture
         id: start_tcpdump
@@ -74,35 +74,39 @@ jobs:
             --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
             "${ENV_FLAGS[@]}" \
             ${{ matrix.dicom_server.image }} \
-            ${{ matrix.dicom_server.command }} \
-            || { echo "::error::Failed to start container ${{ matrix.dicom_server.name }}"; exit 1; }
+            ${{ matrix.dicom_server.command }}
+          # Check exit code AFTER command completes
+          docker_run_exit_code=$?
+          if [ $docker_run_exit_code -ne 0 ]; then
+            echo "::error::Failed to start container ${{ matrix.dicom_server.name }} (docker run failed with code $docker_run_exit_code)"
+            exit 1
+          fi
 
-          # === Simplified Port Check Logic with Manual Timeout ===
+          # === Simplified Port Check Logic using netcat ===
           echo "Waiting for ${{ matrix.dicom_server.name }} (port ${{ matrix.dicom_server.port }}) to become available (max 60s)..."
           count=0
           max_wait=120 # 120 * 0.5s = 60 seconds
-          port_open=0
+          success=0
           while [ $count -lt $max_wait ]; do
-            # Check if container is still running first
+            # Check container first
             if ! docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }} --format "{{.ID}}" | grep -q .; then
-              echo "" # Newline
-              echo "::error::Container exited while waiting for port." >&2
-              exit 1 # Fail the step
+                echo "" # Newline
+                echo "::error::Container exited while waiting for port." >&2
+                exit 1 # Fail the step
             fi
-
-            # Attempt TCP connection (redirect errors to null)
-            if printf "" > /dev/tcp/127.0.0.1/${{ matrix.dicom_server.port }} 2>/dev/null; then
-              port_open=1
+            # Check port using nc
+            if nc -z -w 1 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+              success=1
+              echo " Port detected as open." # Loop succeeded
               break # Exit loop if port is open
             fi
-
             echo -n "." # Print progress dot
             sleep 0.5
             count=$((count + 1))
           done
-          echo "" # Newline after dots
+          echo "" # Newline
 
-          if [ $port_open -eq 0 ]; then
+          if [ $success -eq 0 ]; then
             echo "::error::Timeout waiting for port ${{ matrix.dicom_server.port }}." >&2
             # Attempt to get logs on failure
             echo "Attempting to get logs on failure..." >&2
