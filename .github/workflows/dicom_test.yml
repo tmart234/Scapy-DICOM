@@ -67,6 +67,7 @@ jobs:
           echo "Using Env Vars: ${ENV_FLAGS[@]}"
           echo "Using Command: ${{ matrix.dicom_server.command }}"
 
+          # Run docker run first
           docker run \
             --detach \
             --rm \
@@ -94,7 +95,8 @@ jobs:
                 echo "::error::Container exited while waiting for port." >&2
                 exit 1 # Fail the step
             fi
-            # Check port using nc
+            # Check port using nc (-z: zero-I/O mode, -w 1: timeout 1s)
+            # Added -N to nc flags for OpenBSD netcat version if needed (some systems require it to exit after connect)
             if nc -z -w 1 127.0.0.1 ${{ matrix.dicom_server.port }}; then
               success=1
               echo " Port detected as open." # Loop succeeded
@@ -116,7 +118,7 @@ jobs:
 
           echo "${{ matrix.dicom_server.name }} port is open and container appears running."
           sleep 2 # Keep the short grace period
-
+          
       - name: Run echoscu Test against ${{ matrix.dicom_server.name }}
         run: |
           echo "Running echoscu -v -aet SCAPY_CI_SCU -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }}"
