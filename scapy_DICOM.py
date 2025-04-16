@@ -933,6 +933,9 @@ class DICOMSession:
         # --- Build Variable Items ---
         # 1. Application Context Item
         app_context = DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))
+        # Manually calculate app_context length and ensure correct build (optional but safer)
+        app_context.length = len(app_context.data)
+
 
         # 2. Presentation Context Items
         pres_items_list = []
@@ -940,17 +943,23 @@ class DICOMSession:
         for abs_syntax, trn_syntaxes in requested_contexts.items():
             # Build Abstract Syntax Sub-item
             abs_syntax_item = AbstractSyntaxSubItem(abstract_syntax_uid=abs_syntax)
+            abs_syntax_bytes = bytes(abs_syntax_item) # Build bytes early
+
             # Build Transfer Syntax Sub-items list
-            trn_syntax_items = [TransferSyntaxSubItem(transfer_syntax_uid=ts) for ts in trn_syntaxes]
+            trn_syntax_items_bytes = b"".join(
+                bytes(TransferSyntaxSubItem(transfer_syntax_uid=ts)) for ts in trn_syntaxes
+            ) # Build bytes early
 
             # Combine sub-items into Presentation Context 'data'
             # Fixed part (context_id, reserved) + abstract syntax bytes + transfer syntax bytes
             pres_data_header = struct.pack("!BBBB", context_id_counter, 0, 0, 0)
-            pres_data_payload = bytes(abs_syntax_item) + b"".join(bytes(ts) for ts in trn_syntax_items)
-            pres_total_data = pres_data_header + pres_data_payload
+            pres_total_data = pres_data_header + abs_syntax_bytes + trn_syntax_items_bytes
 
-            # Create the Presentation Context RQ Item
-            pres_item = DICOMVariableItem(item_type=0x20, data=pres_total_data)
+            # *** FIX: Explicitly create and set length for the Pres Context Item ***
+            pres_item = DICOMVariableItem(item_type=0x20) # Create item
+            pres_item.data = pres_total_data            # Set data
+            pres_item.length = len(pres_total_data)     # Explicitly set length
+
             pres_items_list.append(pres_item)
             context_id_counter += 2 # Increment by 2 to keep it odd
 
@@ -962,17 +971,17 @@ class DICOMSession:
         ]
         user_info_data = b"".join(bytes(item) for item in user_info_subitems)
         user_info_item = DICOMVariableItem(item_type=0x50, data=user_info_data)
-
+        # Manually calculate user_info length and ensure correct build (optional but safer)
+        user_info_item.length = len(user_info_item.data)
         # Combine all variable items
         all_variable_items = [app_context] + pres_items_list + [user_info_item]
 
         # --- Build A-ASSOCIATE-RQ PDU ---
         assoc_rq = DICOM()/A_ASSOCIATE_RQ(
-             called_ae_title=self.dst_ae,
-             calling_ae_title=self.src_ae,
-             # variable_items field is populated manually below or via build_payload
+            called_ae_title=self.dst_ae,
+            calling_ae_title=self.src_ae,
         )
-        # Assign manually built items (needed because dissect_payload overwrites)
+        # Assign manually built items
         assoc_rq[A_ASSOCIATE_RQ].variable_items = all_variable_items
 
         log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port}")
