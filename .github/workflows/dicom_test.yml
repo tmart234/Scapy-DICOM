@@ -14,18 +14,17 @@ jobs:
       matrix:
         dicom_server:
           - name: Orthanc
-            image: orthancteam/orthanc:latest 
+            image: orthancteam/orthanc:latest
             aet: ORTHANC_CI
             port: 4242
-            env_vars: "-e VERBOSE_ENABLED=true -e DICOM_AET={aet} -e DICOM_PORT={port}" # Simplified env var handling
-            command: "--verbose"
+            # env_vars: (Removed - handled dynamically below)
+            command: "--verbose /etc/orthanc/" # Point to config dir
 
           - name: Pydicom_pynetdicom
             image: pydicom/dicom:latest
             aet: PYDICOM_SCP
             port: 11112
-            env_vars: "" 
-
+            # env_vars: (Removed - handled dynamically below)
             command: >
               python -m pynetdicom echoscp
               --ae-title PYDICOM_SCP
@@ -44,32 +43,40 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install scapy  # Assuming your scapy_DICOM.py is in the repo
-          sudo apt-get update && sudo apt-get install -y tshark
+          # Assuming your scapy_DICOM.py is in the repo and requires scapy
+          pip install scapy
+          # Install tcpdump for network capture
+          sudo apt-get update && sudo apt-get install -y tcpdump
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Optional: Log in to Docker Hub if using private images (unlikely for these examples)
+      # - name: Log in to Docker Hub
+      #   uses: docker/login-action@v3
+      #   with:
+      #     username: ${{ secrets.DOCKERHUB_USERNAME }}
+      #     password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Start tcpdump capture
         id: start_tcpdump
         run: |
-          echo "Available network interfaces:"
-          ip addr show
-          echo "----------"
-          sudo tcpdump -D
-          # Capture on 'any' interface for any relevant port (more robust for matrix)
+          echo "Starting tcpdump capture for port ${{ matrix.dicom_server.port }}..."
           sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w dicom_capture_${{ matrix.dicom_server.name }}.pcap &
           echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
 
       - name: Start DICOM SCP (${{ matrix.dicom_server.name }})
         run: |
           echo "Starting ${{ matrix.dicom_server.name }} container..."
-          # Replace AET and Port in env_vars string template
-          ENV_VARS_PROCESSED=$(echo "${{ matrix.dicom_server.env_vars }}" | sed 's/{aet}/${{ matrix.dicom_server.aet }}/g' | sed 's/{port}/${{ matrix.dicom_server.port }}/g')
-          echo "Using Env Vars: $ENV_VARS_PROCESSED"
+          # Build ENV flags array dynamically
+          ENV_FLAGS=()
+          if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
+            ENV_FLAGS+=("-e" "VERBOSE_ENABLED=true")
+            ENV_FLAGS+=("-e" "DICOM_AET=${{ matrix.dicom_server.aet }}")
+            ENV_FLAGS+=("-e" "DICOM_PORT=${{ matrix.dicom_server.port }}")
+            # Configure Orthanc to accept connections from any calling AET
+            ENV_FLAGS+=("-e" "ORTHANC__ACCEPT_UNKNOWN_PEERS=true")
+            # Optional: Disable AE title checking if the above doesn't work alone
+            # ENV_FLAGS+=("-e" "ORTHANC__DICOM_CHECK_CALLING_AET=false")
+          fi
+          echo "Using Env Vars: ${ENV_FLAGS[@]}"
           echo "Using Command: ${{ matrix.dicom_server.command }}"
 
           docker run \
@@ -77,23 +84,25 @@ jobs:
             --rm \
             --name dicom-scp-test-${{ matrix.dicom_server.name }} \
             --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
-            $ENV_VARS_PROCESSED \
+            "${ENV_FLAGS[@]}" \
             ${{ matrix.dicom_server.image }} \
             ${{ matrix.dicom_server.command }}
 
-          echo "Waiting for ${{ matrix.dicom_server.name }} to start..."
-          sleep 20
+          # Wait for the port to be open before proceeding
+          echo "Waiting for ${{ matrix.dicom_server.name }} (port ${{ matrix.dicom_server.port }}) to become available..."
+          timeout 60 bash -c 'until printf "" > /dev/tcp/127.0.0.1/${{ matrix.dicom_server.port }}; do sleep 0.5; done' \
+            || (echo "Error: Timeout waiting for port ${{ matrix.dicom_server.port }}"; docker logs dicom-scp-test-${{ matrix.dicom_server.name }}; exit 1)
+          echo "${{ matrix.dicom_server.name }} port is open."
+          sleep 2 # Short extra grace period
 
           echo "Checking if container is running..."
           docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }}
-          # Add a small delay after check to ensure service inside is ready
-          sleep 5
 
       - name: Run DICOM Integration Test Script against ${{ matrix.dicom_server.name }}
         id: test_script
-        continue-on-error: true
+        continue-on-error: true # Allow subsequent cleanup steps even if test fails
         run: |
-          python test_integration.py \
+          python Scapy-DICOM/test_integration.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -101,38 +110,40 @@ jobs:
             --debug
 
       - name: Stop tcpdump capture
-        if: always()
+        if: always() # Ensure tcpdump stops even if tests fail
         run: |
           echo "Stopping tcpdump (PID: ${{ steps.start_tcpdump.outputs.tcpdump_pid }})..."
           if [ -n "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" ]; then
-            sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump (PID: ${{ steps.start_tcpdump.outputs.tcpdump_pid }}) already stopped or kill failed."
+            # Send SIGTERM first, then SIGKILL if needed after a short wait
+            sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump already stopped or kill failed."
+            sleep 2
+            sudo kill -0 ${{ steps.start_tcpdump.outputs.tcpdump_pid }} 2>/dev/null && sudo kill -9 ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump cleanly stopped."
           else
             echo "tcpdump PID not found in step outputs."
           fi
           sleep 2
 
       - name: Upload pcap artifact (${{ matrix.dicom_server.name }})
-        if: always()
+        if: always() # Upload capture regardless of test outcome
         uses: actions/upload-artifact@v4
         with:
-          name: dicom-pcap-capture-${{ matrix.dicom_server.name }} # Unique name per server
+          name: dicom-pcap-capture-${{ matrix.dicom_server.name }}
           path: dicom_capture_${{ matrix.dicom_server.name }}.pcap
+          if-no-files-found: ignore # Don't fail workflow if pcap is empty/missing
 
       - name: Show ${{ matrix.dicom_server.name }} Logs
-        if: always()
+        if: always() # Show logs regardless of test outcome
         run: |
-           echo "--- ${{ matrix.dicom_server.name }} SCP Logs ---"
-           sleep 2
-           docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get logs for ${{ matrix.dicom_server.name }}."
-
+          echo "--- ${{ matrix.dicom_server.name }} SCP Logs ---"
+          docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get logs for ${{ matrix.dicom_server.name }}."
 
       - name: Stop ${{ matrix.dicom_server.name }} Container
-        if: always()
+        if: always() # Ensure container is stopped/removed
         run: |
           echo "Stopping ${{ matrix.dicom_server.name }} SCP container..."
           docker stop dicom-scp-test-${{ matrix.dicom_server.name }} || echo "${{ matrix.dicom_server.name }} container already stopped or could not be stopped."
 
-      # Fail the overall job if the test script step failed FOR THIS MATRIX ENTRY
+      # Fail the overall job if the test script step failed
       - name: Check test script outcome for ${{ matrix.dicom_server.name }}
         if: steps.test_script.outcome != 'success'
         run: |
