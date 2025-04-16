@@ -164,6 +164,7 @@ jobs:
           if [[ -f "$PCAP_FILE" ]]; then
             echo "--- PCAP Info for $PCAP_FILE ---"
             capinfos "$PCAP_FILE"
+            tshark -r "$PCAP_FILE" -c 150
           else
             echo "PCAP file $PCAP_FILE not found."
           fi
