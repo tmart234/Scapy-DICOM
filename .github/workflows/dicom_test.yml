@@ -43,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install scapy
-          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk netcat-openbsd
+          sudo apt-get update && sudo apt-get install -y tcpdump dcmtk netcat-openbsd wireshark-common
 
       - name: Start tcpdump capture
         id: start_tcpdump
@@ -156,6 +156,18 @@ jobs:
             echo "tcpdump PID not found in step outputs."
           fi
           sleep 2
+      
+      - name: Print PCAP Info (${{ matrix.dicom_server.name }}) # Use dynamic name in step title too
+        if: always() # Run even if previous steps failed, to analyze capture
+        run: |
+          PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
+          if [[ -f "$PCAP_FILE" ]]; then
+            echo "--- PCAP Info for $PCAP_FILE ---"
+            capinfos "$PCAP_FILE"
+          else
+            echo "PCAP file $PCAP_FILE not found."
+          fi
+        continue-on-error: true # Keep this if you don't want capinfos issues to fail the job
 
       - name: Upload pcap artifact (${{ matrix.dicom_server.name }})
         if: always()
