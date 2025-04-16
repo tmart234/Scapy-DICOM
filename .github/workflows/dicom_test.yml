@@ -45,17 +45,15 @@ jobs:
           pip install scapy
           sudo apt-get update && sudo apt-get install -y tcpdump
 
-      # - name: Log in to Docker Hub ... (Optional)
-
-      - name: Start tcpdump capture
-        id: start_tcpdump
-        run: |
-          echo "Starting tcpdump capture for port ${{ matrix.dicom_server.port }}..."
-          sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w dicom_capture_${{ matrix.dicom_server.name }}.pcap &
-          echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
-
+          - name: Start tcpdump capture
+          id: start_tcpdump
+          run: |
+            echo "Starting tcpdump capture for port ${{ matrix.dicom_server.port }}..."
+            sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w dicom_capture_${{ matrix.dicom_server.name }}.pcap &
+            echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
+  
       - name: Start DICOM SCP (${{ matrix.dicom_server.name }})
-        id: start_scp # Give this step an ID
+        id: start_scp
         run: |
           echo "Starting ${{ matrix.dicom_server.name }} container..."
           # Build ENV flags array dynamically
@@ -69,7 +67,6 @@ jobs:
           echo "Using Env Vars: ${ENV_FLAGS[@]}"
           echo "Using Command: ${{ matrix.dicom_server.command }}"
 
-          # Use standard Docker SDK exit codes where possible
           docker run \
             --detach \
             --rm \
@@ -78,21 +75,40 @@ jobs:
             "${ENV_FLAGS[@]}" \
             ${{ matrix.dicom_server.image }} \
             ${{ matrix.dicom_server.command }} \
-            || { echo "::error::Failed to start container ${{ matrix.dicom_server.name }}"; exit 1; } # Exit if docker run fails
+            || { echo "::error::Failed to start container ${{ matrix.dicom_server.name }}"; exit 1; }
 
-          # Wait for the port to be open before proceeding
+          # === Corrected Port Check Logic ===
           echo "Waiting for ${{ matrix.dicom_server.name }} (port ${{ matrix.dicom_server.port }}) to become available..."
-          timeout 60 bash -c 'until printf "" > /dev/tcp/127.0.0.1/${{ matrix.dicom_server.port }}; do sleep 0.5; docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }} --format "{{.ID}}" | grep -q . || { echo "::error::Container exited while waiting for port."; exit 1; } ; done' \
-            || (echo "::error::Timeout or container exit waiting for port ${{ matrix.dicom_server.port }}"; docker logs dicom-scp-test-${{ matrix.dicom_server.name }} &> >(tee startup_logs_${{ matrix.dicom_server.name }}.txt); exit 1)
-            # Also check if container is still running inside the loop ^^^
-            # Capture logs on timeout/exit ^^^
+          # Use a temporary file for loop status to avoid complex inline error handling
+          touch loop_status_ok.txt
+          if ! timeout 60 bash -c '
+              while ! printf "" > /dev/tcp/127.0.0.1/${{ matrix.dicom_server.port }}; do
+                sleep 0.5;
+                # Check if container is still running
+                if ! docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }} --format "{{.ID}}" | grep -q .; then
+                  echo "::error::Container exited while waiting for port." >&2
+                  rm loop_status_ok.txt # Signal failure
+                  exit 1 # Exit the subshell loop
+                fi
+              done'; then
+              # This block executes if timeout occurs OR if the inner loop exited with error (container gone)
+              if [[ -f loop_status_ok.txt ]]; then
+                # Timeout occurred, container was likely still running
+                echo "::error::Timeout waiting for port ${{ matrix.dicom_server.port }} to open." >&2
+              fi
+              rm -f loop_status_ok.txt # Clean up status file
+              # Try to get logs even on failure
+              echo "Attempting to get logs on failure..." >&2
+              docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not retrieve logs on failure." >&2
+              exit 1 # Fail the step
+          fi
+          rm -f loop_status_ok.txt # Clean up status file on success
 
           echo "${{ matrix.dicom_server.name }} port is open and container appears running."
-          sleep 2 # Short extra grace period
+          sleep 2
 
-      # *** NEW STEP: Show logs immediately after port check ***
       - name: Show ${{ matrix.dicom_server.name }} Logs (Post-Start)
-        if: always() && steps.start_scp.outcome == 'success' # Only run if start step thinks it succeeded
+        if: always() && steps.start_scp.outcome == 'success'
         run: |
           echo "--- ${{ matrix.dicom_server.name }} SCP Logs (Post-Start Check) ---"
           docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get logs for ${{ matrix.dicom_server.name }} (Post-Start)."
@@ -101,20 +117,26 @@ jobs:
         id: test_script
         continue-on-error: true
         run: |
-          # Assuming test_integration.py is in the repo root now based on previous fix
+          # === Add timeout argument, especially for Orthanc ===
+          TIMEOUT=20 # Default timeout
+          if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
+            TIMEOUT=45 # Increase timeout for Orthanc
+          fi
+          echo "Using timeout: $TIMEOUT seconds"
+
+          # Assuming test_integration.py is in the repo root
+          # NOTE: You might need to add --timeout $TIMEOUT to test_integration.py arguments first!
           python test_integration.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
             --calling-ae SCAPY_CI_SCU \
+            --timeout $TIMEOUT \
             --debug
-
-      # ... (rest of the steps: stop tcpdump, upload artifact, final logs, stop container, check outcome) ...
 
       - name: Stop tcpdump capture
         if: always()
         run: |
-          # ... (tcpdump stop logic as before) ...
           echo "Stopping tcpdump (PID: ${{ steps.start_tcpdump.outputs.tcpdump_pid }})..."
           if [ -n "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" ]; then
             sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump already stopped or kill failed."
@@ -137,13 +159,7 @@ jobs:
         if: always()
         run: |
           echo "--- ${{ matrix.dicom_server.name }} SCP Logs (Final) ---"
-          # Attempt to show logs captured on timeout/exit first
-          if [[ -f "startup_logs_${{ matrix.dicom_server.name }}.txt" ]]; then
-            echo "Captured startup logs:"
-            cat startup_logs_${{ matrix.dicom_server.name }}.txt
-          fi
-          # Then try getting live logs
-          docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get live logs for ${{ matrix.dicom_server.name }} (Final)."
+          docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get logs for ${{ matrix.dicom_server.name }} (Final)."
 
       - name: Stop ${{ matrix.dicom_server.name }} Container
         if: always()
