@@ -762,16 +762,17 @@ class P_DATA_TF(Packet):
         """
         self.parsed_pdv_items = []
         # Determine the exact number of bytes belonging to this PDU's payload
+        # The 'length' field of the DICOM layer specifies the length of the PDU *after* the header (Type, Reserved, Length)
         total_payload_len = getattr(self.underlayer, 'length', len(s))
-        log.debug(f"P_DATA_TF.dissect_payload: Starting. UL length = {total_payload_len}. Available bytes = {len(s)}.")
+        log.debug(f"P_DATA_TF.dissect_payload: Starting. UL length field = {total_payload_len}. Available bytes in buffer = {len(s)}.")
 
-        # Determine the actual bytes to process from 's'
+        # Determine the actual bytes to process from 's' based on UL length
         if total_payload_len > len(s):
-            log.warning(f"P_DATA_TF.dissect_payload: UL length {total_payload_len} > available bytes {len(s)}. Processing only available bytes.")
+            log.warning(f"P_DATA_TF.dissect_payload: UL length ({total_payload_len}) > available bytes ({len(s)}). Processing only available bytes.")
             payload_to_process = s
             remaining_after_pdu = b'' # No bytes left after this PDU
         elif total_payload_len < len(s):
-             log.warning(f"P_DATA_TF.dissect_payload: UL length {total_payload_len} < available bytes {len(s)}. Processing UL length; {len(s) - total_payload_len} bytes will remain.")
+             log.debug(f"P_DATA_TF.dissect_payload: UL length ({total_payload_len}) < available bytes ({len(s)}). Processing UL length; {len(s) - total_payload_len} bytes will remain for next PDU.")
              payload_to_process = s[:total_payload_len]
              remaining_after_pdu = s[total_payload_len:] # Bytes belonging to the *next* PDU
         else:
@@ -780,7 +781,7 @@ class P_DATA_TF(Packet):
             remaining_after_pdu = b'' # No bytes left after this PDU
 
 
-        log.debug(f"P_DATA_TF.dissect_payload: Processing {len(payload_to_process)} bytes. Remaining after PDU: {len(remaining_after_pdu)}")
+        log.debug(f"P_DATA_TF.dissect_payload: Determined PDU payload length to process: {len(payload_to_process)}. Remaining after PDU: {len(remaining_after_pdu)}")
         stream = BytesIO(payload_to_process)
         processed_bytes_count = 0
 
@@ -788,86 +789,97 @@ class P_DATA_TF(Packet):
             start_offset = stream.tell()
             log.debug(f" P_DATA_TF loop: Current offset={start_offset}, Total to process={len(payload_to_process)}")
 
-            # Read PDV Item Length (4 bytes, Big Endian)
+            # --- Read PDV Item Length (4 bytes, Big Endian) ---
             if start_offset + 4 > len(payload_to_process):
                  log.warning(f" P_DATA_TF loop: Not enough bytes left ({len(payload_to_process) - start_offset}) for PDV length field. Stopping parse.")
                  break
 
             packed_length_bytes = stream.read(4)
-            # This check should be redundant now, but safe:
-            if len(packed_length_bytes) < 4:
+            if len(packed_length_bytes) < 4: # Should be redundant, but safe
                 log.warning(f" P_DATA_TF loop: Short read on PDV length field (got {len(packed_length_bytes)} bytes). Stopping parse.")
                 stream.seek(start_offset) # Rewind to include these bytes as leftovers
-                break # Stop processing
+                break
 
             try:
+                # --- Unpack PDV Value Length ---
                 pdv_value_len = struct.unpack("!I", packed_length_bytes)[0]
                 log.debug(f" P_DATA_TF loop: Read PDV Value Length = {pdv_value_len}")
+
+                # --- Check if Declared Length Fits ---
+                current_stream_pos_after_len = stream.tell()
+                bytes_remaining_in_stream = len(payload_to_process) - current_stream_pos_after_len
+                if pdv_value_len > bytes_remaining_in_stream:
+                    log.warning(f" P_DATA_TF loop: Declared PDV value length ({pdv_value_len}) exceeds remaining bytes in PDU payload ({bytes_remaining_in_stream}). Truncated item? Stopping parse.")
+                    stream.seek(start_offset) # Rewind before this item's length field
+                    break
+
+                # --- Read PDV Value (Context ID, Msg Hdr, Data) ---
+                log.debug(f" P_DATA_TF loop: Attempting to read {pdv_value_len} bytes for PDV value...")
+                pdv_value_bytes = stream.read(pdv_value_len)
+                log.debug(f" P_DATA_TF loop: Read {len(pdv_value_bytes)} actual bytes for value.")
+
+                if len(pdv_value_bytes) < pdv_value_len:
+                    # This shouldn't happen due to the check above, but safety first
+                    log.error(f" P_DATA_TF loop: Short read for PDV value. Expected {pdv_value_len}, got {len(pdv_value_bytes)}. Stopping parse.")
+                    stream.seek(start_offset) # Rewind
+                    break
+
+                # --- Check Minimum Value Length (Context ID + Header) ---
+                if len(pdv_value_bytes) < 2:
+                    log.error(f" P_DATA_TF loop: PDV value too short ({len(pdv_value_bytes)} bytes) for Context ID and Header. Stopping parse.")
+                    stream.seek(start_offset) # Rewind
+                    break
+
+                # --- Parse Value Components ---
+                context_id = pdv_value_bytes[0]
+                msg_hdr = pdv_value_bytes[1]
+                data_bytes = pdv_value_bytes[2:]
+                log.debug(f" P_DATA_TF loop: Parsed ContextID={context_id}, MsgHdr={msg_hdr:02X} (Cmd={(msg_hdr & 0x01)}, Last={(msg_hdr >> 1) & 0x01}), DataLen={len(data_bytes)}")
+
+                # --- Create and Populate PDV Item Object ---
+                try:
+                    log.debug(" P_DATA_TF loop: Creating PresentationDataValueItem instance...")
+                    pdv_item = PresentationDataValueItem()
+                    pdv_item.context_id = context_id
+                    pdv_item.message_control_header = msg_hdr
+                    pdv_item.data = data_bytes
+                    pdv_item._parsed_pdv_value_len = pdv_value_len # Store the parsed length
+                    log.debug(f" P_DATA_TF loop: Appending PDV Item object: {pdv_item.summary()}")
+                    self.parsed_pdv_items.append(pdv_item) # <-- THE CRITICAL STEP
+                    log.debug(f" P_DATA_TF loop: Successfully appended PDV Item. List size now: {len(self.parsed_pdv_items)}")
+                except Exception as item_ex:
+                    # Log the specific error during item creation/appending
+                    log.error(f" P_DATA_TF loop: Failed to create/append PDV Item object: {item_ex}", exc_info=True)
+                    stream.seek(start_offset) # Rewind before problematic item
+                    break # Stop parsing this PDU
+
             except struct.error as e:
-                log.error(f" P_DATA_TF loop: Error unpacking PDV length: {e}. Stopping parse.")
+                log.error(f" P_DATA_TF loop: Struct error unpacking PDV length at offset {start_offset}: {e}. Stopping parse.", exc_info=True)
                 stream.seek(start_offset) # Rewind
                 break
-
-            # Check if the declared length fits within the remaining PDU payload
-            current_stream_pos = stream.tell()
-            bytes_remaining_in_stream = len(payload_to_process) - current_stream_pos
-            if pdv_value_len > bytes_remaining_in_stream:
-                log.warning(f" P_DATA_TF loop: PDV value length ({pdv_value_len}) exceeds remaining bytes in stream ({bytes_remaining_in_stream}). Truncated item? Stopping parse.")
-                stream.seek(start_offset) # Rewind
-                break
-
-            # Read the PDV Value (Context ID, Msg Hdr, Data)
-            log.debug(f" P_DATA_TF loop: Reading {pdv_value_len} bytes for PDV value...")
-            pdv_value_bytes = stream.read(pdv_value_len)
-            if len(pdv_value_bytes) < pdv_value_len:
-                 # This shouldn't happen due to the check above, but safety first
-                 log.error(f" P_DATA_TF loop: Short read for PDV value. Expected {pdv_value_len}, got {len(pdv_value_bytes)}. Stopping parse.")
-                 stream.seek(start_offset) # Rewind
+            except Exception as e: # Catch other potential errors during processing
+                 log.error(f" P_DATA_TF loop: Unexpected error processing PDV at offset {start_offset}: {e}", exc_info=True)
+                 stream.seek(start_offset)
                  break
 
-            # Check minimum length for Context ID and Message Control Header
-            if len(pdv_value_bytes) < 2:
-                 log.error(f" P_DATA_TF loop: PDV value too short ({len(pdv_value_bytes)} bytes) for Context ID and Header. Stopping parse.")
-                 stream.seek(start_offset) # Rewind
-                 break
 
-            # Parse the PDV Item components
-            context_id = pdv_value_bytes[0]
-            msg_hdr = pdv_value_bytes[1]
-            data_bytes = pdv_value_bytes[2:]
-            log.debug(f" P_DATA_TF loop: Parsed ContextID={context_id}, MsgHdr={msg_hdr}, DataLen={len(data_bytes)}")
-
-            # Create and populate the PresentationDataValueItem instance
-            try:
-                pdv_item = PresentationDataValueItem()
-                pdv_item.context_id = context_id
-                pdv_item.message_control_header = msg_hdr
-                pdv_item.data = data_bytes
-                pdv_item._parsed_pdv_value_len = pdv_value_len # Store the parsed length
-                log.debug(f" P_DATA_TF loop: Created PDV Item object: {pdv_item.summary()}")
-                self.parsed_pdv_items.append(pdv_item)
-                log.debug(f" P_DATA_TF loop: Successfully appended PDV Item. List size now: {len(self.parsed_pdv_items)}")
-            except Exception as item_ex:
-                log.error(f" P_DATA_TF loop: Failed to create/append PDV Item object: {item_ex}", exc_info=True)
-                stream.seek(start_offset) # Rewind before problematic item
-                break # Stop parsing this PDU
+            # --- Update Processed Bytes Count ---
+            processed_bytes_count = stream.tell() # Update based on stream's current position
+            log.debug(f" P_DATA_TF loop: End of loop iteration. processed_bytes_count updated to {processed_bytes_count}")
 
 
-            # Update processed bytes count for the outer loop condition
-            processed_bytes_count = stream.tell()
-            log.debug(f" P_DATA_TF loop: processed_bytes_count updated to {processed_bytes_count}")
-
-
+        # --- Handle Leftover Bytes ---
         # After loop: Check if any bytes remain in the stream (part of this PDU but unparsed)
         leftover_pdu_bytes = stream.read()
         if leftover_pdu_bytes:
-            log.warning(f"P_DATA_TF.dissect_payload: {len(leftover_pdu_bytes)} unparsed bytes remaining within PDU payload buffer.")
+            log.warning(f"P_DATA_TF.dissect_payload: {len(leftover_pdu_bytes)} unparsed bytes remaining within PDU payload buffer (offset {processed_bytes_count} to {len(payload_to_process)}).")
             # Prepend these leftovers to the bytes belonging to the next PDU
             remaining_after_pdu = leftover_pdu_bytes + remaining_after_pdu
 
-        # Assign the remaining bytes (belonging to the *next* PDU or unparsed) to payload
+        # Assign the remaining bytes (belonging to the *next* PDU or unparsed) to Scapy's payload field
         self.payload = Raw(remaining_after_pdu) if remaining_after_pdu else NoPayload()
         log.debug(f"P_DATA_TF.dissect_payload: Finished. Parsed {len(self.parsed_pdv_items)} PDV items. Next layer payload length: {len(self.payload.load if isinstance(self.payload, Raw) else 0)}")
+
 
     def build_payload(self):
         """Builds the P-DATA-TF payload by concatenating the bytes of PDV items."""
@@ -901,11 +913,6 @@ bind_layers(DICOM, P_DATA_TF, pdu_type=0x04) # <-- Binding for P-DATA-TF
 bind_layers(DICOM, A_RELEASE_RQ, pdu_type=0x05)
 bind_layers(DICOM, A_RELEASE_RP, pdu_type=0x06)
 bind_layers(DICOM, A_ABORT, pdu_type=0x07)
-
-# NOTE: Binding Variable Items (0x10, 0x20, 0x21, 0x50 etc.) to specific payload
-# within A-ASSOCIATE-RQ/AC is complex due to the list structure. Manual dissection
-# as implemented in A_ASSOCIATE_RQ.dissect_payload is generally more reliable.
-# Similarly, binding sub-items within User Info or Presentation Context is tricky.
 
 
 # --- DICOM Session Helper Class (Optional, but useful for tests) ---
@@ -1170,26 +1177,61 @@ class DICOMSession:
 
         log.info("Sending A-RELEASE-RQ...")
         release_rq = DICOM()/A_RELEASE_RQ()
-        response = self.stream.sr1(release_rq, timeout=self.read_timeout, verbose=False)
 
-        if not response:
-            log.warning("No response received for A-RELEASE-RQ (timeout). Closing connection.")
+        try:
+            # Send the release request
+            bytes_sent = self.stream.send(release_rq)
+            if bytes_sent <= 0:
+                 log.error("Failed to send A-RELEASE-RQ (socket reported 0 bytes sent).")
+                 self.assoc_established = False
+                 self.close()
+                 return False
+
+            # Wait for the response using recv()
+            log.info("Waiting for A-RELEASE-RP response...")
+            response = self.stream.recv() # Use recv() to get the next PDU
+
+        except socket.timeout:
+            log.warning(f"Socket timeout ({self.read_timeout}s) waiting for A-RELEASE-RP. Closing connection.")
+            self.assoc_established = False
+            self.close()
+            return False
+        except Exception as e:
+            log.error(f"Error sending/receiving A-RELEASE-RQ: {e}", exc_info=True)
             self.assoc_established = False
             self.close()
             return False
 
+
+        if not response:
+            log.warning("No response received for A-RELEASE-RQ (recv returned None - likely timeout/closed). Closing connection.")
+            self.assoc_established = False
+            self.close()
+            return False
+
+        # Check the received PDU
         if response.haslayer(A_RELEASE_RP):
             log.info("Association released successfully (A-RELEASE-RP received).")
             self.assoc_established = False
             self.close() # Close connection after successful release
             return True
+        elif response.haslayer(A_ABORT):
+            log.warning(f"Received A-ABORT instead of A-RELEASE-RP:")
+            response.show()
+            abort_layer = response[A_ABORT]
+            log.warning(f"  Abort Source: {abort_layer.get_field('source').i2s.get(abort_layer.source, '?')} ({abort_layer.source})")
+            log.warning(f"  Abort Reason: {abort_layer.get_field('reason_diag').i2s.get(abort_layer.reason_diag, '?')} ({abort_layer.reason_diag})")
+            self.assoc_established = False
+            self.close() # Close connection after abort
+            return False # Release failed
         else:
             log.warning(f"Unexpected response received for A-RELEASE-RQ: {response.summary()}")
+            response.show()
             # Should we abort here? Or just close? Closing is safer.
             self.assoc_established = False
             self.close()
-            return False
-
+            return False # Release failed
+        
     def abort(self):
         """Sends A-ABORT PDU."""
         if not self.stream:
