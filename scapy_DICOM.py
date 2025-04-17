@@ -1169,6 +1169,121 @@ class DICOMSession:
             self.close()
             return False
 
+    def find_accepted_context_id(self, sop_class_uid):
+        """Finds the first accepted presentation context ID for a given abstract syntax UID."""
+        for ctx_id, (abs_syntax, _trn_syntax) in self.accepted_contexts.items():
+            if abs_syntax == sop_class_uid:
+                log.debug(f"Found accepted context ID {ctx_id} for SOP Class {sop_class_uid}")
+                return ctx_id
+        log.warning(f"No accepted presentation context found for SOP Class {sop_class_uid}")
+        return None
+
+    def c_echo(self, msg_id=None):
+        """
+        Performs a C-ECHO verification.
+
+        Args:
+            msg_id (int, optional): The Message ID to use. If None, a default one is generated.
+
+        Returns:
+            int or None: The DICOM status code (e.g., 0x0000 for success) if a valid
+                         C-ECHO response is received, otherwise None indicating an error
+                         (e.g., association error, timeout, unexpected PDU, parsing failure).
+        """
+        if not self.assoc_established:
+            log.error("Cannot perform C-ECHO: Association not established.")
+            return None
+
+        # 1. Find accepted context ID for Verification SOP Class
+        echo_ctx_id = self.find_accepted_context_id(VERIFICATION_SOP_CLASS_UID)
+        if echo_ctx_id is None:
+            log.error("Cannot perform C-ECHO: No accepted context for Verification SOP Class.")
+            return None # Indicate failure: context not accepted
+
+        # 2. Prepare C-ECHO-RQ DIMSE Message
+        if msg_id is None:
+            msg_id = int(time.time()) % 10000
+        dimse_command_bytes = build_c_echo_rq_dimse(msg_id)
+
+        # 3. Create the PresentationDataValueItem object for C-ECHO-RQ
+        pdv_rq = PresentationDataValueItem()
+        pdv_rq.context_id = echo_ctx_id
+        pdv_rq.data = dimse_command_bytes
+        pdv_rq.is_command = True
+        pdv_rq.is_last = True
+
+        # 4. Send the PDV Item via P-DATA-TF
+        log.info(f"Sending C-ECHO-RQ (Message ID: {msg_id}) via DICOMSession.c_echo...")
+        if not self.send_p_data(pdv_list=[pdv_rq]):
+            log.error("C-ECHO failed: Could not send P-DATA.")
+            # send_p_data should handle closing on error
+            return None # Indicate failure: send error
+
+        # 5. Wait for and receive the response PDU
+        log.info("Waiting for C-ECHO response...")
+        response_pdata = None
+        try:
+            # Use the stream directly to receive the next PDU
+            response_pdata = self.stream.recv()
+        except socket.timeout:
+            log.error(f"Socket timeout ({self.read_timeout}s) waiting for C-ECHO response.")
+            self.abort() # Abort on timeout
+            return None # Indicate failure: timeout
+        except Exception as e:
+            log.error(f"Error receiving C-ECHO response: {e}", exc_info=True)
+            self.abort() # Abort on other errors
+            return None # Indicate failure: socket/other error
+
+        if not response_pdata:
+            log.error("No C-ECHO response PDU received (connection closed?).")
+            self.close() # Already closed or failed
+            return None # Indicate failure: no response/closed
+
+        # 6. Process the response
+        log.debug("Processing C-ECHO response PDU:")
+        log.debug(f"{response_pdata.show(dump=True)}")
+
+        # Check PDU type
+        if response_pdata.pdu_type == 0x04: # P-DATA-TF
+            log.debug("Response is P-DATA-TF (Type 0x04). Checking parsed items...")
+            # Check if dissector stored the instance and items
+            if hasattr(response_pdata, 'pdata_instance') and \
+               hasattr(response_pdata.pdata_instance, 'parsed_pdv_items') and \
+               response_pdata.pdata_instance.parsed_pdv_items:
+
+                parsed_items = response_pdata.pdata_instance.parsed_pdv_items
+                log.debug(f"Found {len(parsed_items)} PDV items in response.")
+                # Find the relevant PDV (usually the first/only one for C-ECHO RSP)
+                for pdv in parsed_items:
+                    if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
+                        log.debug(f"Found relevant response PDV (CtxID={echo_ctx_id}). Parsing status...")
+                        status = parse_dimse_status(pdv.data)
+                        if status is not None:
+                            log.info(f"C-ECHO completed with DIMSE Status: 0x{status:04X}")
+                            return status # Return the parsed status code
+                        else:
+                            log.error("Failed to parse DIMSE status from C-ECHO response PDV.")
+                            return None # Indicate failure: status parsing error
+                # If loop finishes without finding the right PDV
+                log.error("Did not find a suitable response PDV in the received P-DATA-TF.")
+                return None # Indicate failure: PDV not found/matched
+            else:
+                log.error("P-DATA-TF received, but failed to find populated parsed_pdv_items via pdata_instance.")
+                return None # Indicate failure: dissection access error
+
+        elif response_pdata.haslayer(A_ABORT):
+             log.error(f"Received A-ABORT instead of C-ECHO response:")
+             # Logging handled within abort handler if needed, or add here
+             self.assoc_established = False # Ensure state is updated
+             self.close()
+             return None # Indicate failure: aborted
+        else:
+            log.error(f"Received unexpected PDU type {response_pdata.pdu_type} instead of C-ECHO response.")
+            response_pdata.show()
+            # Consider aborting if the state is unexpected
+            self.abort()
+            return None # Indicate failure: unexpected PDU
+
     def release(self):
         """Sends A-RELEASE-RQ and waits for A-RELEASE-RP."""
         if not self.assoc_established or not self.stream:
