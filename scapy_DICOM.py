@@ -19,7 +19,6 @@ import time
 import socket
 import logging
 from io import BytesIO
-# import struct # Already imported above
 
 from scapy.all import Packet, bind_layers, PacketListField, conf
 from scapy.fields import (

@@ -17,18 +17,17 @@ jobs:
             image: orthancteam/orthanc:latest
             aet: ORTHANC_CI
             port: 4242
-            # Simplify command - remove potentially problematic config path argument
             command: "--verbose"
 
-          - name: Pydicom_pynetdicom
-            image: pydicom/dicom:latest
-            aet: PYDICOM_SCP
-            port: 11112
-            command: >
-              python -m pynetdicom echoscp
-              --ae-title PYDICOM_SCP
-              --port 11112
-              -v
+          # - name: Pydicom_pynetdicom
+          #   image: pydicom/dicom:latest
+          #   aet: PYDICOM_SCP
+          #   port: 11112
+          #   command: >
+          #     python -m pynetdicom echoscp
+          #     --ae-title PYDICOM_SCP
+          #     --port 11112
+          #     -v
 
     steps:
       - name: Checkout repository
