@@ -755,24 +755,28 @@ class P_DATA_TF(Packet):
     # Store parsed items here
     parsed_pdv_items = []
 
-    def dissect_payload(self, s):
+    def do_dissect_payload(self, s):
         """
         Manually parse the PDU payload 's' into PresentationDataValueItem objects.
         Consume exactly the number of bytes specified by the DICOM UL length.
+        (This is the method Scapy should call for payload dissection).
         """
+        # Keep the entire implementation of the method (with logging)
+        # exactly as provided in the previous step, just change the name.
+        # ... (the rest of the function code with logging remains the same) ...
         self.parsed_pdv_items = []
         # Determine the exact number of bytes belonging to this PDU's payload
         # The 'length' field of the DICOM layer specifies the length of the PDU *after* the header (Type, Reserved, Length)
         total_payload_len = getattr(self.underlayer, 'length', len(s))
-        log.debug(f"P_DATA_TF.dissect_payload: Starting. UL length field = {total_payload_len}. Available bytes in buffer = {len(s)}.")
+        log.debug(f"P_DATA_TF.do_dissect_payload: Starting. UL length field = {total_payload_len}. Available bytes in buffer = {len(s)}.") # Log change
 
         # Determine the actual bytes to process from 's' based on UL length
         if total_payload_len > len(s):
-            log.warning(f"P_DATA_TF.dissect_payload: UL length ({total_payload_len}) > available bytes ({len(s)}). Processing only available bytes.")
+            log.warning(f"P_DATA_TF.do_dissect_payload: UL length ({total_payload_len}) > available bytes ({len(s)}). Processing only available bytes.") # Log change
             payload_to_process = s
             remaining_after_pdu = b'' # No bytes left after this PDU
         elif total_payload_len < len(s):
-             log.debug(f"P_DATA_TF.dissect_payload: UL length ({total_payload_len}) < available bytes ({len(s)}). Processing UL length; {len(s) - total_payload_len} bytes will remain for next PDU.")
+             log.debug(f"P_DATA_TF.do_dissect_payload: UL length ({total_payload_len}) < available bytes ({len(s)}). Processing UL length; {len(s) - total_payload_len} bytes will remain for next PDU.") # Log change
              payload_to_process = s[:total_payload_len]
              remaining_after_pdu = s[total_payload_len:] # Bytes belonging to the *next* PDU
         else:
@@ -781,7 +785,7 @@ class P_DATA_TF(Packet):
             remaining_after_pdu = b'' # No bytes left after this PDU
 
 
-        log.debug(f"P_DATA_TF.dissect_payload: Determined PDU payload length to process: {len(payload_to_process)}. Remaining after PDU: {len(remaining_after_pdu)}")
+        log.debug(f"P_DATA_TF.do_dissect_payload: Determined PDU payload length to process: {len(payload_to_process)}. Remaining after PDU: {len(remaining_after_pdu)}") # Log change
         stream = BytesIO(payload_to_process)
         processed_bytes_count = 0
 
@@ -872,13 +876,13 @@ class P_DATA_TF(Packet):
         # After loop: Check if any bytes remain in the stream (part of this PDU but unparsed)
         leftover_pdu_bytes = stream.read()
         if leftover_pdu_bytes:
-            log.warning(f"P_DATA_TF.dissect_payload: {len(leftover_pdu_bytes)} unparsed bytes remaining within PDU payload buffer (offset {processed_bytes_count} to {len(payload_to_process)}).")
+            log.warning(f"P_DATA_TF.do_dissect_payload: {len(leftover_pdu_bytes)} unparsed bytes remaining within PDU payload buffer (offset {processed_bytes_count} to {len(payload_to_process)}).") # Log change
             # Prepend these leftovers to the bytes belonging to the next PDU
             remaining_after_pdu = leftover_pdu_bytes + remaining_after_pdu
 
         # Assign the remaining bytes (belonging to the *next* PDU or unparsed) to Scapy's payload field
         self.payload = Raw(remaining_after_pdu) if remaining_after_pdu else NoPayload()
-        log.debug(f"P_DATA_TF.dissect_payload: Finished. Parsed {len(self.parsed_pdv_items)} PDV items. Next layer payload length: {len(self.payload.load if isinstance(self.payload, Raw) else 0)}")
+        log.debug(f"P_DATA_TF.do_dissect_payload: Finished. Parsed {len(self.parsed_pdv_items)} PDV items. Next layer payload length: {len(self.payload.load if isinstance(self.payload, Raw) else 0)}") # Log change
 
 
     def build_payload(self):
