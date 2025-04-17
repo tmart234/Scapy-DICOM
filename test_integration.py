@@ -127,21 +127,14 @@ def main():
 
         # 6. Wait for response
         log.info("Waiting for C-ECHO response...")
-        # --- MODIFICATION START ---
-        # Replace: response_pdata = session.stream.recv()
-        # With manual receive and dissection:
         raw_response_bytes = None
         try:
-            # Receive raw bytes from the underlying socket
-            # Use a reasonably large buffer size
             raw_response_bytes = session.sock.recv(8192)
         except socket.timeout:
              log.error(f"Socket timeout ({session.read_timeout}s) waiting for C-ECHO response bytes.")
-             # Abort/Close handled in 'finally'
              sys.exit(1)
         except Exception as sock_err:
              log.error(f"Socket error receiving C-ECHO response bytes: {sock_err}")
-             # Abort/Close handled in 'finally'
              sys.exit(1)
 
         if not raw_response_bytes:
@@ -152,71 +145,73 @@ def main():
         # Explicitly dissect the received bytes using the DICOM base layer
         response_pdata = DICOM(raw_response_bytes)
 
-        if not response_pdata: # Should not happen if raw_response_bytes existed, but check anyway
+        if not response_pdata:
             log.error("Failed to dissect received bytes into DICOM PDU.")
             sys.exit(1)
 
         log.debug(f"Received response packet type: {type(response_pdata)}")
-        response_pdata.show() # Show summary
-        log.debug(f"Received response packet details:\n{response_pdata.show(dump=True)}") # More verbose
+        # Log the details *before* processing logic
+        log.debug(f"Received response packet details:\n{response_pdata.show(dump=True)}")
 
+        # --- MODIFIED RESPONSE PROCESSING ---
+        # Check PDU type directly instead of haslayer()
+        if response_pdata.pdu_type == 0x04: # P-DATA-TF
+            log.info("Received P-DATA-TF response (PDU Type 0x04 identified)")
 
-        # 7. Process the response using the library's dissection
-        if response_pdata.haslayer(P_DATA_TF):
-            log.info("Received P-DATA-TF response (expected C-ECHO-RSP)")
-            pdata_layer = response_pdata[P_DATA_TF]
+            # Directly access the attribute populated by do_dissect_payload
+            # The check for the attribute handles cases where dissection might have failed internally
+            if hasattr(response_pdata, 'parsed_pdv_items') and response_pdata.parsed_pdv_items:
+                log.info(f"Found {len(response_pdata.parsed_pdv_items)} PDV items parsed by do_dissect_payload.")
 
-            # Check the new attribute where manually parsed items are stored
-            if not hasattr(pdata_layer, 'parsed_pdv_items') or not pdata_layer.parsed_pdv_items:
-                log.error("P-DATA-TF received, but parsed_pdv_items list is empty or missing after dissection.")
-                # Check for raw payload on P_DATA_TF itself as fallback
-                if isinstance(pdata_layer.payload, Raw) and pdata_layer.payload.load:
-                     log.warning(f"  P-DATA-TF payload contains raw bytes ({len(pdata_layer.payload.load)} bytes), possibly indicating dissection error before PDV parsing.")
-                     log.warning(f"  Raw Payload Hex: {pdata_layer.payload.load.hex()}")
-                elif not isinstance(pdata_layer.payload, NoPayload):
-                     log.warning(f"  P-DATA-TF has unexpected payload type: {type(pdata_layer.payload)}")
-                sys.exit(1) # Fail the test if no PDVs were parsed
+                # --- Process the parsed PDV items ---
+                rsp_processed = False
+                # Iterate through the list populated by the dissector
+                for pdv in response_pdata.parsed_pdv_items:
+                    # Basic check if it's our item type (optional but good practice)
+                    if not isinstance(pdv, PresentationDataValueItem):
+                         log.warning(f"Skipping unexpected item type in parsed list: {type(pdv)}")
+                         continue
 
-            # --- Process the manually parsed PDV items ---
-            rsp_processed = False
-            # Iterate through the new list
-            for pdv in pdata_layer.parsed_pdv_items:
-                # Check if it's a properly parsed PDV item (not Raw from failure within the loop)
-                if not isinstance(pdv, PresentationDataValueItem):
-                    log.warning(f"Skipping non-PresentationDataValueItem found in parsed_pdv_items: {type(pdv)}")
-                    if isinstance(pdv, Raw):
-                        log.warning(f"  Raw Data Hex: {pdv.load.hex()}")
-                    continue
+                    log.info(f"  Processing PDV: Context={pdv.context_id}, Cmd={pdv.is_command}, Last={pdv.is_last}, DataLen={len(pdv.data)}")
 
-                log.info(f"  Processing PDV: Context={pdv.context_id}, Cmd={pdv.is_command}, Last={pdv.is_last}, DataLen={len(pdv.data)}")
+                    # Check if this PDV matches our expectation for the C-ECHO-RSP
+                    # (Context ID might need adjustment if multiple contexts were offered/accepted)
+                    if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
+                        if pdv.data:
+                            log.info("  Found relevant PDV. Parsing DIMSE status...")
+                            status = parse_dimse_status(pdv.data) # Use the function
 
-                # Check if this PDV matches our expectation for the C-ECHO-RSP
-                if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
-                    if pdv.data:
-                        log.info("  Found relevant PDV. Parsing DIMSE status using library function...")
-                        status = parse_dimse_status(pdv.data) # Use the pdv.data attribute
-
-                        if status is not None:
-                            log.info(f"  Parsed DIMSE Status: 0x{status:04X}")
-                            if status == 0x0000:
-                                log.info("  C-ECHO Response indicates SUCCESS!")
-                                test_success = True
+                            if status is not None:
+                                log.info(f"  Parsed DIMSE Status: 0x{status:04X}")
+                                if status == 0x0000:
+                                    log.info("  C-ECHO Response indicates SUCCESS!")
+                                    test_success = True
+                                else:
+                                    status_str = status_map.get(status, f"Unknown Status 0x{status:04X}")
+                                    log.error(f"  C-ECHO Response DIMSE status indicates failure: {status_str} (0x{status:04X})")
                             else:
-                                # ... (status code mapping remains the same) ...
-                                status_str = status_map.get(status, f"Unknown Status 0x{status:04X}")
-                                log.error(f"  C-ECHO Response DIMSE status indicates failure: {status_str} (0x{status:04X})")
+                                log.error("  Failed to parse DIMSE status from response PDV data.")
+                                log.debug(f"  PDV DIMSE Data Hex: {pdv.data.hex()}")
                         else:
-                            log.error("  Failed to parse DIMSE status from response PDV data using library function.")
-                            log.debug(f"  PDV DIMSE Data Hex: {pdv.data.hex()}")
-                    else:
-                        log.warning("  Found matching PDV, but its data field is empty.")
+                            log.warning("  Found matching PDV, but its data field is empty.")
 
-                    rsp_processed = True # Mark that we found and processed the expected PDV
-                    break # Assume only one C-ECHO-RSP PDV is expected per P-DATA-TF
+                        rsp_processed = True # Mark that we found and processed the expected PDV
+                        break # Assume only one C-ECHO-RSP PDV is expected per P-DATA-TF
 
-            if not rsp_processed:
-                log.error("Did not find a suitable PDV (Command, Last, matching Context ID) in the P-DATA-TF response's items.")
+                if not rsp_processed:
+                    log.error("Did not find a suitable PDV (Command, Last, matching Context ID) in the parsed items list.")
 
+            else:
+                # This case should now be less likely given the dissection logs, but keep it as a fallback
+                log.error("P-DATA-TF PDU Type received, but parsed_pdv_items list is empty or missing.")
+                # Check for raw payload on the PDU itself if dissection failed to populate list
+                if isinstance(response_pdata.payload, Raw) and response_pdata.payload.load:
+                     log.warning(f"  PDU payload contains raw bytes ({len(response_pdata.payload.load)} bytes).")
+                     log.warning(f"  Raw Payload Hex: {response_pdata.payload.load.hex()}")
+                elif not isinstance(response_pdata.payload, NoPayload):
+                     log.warning(f"  PDU has unexpected payload type: {type(response_pdata.payload)}")
+                # sys.exit(1) # Decide if this state should cause failure
+                
         elif response_pdata.haslayer(A_ABORT):
              log.error(f"Received A-ABORT from peer instead of P-DATA response:")
              response_pdata.show()
