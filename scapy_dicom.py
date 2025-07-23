@@ -762,37 +762,24 @@ class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
         FieldLenField("length", None, length_of="value", fmt="!I"),
-        # The 'value' field contains the context_id, header, and data
-        StrLenField("value", "", length_from=lambda x: x.length)
+        # The 'value' field contains the context_id, header, and data.
+        # It's easier to define the sub-fields directly.
+        ByteField("context_id", 1),
+        ByteField("message_control_header", 0x03), # is_command=True, is_last=True
+        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
     ]
-    # We define properties to easily access the sub-fields of 'value'
-    def __init__(self, *args, **kwargs):
-        super(PresentationDataValueItem, self).__init__(*args, **kwargs)
-        if 'context_id' in kwargs: self.context_id = kwargs['context_id']
-        if 'is_command' in kwargs: self.is_command = kwargs['is_command']
-        if 'is_last' in kwargs: self.is_last = kwargs['is_last']
-        if 'data' in kwargs: self.data = kwargs['data']
+    # Define properties to easily get/set the control header bits
+    def _get_is_command(self): return (self.message_control_header & 0x01) == 1
+    def _set_is_command(self, val):
+        if val: self.message_control_header |= 0x01
+        else: self.message_control_header &= ~0x01
+    is_command = property(_get_is_command, _set_is_command)
 
-    def _get_msg_hdr(self):
-        return struct.unpack("!B", self.value[1:2])[0] if len(self.value) > 1 else 0
-
-    def _set_msg_hdr(self, is_command, is_last):
-        hdr = 0
-        if is_last: hdr |= 0x02
-        if is_command: hdr |= 0x01
-        ctx_id_byte = self.value[0:1] if self.value else b'\x01'
-        data_bytes = self.value[2:] if len(self.value) > 2 else b''
-        self.value = ctx_id_byte + struct.pack("!B", hdr) + data_bytes
-
-    context_id = property(lambda self: self.value[0] if self.value else 0,
-                          lambda self, v: setattr(self, 'value', struct.pack("!B", v) + self.value[1:] if self.value else struct.pack("!B", v)))
-    is_command = property(lambda self: (self._get_msg_hdr() & 0x01) == 1,
-                          lambda self, v: self._set_msg_hdr(v, self.is_last))
-    is_last = property(lambda self: (self._get_msg_hdr() >> 1 & 0x01) == 1,
-                       lambda self, v: self._set_msg_hdr(self.is_command, v))
-    data = property(lambda self: self.value[2:] if len(self.value) > 2 else b'',
-                    lambda self, v: setattr(self, 'value', self.value[:2] + v if len(self.value) >= 2 else b'\x01\x00' + v))
-
+    def _get_is_last(self): return (self.message_control_header >> 1 & 0x01) == 1
+    def _set_is_last(self, val):
+        if val: self.message_control_header |= 0x02
+        else: self.message_control_header &= ~0x02
+    is_last = property(_get_is_last, _set_is_last)
 # ---- FIXED P_DATA_TF ----
 class P_DATA_TF(Packet):
     """
@@ -805,7 +792,7 @@ class P_DATA_TF(Packet):
                         length_from=lambda pkt: pkt.underlayer.length)
     ]
 
-    
+
 # --- Bind Layers ---
 bind_layers(TCP, DICOM, dport=DICOM_PORT)
 bind_layers(TCP, DICOM, sport=DICOM_PORT)

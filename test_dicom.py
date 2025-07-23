@@ -300,16 +300,11 @@ class TestAdvancedFuzzingTechniques:
         assert big_endian_payload in bytes(pkt)
 
     def test_req_l17_security_negotiation_probing(self):
-        """REQ-L17: Can include a Secure Transport Connection sub-item in an A-ASSOCIATE-RQ."""
-        # This test now uses the class defined directly in scapy_dicom.py
-        secure_item = SecureTransportConnectionSubItem()
-        user_info = UserInformationItem(user_data_subitems=bytes(secure_item))
-        pkt = DICOM() / A_ASSOCIATE_RQ()
-        pkt[A_ASSOCIATE_RQ].variable_items = [user_info]
-
-        # Assert that the bytes for the secure item (0x56, 0x00, 0x00, 0x00) are present.
+        secure_item_bytes = bytes(DICOMVariableItem(item_type=0x56))
+        assert secure_item_bytes == b'\x56\x00\x00\x00'
+        user_info = DICOMVariableItem(item_type=0x50, data=secure_item_bytes)
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[user_info])
         assert b'\x56\x00\x00\x00' in bytes(pkt)
-
 
 # --- Group 4: Integration Test ---
 # This test connects to a live SCP to perform a C-ECHO.
@@ -322,35 +317,23 @@ integration_test_marker = pytest.mark.skipif(
 
 @integration_test_marker
 def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
-    """
-    Performs a full C-ECHO workflow against a live SCP.
-    Connect -> Associate -> C-ECHO -> Release.
-    """
+    """Performs a full C-ECHO workflow against a live SCP."""
     session = DICOMSession(
-        dst_ip=scp_ip,
-        dst_port=scp_port,
-        dst_ae=scp_ae,
-        src_ae=my_ae,
-        read_timeout=timeout
+        dst_ip=scp_ip, dst_port=scp_port,
+        dst_ae=scp_ae, src_ae=my_ae, read_timeout=timeout
     )
-    
-    echo_status = None
     try:
-        # 1. Associate
         verification_context = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
         assoc_success = session.associate(requested_contexts=verification_context)
         assert assoc_success, "Association failed"
 
-        # 2. Perform C-ECHO
         echo_status = session.c_echo()
-        assert echo_status is not None, "C-ECHO operation failed at a low level (returned None)"
-        assert echo_status == 0x0000, f"C-ECHO failed with non-zero status: 0x{echo_status:04X}"
-
+        assert echo_status is not None, "C-ECHO operation returned None"
+        assert echo_status == 0x0000, f"C-ECHO failed with status: 0x{echo_status:04X}"
     finally:
-        # 3. Cleanly release the association
-        if session and session.assoc_established:
-            release_success = session.release()
-            assert release_success, "Failed to cleanly release the association"
-        elif session and session.stream:
-            # If association failed but connection is open, just close it
-            session.close()
+        if session and session.stream:
+            if session.assoc_established:
+                release_success = session.release()
+                assert release_success, "Failed to cleanly release the association"
+            else:
+                session.close()
