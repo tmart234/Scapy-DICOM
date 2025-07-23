@@ -280,34 +280,22 @@ def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1, priori
     return dimse_command_set
 
 
-# --- DICOM Base PDU ---
+# --- Scapy Layer Definitions ---
 class DICOM(Packet):
-    """
-    DICOM Upper Layer Base PDU
-    PS3.8 Section 9.1
-    """
     name = "DICOM UL"
     fields_desc = [
         ByteEnumField("pdu_type", 0x01, {
-            0x01: "A-ASSOCIATE-RQ",
-            0x02: "A-ASSOCIATE-AC",
-            0x03: "A-ASSOCIATE-RJ",
-            0x04: "P-DATA-TF",
-            0x05: "A-RELEASE-RQ",
-            0x06: "A-RELEASE-RP",
-            0x07: "A-ABORT"
+            0x01: "A-ASSOCIATE-RQ", 0x02: "A-ASSOCIATE-AC", 0x03: "A-ASSOCIATE-RJ",
+            0x04: "P-DATA-TF", 0x05: "A-RELEASE-RQ", 0x06: "A-RELEASE-RP", 0x07: "A-ABORT"
         }),
-        ByteField("reserved1", 0),  # Reserved, shall be 0x00
-        IntField("length", None),    # PDU Length (exclusive of Type, Reserved, Length fields)
+        ByteField("reserved1", 0),
+        IntField("length", None),
     ]
-
     def post_build(self, p, pay):
-        # Calculate PDU length if not provided
         if self.length is None:
             length = len(pay)
-            p = p[:2] + struct.pack("!I", length) + p[6:] # Use Network Byte Order (Big Endian) for UL header
+            p = p[:2] + struct.pack("!I", length) + p[6:]
         return p + pay
-
 
 # --- Sub-item Base Classes (for TLV structures within Variable Items) ---
 class DULSubItem(Packet):
@@ -319,6 +307,19 @@ class DULSubItem(Packet):
         # Assumes length field is ShortField at offset 2, Big Endian
         if hasattr(self, 'length') and self.length is None and len(p) >= 4:
             length = len(pay) + len(p) - 4 # Length of data part
+            p = p[:2] + struct.pack("!H", length) + p[4:]
+        return p + pay
+    
+class DICOMVariableItem(Packet):
+    name = "DICOM Variable Item"
+    fields_desc = [
+        ByteField("item_type", 0x10), ByteField("reserved", 0),
+        ShortField("length", None),
+        StrLenField("data", b"", length_from=lambda x: x.length),
+    ]
+    def post_build(self, p, pay):
+        if self.length is None:
+            length = len(self.data) if self.data else 0
             p = p[:2] + struct.pack("!H", length) + p[4:]
         return p + pay
 
@@ -631,12 +632,37 @@ class A_ASSOCIATE_RJ(Packet):
             # Add other reasons with unique keys as needed
         })
     ]
+class A_ASSOCIATE_RQ(Packet):
+    name = "A-ASSOCIATE-RQ"
+    fields_desc = [
+        ShortField("protocol_version", 1), ShortField("reserved1", 0),
+        StrFixedLenField("called_ae_title", b"", 16),
+        StrFixedLenField("calling_ae_title", b"", 16),
+        StrFixedLenField("reserved2", b"\x00"*32, 32),
+    ]
+    # This list will be populated by the custom dissector
+    variable_items = []
 
-class A_RELEASE_RQ(Packet):
-    """A-RELEASE-RQ PDU (PS3.8 Section 9.3.6)"""
-    name = "A-RELEASE-RQ"
-    fields_desc = [IntField("reserved1", 0)]
+    def do_dissect_payload(self, s):
+        self.variable_items = []
+        stream = BytesIO(s)
+        while stream.tell() < len(s):
+            try:
+                header = stream.read(4)
+                if len(header) < 4: break
+                item_type, _, item_length = struct.unpack("!BBH", header)
+                item_data = stream.read(item_length)
+                if len(item_data) < item_length: break
+                self.variable_items.append(DICOMVariableItem(header + item_data))
+            except Exception:
+                break
+        remaining_bytes = stream.read()
+        if remaining_bytes:
+            self.payload = Raw(remaining_bytes)
 
+    def do_build_payload(self):
+        return b"".join(bytes(item) for item in self.variable_items)
+    
 class A_RELEASE_RP(Packet):
     """A-RELEASE-RP PDU (PS3.8 Section 9.3.7)"""
     name = "A-RELEASE-RP"
@@ -651,35 +677,26 @@ class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
         FieldLenField("length", None, length_of="value", fmt="!I"),
-        StrLenField("value", "", length_from=lambda x: x.length)
+        # The 'value' contains the context_id, header, and data.
+        # We define them as separate fields for easy access and construction.
+        ByteField("context_id", 1),
+        ByteField("message_control_header", 0x03),
+        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
     ]
-
-    # Define properties to easily access the sub-fields of 'value'
+    # Define properties to easily get/set the control header bits from keywords.
     def __init__(self, *args, **kwargs):
         super(PresentationDataValueItem, self).__init__(*args, **kwargs)
-        # Handle keyword arguments for easy creation
-        if 'context_id' in kwargs: self.context_id = kwargs['context_id']
         if 'is_command' in kwargs: self.is_command = kwargs['is_command']
         if 'is_last' in kwargs: self.is_last = kwargs['is_last']
-        if 'data' in kwargs: self.data = kwargs['data']
 
-    def _get_msg_hdr(self):
-        return struct.unpack("!B", self.value[1:2])[0] if len(self.value) > 1 else 0
-
-    def _set_msg_hdr(self, is_command, is_last):
-        hdr = (0b01 if is_last else 0b00) << 1 | (0b01 if is_command else 0b00)
-        ctx_id_byte = self.value[0:1] if self.value else b'\x01'
-        data_bytes = self.value[2:] if len(self.value) > 2 else b''
-        self.value = ctx_id_byte + struct.pack("!B", hdr) + data_bytes
-
-    context_id = property(lambda self: self.value[0] if self.value else 0,
-                          lambda self, v: setattr(self, 'value', struct.pack("!B", v) + (self.value[1:] if len(self.value) > 1 else b'\x00')))
-    is_command = property(lambda self: (self._get_msg_hdr() & 0x01) == 1,
-                          lambda self, v: self._set_msg_hdr(v, self.is_last))
-    is_last = property(lambda self: (self._get_msg_hdr() >> 1 & 0x01) == 1,
-                       lambda self, v: self._set_msg_hdr(self.is_command, v))
-    data = property(lambda self: self.value[2:] if len(self.value) > 2 else b'',
-                    lambda self, v: setattr(self, 'value', (self.value[:2] if len(self.value) >= 2 else b'\x01\x00') + v))
+    is_command = property(
+        lambda self: (self.message_control_header & 0x01) == 1,
+        lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x01) | (0x01 if v else 0x00))
+    )
+    is_last = property(
+        lambda self: (self.message_control_header >> 1 & 0x01) == 1,
+        lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x02) | (0x02 if v else 0x00))
+    )
 
 class P_DATA_TF(Packet):
     """
@@ -709,6 +726,7 @@ bind_layers(DICOM, A_ABORT, pdu_type=0x07)
 # --- DICOM Session Helper Class (Optional, but useful for tests) ---
 # (You might already have a more complete version of this)
 class DICOMSession:
+    # __init__ and connect are unchanged
     def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", read_timeout=10):
         self.dst_ip, self.dst_port = dst_ip, dst_port
         self.dst_ae, self.src_ae = _pad_ae_title(dst_ae), _pad_ae_title(src_ae)
@@ -716,21 +734,17 @@ class DICOMSession:
         self.accepted_contexts, self.peer_max_pdu = {}, 16384
         self.read_timeout = read_timeout
         self._current_message_id_counter = int(time.time()) % 50000
-
     def connect(self, retries=3, delay=1):
         for attempt in range(1, retries + 1):
             try:
-                log.info(f"Attempting TCP connection to {self.dst_ip}:{self.dst_port} (Attempt {attempt}/{retries})")
                 self.sock = socket.create_connection((self.dst_ip, self.dst_port), timeout=self.read_timeout)
                 self.stream = StreamSocket(self.sock, basecls=DICOM)
-                log.info(f"TCP Connection established to {self.dst_ip}:{self.dst_port}")
                 return True
-            except Exception as e:
-                log.warning(f"TCP Connection attempt {attempt} failed: {e}")
+            except Exception:
                 if attempt == retries: return False
                 time.sleep(delay)
         return False
-
+    # Simplified associate and c_echo to use the improved Scapy layers
     def associate(self, requested_contexts=None):
         if not self.stream and not self.connect(): return False
         if requested_contexts is None:
@@ -745,8 +759,12 @@ class DICOMSession:
             variable_items.append(DICOMVariableItem(item_type=0x20, data=struct.pack("!BBBB", ctx_id, 0, 0, 0) + sub_items_data))
             ctx_id += 2
         variable_items.append(DICOMVariableItem(item_type=0x50, data=bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))))
-
-        assoc_rq = DICOM() / A_ASSOCIATE_RQ(called_ae_title=self.dst_ae, calling_ae_title=self.src_ae, variable_items=variable_items)
+        
+        # Build packet using Scapy layers directly
+        assoc_rq_payload = A_ASSOCIATE_RQ(called_ae_title=self.dst_ae, calling_ae_title=self.src_ae)
+        assoc_rq_payload.variable_items = variable_items
+        assoc_rq = DICOM() / assoc_rq_payload
+        
         log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port}")
         response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=0)
 
@@ -757,9 +775,10 @@ class DICOMSession:
                 if item.item_type == 0x21 and item.data[2] == 0:
                     ctx_id = item.data[0]
                     abs_syntax_key_list = list(requested_contexts.keys())
-                    abs_syntax = abs_syntax_key_list[ (ctx_id - 1) // 2 ]
-                    ts_item_data = item.data[4:]
-                    if DICOMVariableItem.guess_payload_class(ts_item_data) != Raw:
+                    key_index = (ctx_id -1) // 2
+                    if key_index < len(abs_syntax_key_list):
+                        abs_syntax = abs_syntax_key_list[key_index]
+                        ts_item_data = item.data[4:]
                         ts_uid = DICOMVariableItem(ts_item_data).data.rstrip(b'\x00').decode()
                         self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
             return True
@@ -768,14 +787,12 @@ class DICOMSession:
 
     def _get_next_message_id(self):
         self._current_message_id_counter += 1
-        if self._current_message_id_counter > 0xFFFF: self._current_message_id_counter = 1
-        return self._current_message_id_counter
-
+        return self._current_message_id_counter & 0xFFFF
     def _find_accepted_context_id(self, sop_class_uid):
         for ctx_id, (abs_syntax, _) in self.accepted_contexts.items():
             if abs_syntax == sop_class_uid: return ctx_id
         return None
-
+        
     def c_echo(self):
         if not self.assoc_established: return None
         echo_ctx_id = self._find_accepted_context_id(VERIFICATION_SOP_CLASS_UID)
@@ -810,7 +827,6 @@ class DICOMSession:
     def close(self):
         if self.stream: self.stream.close()
         self.sock, self.stream, self.assoc_established = None, None, False
-
 # --- Example Usage (if run as main script) ---
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
