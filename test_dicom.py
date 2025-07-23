@@ -11,6 +11,8 @@ import os
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 logging.getLogger("scapy.contrib.dicom").setLevel(logging.DEBUG)
 
+# Add project root to path to allow finding scapy_dicom in CI environments
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 # Import all classes and functions from the custom DICOM layer
 # This assumes the layer file is named 'scapy_dicom.py'
 try:

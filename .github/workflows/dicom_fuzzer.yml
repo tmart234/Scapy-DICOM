@@ -1,4 +1,3 @@
-# .github/workflows/dicom_fuzzer.yml
 name: DICOM Fuzzer CI
 
 on:
@@ -80,15 +79,12 @@ jobs:
           echo "This is fuzzed trailer data" >> "${FUZZED_FILE_PATH}"
           
           echo "FUZZED_DCM_PATH=${FUZZED_FILE_PATH}" >> $GITHUB_OUTPUT
-          # FIX: Use a shell variable for logging within the same step
           echo "Prepared fuzzed file at ${FUZZED_FILE_PATH}"
 
       - name: Run DICOM Fuzzer (Association Mode)
-        env:
-          # FIX: Add main_repo to PYTHONPATH
-          PYTHONPATH: ${{ github.workspace }}/main_repo
+        working-directory: ${{ github.workspace }}/main_repo
         run: |
-          python ${{ github.workspace }}/main_repo/dicom_fuzzer.py \
+          python dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -99,11 +95,9 @@ jobs:
         continue-on-error: true
 
       - name: Run DICOM Fuzzer (C-STORE File Mode)
-        env:
-          # FIX: Add main_repo to PYTHONPATH
-          PYTHONPATH: ${{ github.workspace }}/main_repo
+        working-directory: ${{ github.workspace }}/main_repo
         run: |
-          python ${{ github.workspace }}/main_repo/dicom_fuzzer.py \
+          python dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \

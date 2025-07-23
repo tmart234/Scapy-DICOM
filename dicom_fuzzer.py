@@ -7,28 +7,26 @@ import sys
 import time
 import random
 import struct # For manual byte packing if needed
-import urllib.request
+import urllib.request # Added for downloading sample file
 
-# Ensure scapy_DICOM is accessible
+# Ensure scapy_dicom is accessible
+script_dir = os.path.dirname(os.path.abspath(__file__))
+if script_dir not in sys.path:
+    sys.path.insert(0, script_dir)
+
 try:
-    from scapy_dicom import *
+    from scapy_dicom import (
+        DICOMSession, DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_RJ, A_ABORT, P_DATA_TF,
+        PresentationDataValueItem, APP_CONTEXT_UID, DEFAULT_TRANSFER_SYNTAX_UID,
+        VERIFICATION_SOP_CLASS_UID, DICOMVariableItem, PresentationContextRQItem,
+        UserInformationItem, MaxLengthSubItem, ImplementationClassUIDSubItem,
+        ImplementationVersionNameSubItem, AbstractSyntaxSubItem, TransferSyntaxSubItem,
+        _pad_ae_title, _uid_to_bytes, build_c_store_rq_dimse
+    )
     from scapy.all import Raw
-except ImportError:
-    # Fallback path for environments like GitHub Actions
-    sys.path.append(os.path.join(os.path.dirname(__file__), '.'))
-    try:
-        from scapy_dicom import (
-            DICOMSession, DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_RJ, A_ABORT, P_DATA_TF,
-            PresentationDataValueItem, APP_CONTEXT_UID, DEFAULT_TRANSFER_SYNTAX_UID,
-            VERIFICATION_SOP_CLASS_UID, DICOMVariableItem, PresentationContextRQItem,
-            UserInformationItem, MaxLengthSubItem, ImplementationClassUIDSubItem,
-            ImplementationVersionNameSubItem, AbstractSyntaxSubItem, TransferSyntaxSubItem,
-            _pad_ae_title, _uid_to_bytes, build_c_store_rq_dimse
-        )
-        from scapy.all import Raw
-    except ImportError as e_imp:
-        print(f"ERROR: Could not import from scapy_dicom.py: {e_imp}", file=sys.stderr)
-        sys.exit(2)
+except ImportError as e:
+    print(f"ERROR: Could not import required modules. Ensure scapy_dicom.py is present. Details: {e}", file=sys.stderr)
+    sys.exit(2)
 
 import pydicom
 from pydicom.errors import InvalidDicomError
@@ -74,10 +72,12 @@ def ensure_sample_file_exists(file_path=DEFAULT_SAMPLE_FILE):
 def fuzz_association_handshake(session_args, fuzz_params):
     """
     Sends various malformed A-ASSOCIATE-RQ packets to a live target.
+    This function tests requirements that need a live connection to observe a response.
     """
     script_log.info("--- Starting Association Handshake Fuzzing ---")
     
-    # Test Case 1: Overlong Called AE Title
+    # Test Case 1: Overlong Called AE Title (REQ-002)
+    # The pytest script confirms we can BUILD this; the fuzzer CONFIRMS how a server reacts.
     script_log.info("Test Case: Overlong Called AE Title")
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
@@ -97,24 +97,26 @@ def fuzz_association_handshake(session_args, fuzz_params):
                     DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
                 ]
             )
+            # Manually override the field to be longer than the spec allows
             malformed_aarq_pkt[A_ASSOCIATE_RQ].called_ae_title = b"X"*20
             
+            script_log.debug("Sending malformed AARQ (overlong Called AE)")
             response = session.stream.sr1(malformed_aarq_pkt, timeout=session.read_timeout, verbose=0)
             
             if response:
                 script_log.info(f"Received response: {response.summary()}")
                 if response.haslayer(A_ABORT) or response.haslayer(A_ASSOCIATE_RJ):
-                    script_log.info("[PASS] Server correctly rejected or aborted.")
+                    script_log.info("[PASS] Server correctly rejected or aborted the connection.")
                 else:
                     script_log.warning("[FAIL?] Server accepted a malformed AARQ.")
             else:
-                script_log.warning("No response received (timeout/closed). Possible crash?")
+                script_log.warning("No response received (timeout or connection closed). This may indicate a crash.")
         except Exception as e:
             script_log.error(f"Error during overlong AE fuzz: {e}", exc_info=session_args['debug'])
         finally:
             session.close()
 
-    # Test Case 2: Invalid Protocol Version
+    # Test Case 2: Invalid Protocol Version (REQ-L01 related)
     script_log.info("Test Case: Invalid Protocol Version in AARQ")
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
@@ -123,7 +125,7 @@ def fuzz_association_handshake(session_args, fuzz_params):
     if session.connect():
         try:
             invalid_ver_aarq_pkt = DICOM() / A_ASSOCIATE_RQ(
-                protocol_version=0xFFFE,
+                protocol_version=0xFFFE, # Invalid version
                 called_ae_title=_pad_ae_title(session_args['ae_title']),
                 calling_ae_title=_pad_ae_title(session_args['calling_ae']),
                 variable_items=[
@@ -136,6 +138,7 @@ def fuzz_association_handshake(session_args, fuzz_params):
                     DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
                 ]
             )
+            script_log.debug("Sending malformed AARQ (invalid protocol version)")
             response = session.stream.sr1(invalid_ver_aarq_pkt, timeout=session.read_timeout, verbose=0)
             if response:
                 script_log.info(f"Received response: {response.summary()}")
@@ -150,6 +153,10 @@ def fuzz_association_handshake(session_args, fuzz_params):
         finally:
             session.close()
 
+    # NOTE: This is where a fuzzer would implement live tests for requirements like:
+    # - REQ-L11 (State Confusion): e.g., session.stream.send(P_DATA_TF(...)) before associating.
+    # - REQ-L12 (Resource Exhaustion): e.g., session.stream.send(b'\x04\x00\x10\x00\x00\x00\x01\x02')
+    # - REQ-L13 (Interleaving): Send multiple P-DATA-TF packets in a specific order.
     script_log.info("--- Finished Association Handshake Fuzzing ---")
     return True
 
