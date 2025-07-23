@@ -30,7 +30,7 @@ except ImportError as e:
 
 import pydicom
 from pydicom.errors import InvalidDicomError
-from pydicom.uid import generate_uid, ImplicitVRLittleEndian, ExplicitVRLittleEndian
+from pydicom.uid import generate_uid, ImplicitVRLittleEndian
 
 # Global logger
 script_log = logging.getLogger("unified_dicom_fuzzer")
@@ -51,7 +51,7 @@ def ensure_sample_file_exists(file_path=DEFAULT_SAMPLE_FILE):
     if not os.path.exists(dir_name):
         script_log.info(f"Creating sample file directory: {dir_name}")
         os.makedirs(dir_name)
-    
+
     if not os.path.exists(file_path):
         script_log.info(f"Sample file not found at '{file_path}'. Downloading...")
         try:
@@ -75,9 +75,8 @@ def fuzz_association_handshake(session_args, fuzz_params):
     This function tests requirements that need a live connection to observe a response.
     """
     script_log.info("--- Starting Association Handshake Fuzzing ---")
-    
+
     # Test Case 1: Overlong Called AE Title (REQ-002)
-    # The pytest script confirms we can BUILD this; the fuzzer CONFIRMS how a server reacts.
     script_log.info("Test Case: Overlong Called AE Title")
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
@@ -85,24 +84,28 @@ def fuzz_association_handshake(session_args, fuzz_params):
     )
     if session.connect():
         try:
-            malformed_aarq_pkt = DICOM() / A_ASSOCIATE_RQ(
-                calling_ae_title=_pad_ae_title(session_args['calling_ae']),
-                variable_items=[
-                    DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
-                    DICOMVariableItem(item_type=0x20, data=(
-                        struct.pack("!BBBB", 1, 0, 0, 0) +
-                        bytes(AbstractSyntaxSubItem(abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID)) +
-                        bytes(TransferSyntaxSubItem(transfer_syntax_uid=DEFAULT_TRANSFER_SYNTAX_UID))
-                    )),
-                    DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
-                ]
+            # FIX 1: Create the A_ASSOCIATE_RQ object first...
+            aarq_sub_packet = A_ASSOCIATE_RQ(
+                calling_ae_title=_pad_ae_title(session_args['calling_ae'])
             )
+            # ...then assign the variable_items list to the created object.
+            aarq_sub_packet.variable_items=[
+                DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
+                DICOMVariableItem(item_type=0x20, data=(
+                    struct.pack("!BBBB", 1, 0, 0, 0) +
+                    bytes(AbstractSyntaxSubItem(abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID)) +
+                    bytes(TransferSyntaxSubItem(transfer_syntax_uid=DEFAULT_TRANSFER_SYNTAX_UID))
+                )),
+                DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
+            ]
+            malformed_aarq_pkt = DICOM() / aarq_sub_packet
+            
             # Manually override the field to be longer than the spec allows
             malformed_aarq_pkt[A_ASSOCIATE_RQ].called_ae_title = b"X"*20
-            
+
             script_log.debug("Sending malformed AARQ (overlong Called AE)")
             response = session.stream.sr1(malformed_aarq_pkt, timeout=session.read_timeout, verbose=0)
-            
+
             if response:
                 script_log.info(f"Received response: {response.summary()}")
                 if response.haslayer(A_ABORT) or response.haslayer(A_ASSOCIATE_RJ):
@@ -116,7 +119,7 @@ def fuzz_association_handshake(session_args, fuzz_params):
         finally:
             session.close()
 
-    # Test Case 2: Invalid Protocol Version (REQ-L01 related)
+    # Test Case 2: Invalid Protocol Version
     script_log.info("Test Case: Invalid Protocol Version in AARQ")
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
@@ -124,20 +127,23 @@ def fuzz_association_handshake(session_args, fuzz_params):
     )
     if session.connect():
         try:
-            invalid_ver_aarq_pkt = DICOM() / A_ASSOCIATE_RQ(
+            # FIX 1 (Applied here as well)
+            aarq_sub_packet = A_ASSOCIATE_RQ(
                 protocol_version=0xFFFE, # Invalid version
                 called_ae_title=_pad_ae_title(session_args['ae_title']),
-                calling_ae_title=_pad_ae_title(session_args['calling_ae']),
-                variable_items=[
-                    DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
-                    DICOMVariableItem(item_type=0x20, data=(
-                        struct.pack("!BBBB", 1, 0, 0, 0) +
-                        bytes(AbstractSyntaxSubItem(abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID)) +
-                        bytes(TransferSyntaxSubItem(transfer_syntax_uid=DEFAULT_TRANSFER_SYNTAX_UID))
-                    )),
-                    DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
-                ]
+                calling_ae_title=_pad_ae_title(session_args['calling_ae'])
             )
+            aarq_sub_packet.variable_items=[
+                DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
+                DICOMVariableItem(item_type=0x20, data=(
+                    struct.pack("!BBBB", 1, 0, 0, 0) +
+                    bytes(AbstractSyntaxSubItem(abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID)) +
+                    bytes(TransferSyntaxSubItem(transfer_syntax_uid=DEFAULT_TRANSFER_SYNTAX_UID))
+                )),
+                DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
+            ]
+            invalid_ver_aarq_pkt = DICOM() / aarq_sub_packet
+            
             script_log.debug("Sending malformed AARQ (invalid protocol version)")
             response = session.stream.sr1(invalid_ver_aarq_pkt, timeout=session.read_timeout, verbose=0)
             if response:
@@ -153,10 +159,6 @@ def fuzz_association_handshake(session_args, fuzz_params):
         finally:
             session.close()
 
-    # NOTE: This is where a fuzzer would implement live tests for requirements like:
-    # - REQ-L11 (State Confusion): e.g., session.stream.send(P_DATA_TF(...)) before associating.
-    # - REQ-L12 (Resource Exhaustion): e.g., session.stream.send(b'\x04\x00\x10\x00\x00\x00\x01\x02')
-    # - REQ-L13 (Interleaving): Send multiple P-DATA-TF packets in a specific order.
     script_log.info("--- Finished Association Handshake Fuzzing ---")
     return True
 
@@ -166,18 +168,19 @@ def extract_info_or_fallback(dcm_file_path):
         sop_class_uid = str(ds.SOPClassUID)
         sop_instance_uid = str(ds.SOPInstanceUID)
         original_ts_uid = str(ds.file_meta.TransferSyntaxUID)
-        
+
         dataset_buffer = BytesIO()
         pydicom.filewriter.write_dataset(dataset_buffer, ds)
         dataset_bytes = dataset_buffer.getvalue()
-        
+
         return sop_class_uid, sop_instance_uid, dataset_bytes, original_ts_uid, "parsed"
     except Exception:
         script_log.warning(f"Failed to parse '{dcm_file_path}'. Using raw fallback.")
         try:
             with open(dcm_file_path, 'rb') as f:
                 dataset_bytes = f.read()
-            sop_instance_uid = generate_uid(prefix="1.2.3.999.fuzz.")
+            # FIX 2: Remove trailing dot from the prefix for generate_uid
+            sop_instance_uid = generate_uid(prefix="1.2.3.999.fuzz")
             return FALLBACK_SOP_CLASS_UID, sop_instance_uid, dataset_bytes, FALLBACK_TRANSFER_SYNTAX_UID, "fallback_raw"
         except Exception as e_fallback:
             script_log.error(f"Fallback raw read also failed for '{dcm_file_path}': {e_fallback}")
@@ -197,7 +200,7 @@ def fuzz_cstore_with_file(session_args, dcm_file_path, fuzz_params):
     if parse_mode == "failed" or data_bytes is None:
         script_log.error(f"Could not extract data from {dcm_file_path}. Aborting.")
         return False
-    
+
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
         src_ae=session_args['calling_ae'], read_timeout=session_args['timeout']
@@ -228,7 +231,7 @@ def fuzz_cstore_with_file(session_args, dcm_file_path, fuzz_params):
     finally:
         if session and session.stream:
             session.close()
-    
+
     script_log.info("--- Finished C-STORE Fuzzing with File ---")
     return True
 
@@ -251,7 +254,7 @@ def main():
     logging.getLogger("scapy.contrib.dicom").setLevel(log_level)
 
     script_log.info(f"=== DICOM Fuzzer Started (Mode: {args.mode}) ===")
-    
+
     session_params = {
         'ip': args.ip, 'port': args.port, 'ae_title': args.ae_title,
         'calling_ae': args.calling_ae, 'timeout': args.timeout, 'debug': args.debug
@@ -268,7 +271,7 @@ def main():
             if not ensure_sample_file_exists(target_file):
                 script_log.error("Failed to obtain a sample file. Aborting C-STORE mode.")
                 sys.exit(1)
-        
+
         fuzz_cstore_with_file(session_params, target_file, {})
 
     script_log.info("=== DICOM Fuzzer Finished ===")
