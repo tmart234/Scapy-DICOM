@@ -97,7 +97,7 @@ def fuzz_association_handshake(session_args, fuzz_params):
                 DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
             ]
             malformed_aarq_pkt = DICOM() / aarq_sub_packet
-            
+
             malformed_aarq_pkt[A_ASSOCIATE_RQ].called_ae_title = b"X"*20
 
             script_log.debug("Sending malformed AARQ (overlong Called AE)")
@@ -139,7 +139,7 @@ def fuzz_association_handshake(session_args, fuzz_params):
                 DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
             ]
             invalid_ver_aarq_pkt = DICOM() / aarq_sub_packet
-            
+
             script_log.debug("Sending malformed AARQ (invalid protocol version)")
             response = session.stream.sr1(invalid_ver_aarq_pkt, timeout=session.read_timeout, verbose=0)
             if response:
@@ -175,7 +175,7 @@ def extract_info_or_fallback(dcm_file_path):
         try:
             with open(dcm_file_path, 'rb') as f:
                 dataset_bytes = f.read()
-            # FIX: Removed trailing dot from the prefix
+            # FIX: Removed the trailing dot from the prefix string
             sop_instance_uid = generate_uid(prefix="1.2.3.999.fuzz")
             return FALLBACK_SOP_CLASS_UID, sop_instance_uid, dataset_bytes, FALLBACK_TRANSFER_SYNTAX_UID, "fallback_raw"
         except Exception as e_fallback:
