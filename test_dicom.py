@@ -34,11 +34,13 @@ class TestCoreLayerValidation:
         user_info_data = bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))
         user_info = DICOMVariableItem(item_type=0x50, data=user_info_data)
         
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            calling_ae_title=b'VALIDATOR'.ljust(16), 
-            called_ae_title=b'TEST_SCP'.ljust(16),
-            variable_items=[app_context, pres_context, user_info]
+        aarq_payload = A_ASSOCIATE_RQ(
+            calling_ae_title=b'VALIDATOR'.ljust(16),
+            called_ae_title=b'TEST_SCP'.ljust(16)
         )
+        aarq_payload.variable_items = [app_context, pres_context, user_info]
+
+        pkt = DICOM() / aarq_payload
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt.haslayer(A_ASSOCIATE_RQ)
         assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 3
