@@ -175,8 +175,8 @@ def extract_info_or_fallback(dcm_file_path):
         try:
             with open(dcm_file_path, 'rb') as f:
                 dataset_bytes = f.read()
-            # FIX: Removed the trailing dot from the prefix string
-            sop_instance_uid = generate_uid(prefix="1.2.3.999.fuzz")
+            # FIX: Replaced the invalid alphabetic prefix with a valid numeric one.
+            sop_instance_uid = generate_uid(prefix="1.2.3.999.1.")
             return FALLBACK_SOP_CLASS_UID, sop_instance_uid, dataset_bytes, FALLBACK_TRANSFER_SYNTAX_UID, "fallback_raw"
         except Exception as e_fallback:
             script_log.error(f"Fallback raw read also failed for '{dcm_file_path}': {e_fallback}")
