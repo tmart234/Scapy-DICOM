@@ -120,8 +120,9 @@ class A_ASSOCIATE_RQ(Packet):
         StrFixedLenField("reserved2", b"\x00"*32, 32),
     ]
     def __init__(self, *args, **kwargs):
-        self.variable_items = kwargs.pop('variable_items', [])
+        variable_items = kwargs.pop('variable_items', [])
         super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
+        self.variable_items = variable_items
 
     def do_dissect_payload(self, s):
         self.variable_items = []
@@ -151,17 +152,28 @@ class A_ASSOCIATE_RJ(Packet): name = "A-ASSOCIATE-RJ"; fields_desc = [ByteField(
 class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
-        FieldLenField("length", None, length_of="data", fmt="!I", adjust=lambda pkt, x: x + 2),
+        IntField("length", None),
         ByteField("context_id", 1),
         ByteField("message_control_header", 0x03),
-        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
+        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2 if pkt.length is not None else 0)
     ]
+    
+    def post_build(self, p, pay):
+        # Calculate the length field if it wasn't specified
+        if self.length is None:
+            # Length = len(context_id) + len(msg_control) + len(data)
+            length = 1 + 1 + len(self.data)
+            # Pack the calculated length into the raw bytes
+            p = struct.pack("!I", length) + p[4:]
+        return p + pay
+
     def __init__(self, *args, **kwargs):
         is_command_kw = kwargs.pop('is_command', None)
         is_last_kw = kwargs.pop('is_last', None)
         super(PresentationDataValueItem, self).__init__(*args, **kwargs)
         if is_command_kw is not None: self.is_command = is_command_kw
         if is_last_kw is not None: self.is_last = is_last_kw
+
     is_command = property(
         lambda self: (self.message_control_header & 0x01) == 1,
         lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x01) | (0x01 if v else 0x00))
@@ -304,4 +316,3 @@ class DICOMSession:
     def close(self):
         if self.stream: self.stream.close()
         self.sock, self.stream, self.assoc_established = None, None, False
-        
