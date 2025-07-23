@@ -663,15 +663,9 @@ class A_ASSOCIATE_RQ(Packet):
     def do_build_payload(self):
         return b"".join(bytes(item) for item in self.variable_items)
     
-class A_RELEASE_RP(Packet):
-    """A-RELEASE-RP PDU (PS3.8 Section 9.3.7)"""
-    name = "A-RELEASE-RP"
-    fields_desc = [IntField("reserved1", 0)]
-
-class A_ABORT(Packet):
-    """A-ABORT PDU (PS3.8 Section 9.3.8 & Table 9-21)"""
-    name = "A-ABORT"
-    fields_desc = [ByteField("reserved1", 0), ByteField("reserved2", 0), ByteField("source", 0), ByteField("reason_diag", 0)]
+class A_RELEASE_RQ(Packet): name = "A-RELEASE-RQ"; fields_desc = [IntField("reserved1", 0)]
+class A_RELEASE_RP(Packet): name = "A-RELEASE-RP"; fields_desc = [IntField("reserved1", 0)]
+class A_ABORT(Packet): name = "A-ABORT"; fields_desc = [ByteField("reserved1", 0), ByteField("reserved2", 0), ByteField("source", 0), ByteField("reason_diag", 0)]
 
 class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
