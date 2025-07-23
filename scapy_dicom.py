@@ -589,15 +589,35 @@ class SCUSCPRoleSelectionSubItem(DULSubItem):
 # --- Association Control Service PDUs ---
 # PS3.8 Section 9.3
 class A_ASSOCIATE_RQ(Packet):
-    """A-ASSOCIATE-RQ PDU (PS3.8 Section 9.3.2)"""
     name = "A-ASSOCIATE-RQ"
     fields_desc = [
         ShortField("protocol_version", 1), ShortField("reserved1", 0),
-        StrFixedLenField("called_ae_title", b"DefaultCalled".ljust(16), 16),
-        StrFixedLenField("calling_ae_title", b"DefaultCalling".ljust(16), 16),
+        StrFixedLenField("called_ae_title", b"", 16),
+        StrFixedLenField("calling_ae_title", b"", 16),
         StrFixedLenField("reserved2", b"\x00"*32, 32),
-        PacketListField("variable_items", [], DICOMVariableItem, length_from=lambda x: x.underlayer.length - 68),
     ]
+    def __init__(self, *args, **kwargs):
+        self.variable_items = []
+        super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
+
+    def do_dissect_payload(self, s):
+        self.variable_items = []
+        stream = BytesIO(s)
+        while stream.tell() < len(s):
+            try:
+                header = stream.read(4)
+                if len(header) < 4: break
+                item_type, _, item_length = struct.unpack("!BBH", header)
+                item_data = stream.read(item_length)
+                if len(item_data) < item_length: break
+                self.variable_items.append(DICOMVariableItem(header + item_data))
+            except Exception:
+                break
+        remaining_bytes = stream.read()
+        if remaining_bytes: self.payload = Raw(remaining_bytes)
+
+    def do_build_payload(self):
+        return b"".join(bytes(item) for item in self.variable_items)
 
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     """A-ASSOCIATE-AC PDU (PS3.8 Section 9.3.3)"""
@@ -671,35 +691,33 @@ class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
         FieldLenField("length", None, length_of="value", fmt="!I"),
-        # The 'value' is an internal detail. The fields below are what matter.
-        ByteField("context_id", 1),
-        ByteField("message_control_header", 0x03), # Default: is_command=True, is_last=True
-        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
+        StrLenField("value", "", length_from=lambda x: x.length)
     ]
-
     def __init__(self, *args, **kwargs):
-        # 1. Pop our custom keywords out of the dictionary first.
-        is_command_kw = kwargs.pop('is_command', None)
-        is_last_kw = kwargs.pop('is_last', None)
-
-        # 2. Call the main Scapy constructor with the remaining keywords.
         super(PresentationDataValueItem, self).__init__(*args, **kwargs)
+        if 'context_id' in kwargs: self.context_id = kwargs['context_id']
+        if 'is_command' in kwargs: self.is_command = kwargs['is_command']
+        if 'is_last' in kwargs: self.is_last = kwargs['is_last']
+        if 'data' in kwargs: self.data = kwargs['data']
 
-        # 3. Now, set the properties using the values we saved.
-        if is_command_kw is not None:
-            self.is_command = is_command_kw
-        if is_last_kw is not None:
-            self.is_last = is_last_kw
+    def _get_msg_hdr(self):
+        return struct.unpack("!B", self.value[1:2])[0] if len(self.value) > 1 else 0
 
-    # The properties correctly manipulate the message_control_header bits.
-    is_command = property(
-        lambda self: (self.message_control_header & 0x01) == 1,
-        lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x01) | (0x01 if v else 0x00))
-    )
-    is_last = property(
-        lambda self: (self.message_control_header >> 1 & 0x01) == 1,
-        lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x02) | (0x02 if v else 0x00))
-    )
+    def _set_msg_hdr(self, is_command, is_last):
+        hdr = (0b01 if is_last else 0b00) << 1 | (0b01 if is_command else 0b00)
+        ctx_id_byte = self.value[0:1] if self.value else b'\x01'
+        data_bytes = self.value[2:] if len(self.value) > 2 else b''
+        self.value = ctx_id_byte + struct.pack("!B", hdr) + data_bytes
+
+    context_id = property(lambda self: self.value[0] if self.value else 0,
+                          lambda self, v: setattr(self, 'value', struct.pack("!B", v) + (self.value[1:] if len(self.value) > 1 else b'\x00')))
+    is_command = property(lambda self: (self._get_msg_hdr() & 0x01) == 1,
+                          lambda self, v: self._set_msg_hdr(v, self.is_last))
+    is_last = property(lambda self: (self._get_msg_hdr() >> 1 & 0x01) == 1,
+                       lambda self, v: self._set_msg_hdr(self.is_command, v))
+    data = property(lambda self: self.value[2:] if len(self.value) > 2 else b'',
+                    lambda self, v: setattr(self, 'value', (self.value[:2] if len(self.value) >= 2 else b'\x01\x03') + v))
+
 
 class P_DATA_TF(Packet):
     """
