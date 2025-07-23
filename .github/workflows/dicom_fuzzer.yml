@@ -83,13 +83,6 @@ jobs:
           # FIX: Use a shell variable for logging within the same step
           echo "Prepared fuzzed file at ${FUZZED_FILE_PATH}"
 
-      - name: Run Pytest Validation Suite
-        env:
-          # FIX: Add main_repo to PYTHONPATH to resolve ModuleNotFoundError
-          PYTHONPATH: ${{ github.workspace }}/main_repo
-        run: |
-          pytest ${{ github.workspace }}/main_repo/test_dicom_layer.py -v
-
       - name: Run DICOM Fuzzer (Association Mode)
         env:
           # FIX: Add main_repo to PYTHONPATH

@@ -4,8 +4,8 @@ import struct
 import logging
 import time
 import uuid
-
-from scapy_dicom import _uid_to_bytes
+import sys
+import os
 
 # Mute Scapy's verbose warnings for this demonstration
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
@@ -19,7 +19,6 @@ except ImportError:
     print("[-] ERROR: Could not import the DICOM layer.")
     print("[-] Please ensure the DICOM layer script is saved as 'scapy_dicom.py' in the same directory.")
     exit(1)
-
 
 # --- Group 1: Layer Unit & Validation Tests ---
 # These tests validate the layer's ability to build and parse various PDUs.
