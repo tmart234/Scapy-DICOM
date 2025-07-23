@@ -19,15 +19,15 @@ jobs:
             port: 4242
             command: "--verbose"
 
-          # - name: Pydicom_pynetdicom
-          #   image: pydicom/dicom:latest
-          #   aet: PYDICOM_SCP
-          #   port: 11112
-          #   command: >
-          #     python -m pynetdicom echoscp
-          #     --ae-title PYDICOM_SCP
-          #     --port 11112
-          #     -v
+          - name: Pydicom_pynetdicom
+            image: pydicom/dicom:latest
+            aet: PYDICOM_SCP
+            port: 11112
+            command: >
+              python -m pynetdicom echoscp
+              --ae-title PYDICOM_SCP
+              --port 11112
+              -v
 
     steps:
       - name: Checkout repository
@@ -133,9 +133,8 @@ jobs:
           fi
           echo "Using timeout: $TIMEOUT seconds"
 
-          # Assuming test_integration.py is in the repo root
-          # NOTE: You might need to add --timeout $TIMEOUT to test_integration.py arguments first!
-          python test_integration.py \
+          # NOTE: You might need to add --timeout $TIMEOUT to test_dicom.py arguments first!
+          python test_dicom.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
