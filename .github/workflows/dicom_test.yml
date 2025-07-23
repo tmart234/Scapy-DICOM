@@ -96,7 +96,7 @@ jobs:
 
           # FIX: Use pytest to run the tests, not python. Use the correct filename.
           # FIX: Added -sv for verbose output and to show print statements.
-          pytest test_dicom_layer.py \
+          pytest test_dicom.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
