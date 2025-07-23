@@ -849,7 +849,6 @@ class P_DATA_TF(Packet):
     # Store parsed items here
     parsed_pdv_items = []
 
-# In scapy_DICOM.py -> P_DATA_TF class
 
     def do_dissect_payload(self, s):
         """

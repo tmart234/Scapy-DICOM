@@ -41,7 +41,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install scapy pytest
+          # FIX: Added pynetdicom for the Pydicom_pynetdicom server test case
+          pip install scapy pytest pynetdicom
           sudo apt-get update && sudo apt-get install -y tcpdump dcmtk netcat-openbsd tshark
 
       - name: Start tcpdump capture
@@ -55,7 +56,6 @@ jobs:
         id: start_scp
         run: |
           echo "Starting ${{ matrix.dicom_server.name }} container..."
-          # --- ENV_FLAGS logic remains the same ---
           ENV_FLAGS=()
           if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
             ENV_FLAGS+=("-e" "VERBOSE_ENABLED=true")
@@ -63,10 +63,7 @@ jobs:
             ENV_FLAGS+=("-e" "DICOM_PORT=${{ matrix.dicom_server.port }}")
             ENV_FLAGS+=("-e" "ORTHANC__ACCEPT_UNKNOWN_PEERS=true")
           fi
-          echo "Using Env Vars: ${ENV_FLAGS[@]}"
-          echo "Using Command: ${{ matrix.dicom_server.command }}"
 
-          # --- Run docker run first, check exit code ---
           docker run \
             --detach \
             --rm \
@@ -75,88 +72,49 @@ jobs:
             "${ENV_FLAGS[@]}" \
             ${{ matrix.dicom_server.image }} \
             ${{ matrix.dicom_server.command }}
-          docker_run_exit_code=$?
-          if [ $docker_run_exit_code -ne 0 ]; then
-            echo "::error::Failed to start container ${{ matrix.dicom_server.name }} (docker run failed with code $docker_run_exit_code)"
-            exit 1
-          fi
 
-          # === Final Simplified Port Check Logic v2 ===
           echo "Waiting for ${{ matrix.dicom_server.name }} (port ${{ matrix.dicom_server.port }}) to become available (max 60s)..."
-          count=0
-          max_wait=120 # 120 * 0.5s = 60 seconds
-          success=0
-          while [ $count -lt $max_wait ]; do
-            # Check container first
-            if ! docker ps --filter name=dicom-scp-test-${{ matrix.dicom_server.name }} --format "{{.ID}}" | grep -q .; then
-                echo "" && echo "::error::Container exited while waiting for port." >&2
-                # Attempt to get logs on failure - moved to final step
-                exit 1
-            fi
-            # Check port using nc
-            if nc -z -w 1 127.0.0.1 ${{ matrix.dicom_server.port }}; then
-              success=1
-              echo " Port detected as open."
-              break
-            fi
-            echo -n "."
-            sleep 0.5
-            count=$((count + 1))
-          done
-          echo "" # Newline
-
-          if [ $success -eq 0 ]; then
-            echo "::error::Timeout waiting for port ${{ matrix.dicom_server.port }}." >&2
-            # Attempt to get logs on failure - moved to final step
-            exit 1
-          fi
-
-          echo "${{ matrix.dicom_server.name }} port is open and container appears running."
-          sleep 2
+          timeout 60 bash -c 'until nc -z -w 1 127.0.0.1 ${{ matrix.dicom_server.port }}; do echo -n "."; sleep 1; done'
+          echo " Port detected as open."
+          sleep 2 # Extra grace time for the server to initialize fully
 
       - name: Run echoscu Test against ${{ matrix.dicom_server.name }}
         run: |
           echo "Running echoscu -v -aet SCAPY_CI_SCU -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }}"
-          # Run echoscu with a timeout (e.g., 15 seconds)
-          # Use timeout command for echoscu itself
           timeout 15 echoscu -v -aet SCAPY_CI_SCU -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }} \
-            || echo "::warning::echoscu command failed or timed out (exit code $?). This might indicate an issue with the SCP container or environment."
+            || echo "::warning::echoscu command failed or timed out."
 
-      - name: Run DICOM Integration Test Script against ${{ matrix.dicom_server.name }}
+      - name: Run Pytest Integration Tests against ${{ matrix.dicom_server.name }}
         id: test_script
-        continue-on-error: true
+        continue-on-error: true # Keep this so subsequent cleanup steps always run
         run: |
-          # === Add timeout argument, especially for Orthanc ===
           TIMEOUT=20 # Default timeout
           if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
             TIMEOUT=45 # Increase timeout for Orthanc
           fi
           echo "Using timeout: $TIMEOUT seconds"
 
-          # NOTE: You might need to add --timeout $TIMEOUT to test_dicom.py arguments first!
-          python test_dicom.py \
+          # FIX: Use pytest to run the tests, not python. Use the correct filename.
+          # FIX: Added -sv for verbose output and to show print statements.
+          pytest test_dicom_layer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
             --calling-ae SCAPY_CI_SCU \
             --timeout $TIMEOUT \
-            --debug
+            -sv
 
       - name: Stop tcpdump capture
         if: always()
         run: |
           echo "Stopping tcpdump (PID: ${{ steps.start_tcpdump.outputs.tcpdump_pid }})..."
           if [ -n "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" ]; then
-            sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump already stopped or kill failed."
-            sleep 2
-            sudo kill -0 ${{ steps.start_tcpdump.outputs.tcpdump_pid }} 2>/dev/null && sudo kill -9 ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump cleanly stopped."
-          else
-            echo "tcpdump PID not found in step outputs."
+            sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} || echo "tcpdump already stopped."
           fi
           sleep 2
-      
-      - name: Print PCAP Info (${{ matrix.dicom_server.name }}) # Use dynamic name in step title too
-        if: always() # Run even if previous steps failed, to analyze capture
+
+      - name: Print PCAP Info (${{ matrix.dicom_server.name }})
+        if: always()
         run: |
           PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
           if [[ -f "$PCAP_FILE" ]]; then
@@ -165,7 +123,7 @@ jobs:
           else
             echo "PCAP file $PCAP_FILE not found."
           fi
-        continue-on-error: true # Keep this if you don't want capinfos issues to fail the job
+        continue-on-error: true
 
       - name: Upload pcap artifact (${{ matrix.dicom_server.name }})
         if: always()
@@ -179,16 +137,16 @@ jobs:
         if: always()
         run: |
           echo "--- ${{ matrix.dicom_server.name }} SCP Logs (Final) ---"
-          docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get logs for ${{ matrix.dicom_server.name }} (Final)."
+          docker logs dicom-scp-test-${{ matrix.dicom_server.name }} || echo "Could not get logs for ${{ matrix.dicom_server.name }}."
 
       - name: Stop ${{ matrix.dicom_server.name }} Container
         if: always()
         run: |
           echo "Stopping ${{ matrix.dicom_server.name }} SCP container..."
-          docker stop dicom-scp-test-${{ matrix.dicom_server.name }} || echo "${{ matrix.dicom_server.name }} container already stopped or could not be stopped."
+          docker stop dicom-scp-test-${{ matrix.dicom_server.name }} || echo "${{ matrix.dicom_server.name }} container already stopped."
 
       - name: Check test script outcome for ${{ matrix.dicom_server.name }}
         if: steps.test_script.outcome != 'success'
         run: |
-          echo "Test script failed for ${{ matrix.dicom_server.name }}!"
+          echo "::error::Pytest script failed for ${{ matrix.dicom_server.name }}!"
           exit 1

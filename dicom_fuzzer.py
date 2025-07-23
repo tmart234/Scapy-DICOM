@@ -42,7 +42,7 @@ DEFAULT_SAMPLE_FILE = os.path.join(DEFAULT_SAMPLE_DIR, "valid_ct.dcm")
 
 # --- Fallback UIDs ---
 FALLBACK_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture
-FALLBACK_TRANSFER_SYNTAX_UID = ImplicitVRLittleEndian._uid
+FALLBACK_TRANSFER_SYNTAX_UID = str(ImplicitVRLittleEndian)
 
 # --- Helper Functions ---
 def ensure_sample_file_exists(file_path=DEFAULT_SAMPLE_FILE):
