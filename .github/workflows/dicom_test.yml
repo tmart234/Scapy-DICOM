@@ -119,7 +119,7 @@ jobs:
           PCAP_FILE="dicom_capture_${{ matrix.dicom_server.name }}.pcap"
           if [[ -f "$PCAP_FILE" ]]; then
             echo "--- PCAP Info for $PCAP_FILE ---"
-            tshark -r "$PCAP_FILE" -c 150
+            tshark -r "$PCAP_FILE" -c 400 -V
           else
             echo "PCAP file $PCAP_FILE not found."
           fi
