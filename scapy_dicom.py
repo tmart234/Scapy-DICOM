@@ -130,7 +130,7 @@ class A_ASSOCIATE_RQ(Packet):
             try:
                 header = stream.read(4)
                 if len(header) < 4: break
-                item_type, _, item_length = struct.unpack("!BBH", header)
+                _, _, item_length = struct.unpack("!BBH", header)
                 item_data = stream.read(item_length)
                 if len(item_data) < item_length: break
                 self.variable_items.append(DICOMVariableItem(header + item_data))
@@ -141,7 +141,7 @@ class A_ASSOCIATE_RQ(Packet):
 
     def do_build_payload(self):
         return b"".join(bytes(item) for item in self.variable_items)
-
+    
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     name = "A-ASSOCIATE-AC"
 
@@ -224,8 +224,7 @@ class DICOMSession:
             ctx_id += 2
         variable_items.append(DICOMVariableItem(item_type=0x50, data=bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))))
         
-        assoc_rq_payload = A_ASSOCIATE_RQ(called_ae_title=self.dst_ae, calling_ae_title=self.src_ae)
-        assoc_rq_payload.variable_items = variable_items
+        assoc_rq_payload = A_ASSOCIATE_RQ(called_ae_title=self.dst_ae, calling_ae_title=self.src_ae, variable_items=variable_items)
         assoc_rq = DICOM() / assoc_rq_payload
         
         response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=0)
@@ -305,3 +304,4 @@ class DICOMSession:
     def close(self):
         if self.stream: self.stream.close()
         self.sock, self.stream, self.assoc_established = None, None, False
+        
