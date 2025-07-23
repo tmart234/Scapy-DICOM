@@ -40,75 +40,30 @@ DICOM_PORT = 104
 APP_CONTEXT_UID = "1.2.840.10008.3.1.1.1"
 DEFAULT_TRANSFER_SYNTAX_UID = "1.2.840.10008.1.2"
 VERIFICATION_SOP_CLASS_UID = "1.2.840.10008.1.1"
-CT_IMAGE_STORAGE_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.2"
 
 def _pad_ae_title(title):
-    """Pad AE Title with trailing spaces to 16 bytes."""
-    if isinstance(title, bytes):
-        return title.ljust(16, b' ')
+    if isinstance(title, bytes): return title.ljust(16, b' ')
     return title.ljust(16).encode('ascii')
 
 def _uid_to_bytes(uid):
-    """Encode UID string to bytes, handling potential trailing null byte.
-       Also handles input that might already be bytes.
-    """
-    if isinstance(uid, bytes):
-        # If input is already bytes, just handle padding
-        b_uid = uid
-    elif isinstance(uid, str):
-        # If input is string, encode it
-        b_uid = uid.encode('ascii')
-    elif uid is None:
-        return b'' # Handle None input gracefully
-    else:
-        # Raise error for unexpected types
-        raise TypeError(f"Unsupported type for UID conversion: {type(uid)}")
-
-    # DICOM UIDs may be padded with a single NULL byte (0x00) if their length is odd
-    if len(b_uid) % 2 != 0:
-        b_uid += b'\x00'
+    if isinstance(uid, bytes): b_uid = uid
+    elif isinstance(uid, str): b_uid = uid.encode('ascii')
+    else: return b''
+    if len(b_uid) % 2 != 0: b_uid += b'\x00'
     return b_uid
 
 # --- Minimal DIMSE C-ECHO-RQ Builder ---
 # Creates C-ECHO RQ bytes using Implicit VR Little Endian
 def build_c_echo_rq_dimse(message_id=1):
-    """
-    Builds raw bytes for a C-ECHO-RQ DIMSE command message using Implicit VR LE encoding.
-
-    Args:
-        message_id (int): The Message ID to use for the command.
-
-    Returns:
-        bytes: The raw DIMSE command bytes.
-    """
-    log.debug(f"Building C-ECHO-RQ DIMSE (Implicit VR LE) (Message ID: {message_id})")
-    # Build elements *before* calculating group length
-    elements_payload = b''
-    affected_sop_uid_bytes = _uid_to_bytes(VERIFICATION_SOP_CLASS_UID) # Use constant defined in this module
-
-    # (0000,0002) Affected SOP Class UID - Tag(4), Len(4), Value(N)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0002) + struct.pack("<I", len(affected_sop_uid_bytes)) + affected_sop_uid_bytes
-
-    # (0000,0100) Command Field (C-ECHO-RQ = 0x0030) - Tag(4), Len(4)=2, Value(2)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0100) + struct.pack("<I", 2) + struct.pack("<H", 0x0030)
-
-    # (0000,0110) Message ID - Tag(4), Len(4)=2, Value(2)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0110) + struct.pack("<I", 2) + struct.pack("<H", message_id)
-
-    # (0000,0800) Command Data Set Type (0x0101 = No dataset) - Tag(4), Len(4)=2, Value(2)
-    elements_payload += struct.pack("<HH", 0x0000, 0x0800) + struct.pack("<I", 2) + struct.pack("<H", 0x0101)
-
-    # Calculate group length (length of all elements built above)
-    cmd_group_len = len(elements_payload)
-
-    # (0000,0000) Command Group Length - Tag(4), Len(4)=4, Value(4)
-    group_length_element = struct.pack("<HH", 0x0000, 0x0000) + struct.pack("<I", 4) + struct.pack("<I", cmd_group_len)
-
-    # Prepend group length element to the other elements
-    dimse_command_set = group_length_element + elements_payload
-
-    log.debug(f"Built DIMSE Command Set (Implicit VR LE) (len={len(dimse_command_set)}): {dimse_command_set.hex()}")
-    return dimse_command_set
+    elements = [
+        (0x0000, 0x0002, _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)),
+        (0x0000, 0x0100, struct.pack('<H', 0x0030)),
+        (0x0000, 0x0110, struct.pack('<H', message_id)),
+        (0x0000, 0x0800, struct.pack('<H', 0x0101)),
+    ]
+    payload = b"".join(struct.pack('<HH', g, e) + struct.pack('<I', len(v)) + v for g, e, v in elements)
+    group_len = len(payload)
+    return struct.pack('<HHI', 0x0000, 0x0000, 4) + struct.pack('<I', group_len) + payload
 
 def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1, priority=0x0002,
                            move_originator_aet=None, move_originator_msg_id=None):
@@ -147,87 +102,19 @@ def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1, priori
     return dimse_command_set
 
 def parse_dimse_status(dimse_bytes):
-    """
-    Parses the Status (0000,0900) from DIMSE bytes (Implicit VR Little Endian).
-
-    Args:
-        dimse_bytes (bytes): The raw bytes of the DIMSE message (starting with Group 0 Length).
-
-    Returns:
-        int or None: The Status value (e.g., 0x0000 for Success) if found,
-                     otherwise None (if tag not found, wrong format, or parse error).
-    """
     try:
-        offset = 0
-        # Check minimum length for Group 0 Length element (Tag + Len + Value)
-        if len(dimse_bytes) < 12:
-            log.debug("parse_dimse_status: DIMSE bytes too short for Group Length.")
-            return None
-
-        # Check Group 0 Length Tag and Length Field Length
-        tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset+4])
-        value_len_field_len = struct.unpack("<I", dimse_bytes[offset+4:offset+8])[0]
-        if not (tag_group == 0x0000 and tag_elem == 0x0000 and value_len_field_len == 4):
-            log.debug(f"parse_dimse_status: Expected Group Length Tag (0000,0000) with UL VR (len=4), got ({tag_group:04X},{tag_elem:04X}) Len={value_len_field_len}.")
-            return None # Not starting with a valid Group Length element
-
-        # Read the group length value
-        cmd_group_len = struct.unpack("<I", dimse_bytes[offset+8:offset+12])[0]
-        offset += 12 # Move past the Group Length element
-
-        # Define the end boundary for searching within this group
+        if len(dimse_bytes) < 12: return None
+        cmd_group_len = struct.unpack("<I", dimse_bytes[8:12])[0]
+        offset = 12
         group_end_offset = offset + cmd_group_len
-
-        log.debug(f"parse_dimse_status: Searching for Status (0000,0900) within group length {cmd_group_len} (ends at offset {group_end_offset}).")
-
-        while offset < group_end_offset and offset < len(dimse_bytes):
-            # Check minimum length for next element header (Tag + Len)
-            if offset + 8 > len(dimse_bytes):
-                log.debug(f"parse_dimse_status: Truncated element header at offset {offset}.")
-                break
-
-            # Read Tag and Value Length (Implicit VR LE)
+        while offset < group_end_offset and offset + 8 <= len(dimse_bytes):
             tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset+4])
             value_len = struct.unpack("<I", dimse_bytes[offset+4:offset+8])[0]
-            data_offset = offset + 8
-            next_element_offset = data_offset + value_len
-
-            log.debug(f"  Checking Tag: ({tag_group:04X},{tag_elem:04X}), Len: {value_len}, Data Offset: {data_offset}")
-
-            # Check if element exceeds available data (more important than group boundary here)
-            if next_element_offset > len(dimse_bytes):
-                 log.warning(f"parse_dimse_status: Element ({tag_group:04X},{tag_elem:04X}) length ({value_len}) exceeds available data ({len(dimse_bytes)} total).")
-                 break
-
-            if tag_group == 0x0000 and tag_elem == 0x0900: # Status tag found
-                log.debug("  Status tag (0000,0900) found.")
-                if value_len == 2: # Status is US (2 bytes)
-                    if data_offset + 2 <= len(dimse_bytes):
-                        status_bytes = dimse_bytes[data_offset:data_offset+2]
-                        status = struct.unpack("<H", status_bytes)[0]
-                        log.debug(f"  Parsed Status value: 0x{status:04X}")
-                        return status # Return the found status
-                    else:
-                         log.warning("  Status tag (0000,0900) found, but value is truncated.")
-                         return None # Indicate parse error
-                else:
-                    log.warning(f"  Status tag (0000,0900) found but value length is {value_len}, expected 2.")
-                    return None # Indicate parse error (unexpected length)
-
-            # Move to next element
-            offset = next_element_offset
-
-        log.debug("parse_dimse_status: Status tag (0000,0900) not found within the command group.")
-        return None # Status tag not found in the group
-
-    except struct.error as e:
-        log.error(f"Struct unpack error parsing DIMSE status: {e}")
-        log.error(f"DIMSE Data near error: {dimse_bytes[max(0,offset-4):offset+12].hex()}")
-        return None
-    except Exception as e:
-        log.exception(f"Unexpected error parsing DIMSE status: {e}") # Log stack trace
-        return None
-
+            if tag_group == 0x0000 and tag_elem == 0x0900 and value_len == 2:
+                return struct.unpack("<H", dimse_bytes[offset+8:offset+10])[0]
+            offset += 8 + value_len
+    except Exception: return None
+    return None
 
 def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1, priority=0x0002,
                            move_originator_aet=None, move_originator_msg_id=None):
@@ -597,7 +484,7 @@ class A_ASSOCIATE_RQ(Packet):
         StrFixedLenField("reserved2", b"\x00"*32, 32),
     ]
     def __init__(self, *args, **kwargs):
-        self.variable_items = []
+        self.variable_items = kwargs.pop('variable_items', [])
         super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
 
     def do_dissect_payload(self, s):
@@ -618,7 +505,6 @@ class A_ASSOCIATE_RQ(Packet):
 
     def do_build_payload(self):
         return b"".join(bytes(item) for item in self.variable_items)
-
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     """A-ASSOCIATE-AC PDU (PS3.8 Section 9.3.3)"""
     # Structure identical to RQ up to reserved2 field
@@ -690,34 +576,25 @@ class A_ABORT(Packet): name = "A-ABORT"; fields_desc = [ByteField("reserved1", 0
 class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
-        FieldLenField("length", None, length_of="value", fmt="!I"),
-        StrLenField("value", "", length_from=lambda x: x.length)
+        FieldLenField("length", None, length_of="data", fmt="!I", adjust=lambda pkt, x: x + 2),
+        ByteField("context_id", 1),
+        ByteField("message_control_header", 0x03),
+        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
     ]
     def __init__(self, *args, **kwargs):
+        is_command_kw = kwargs.pop('is_command', None)
+        is_last_kw = kwargs.pop('is_last', None)
         super(PresentationDataValueItem, self).__init__(*args, **kwargs)
-        if 'context_id' in kwargs: self.context_id = kwargs['context_id']
-        if 'is_command' in kwargs: self.is_command = kwargs['is_command']
-        if 'is_last' in kwargs: self.is_last = kwargs['is_last']
-        if 'data' in kwargs: self.data = kwargs['data']
-
-    def _get_msg_hdr(self):
-        return struct.unpack("!B", self.value[1:2])[0] if len(self.value) > 1 else 0
-
-    def _set_msg_hdr(self, is_command, is_last):
-        hdr = (0b01 if is_last else 0b00) << 1 | (0b01 if is_command else 0b00)
-        ctx_id_byte = self.value[0:1] if self.value else b'\x01'
-        data_bytes = self.value[2:] if len(self.value) > 2 else b''
-        self.value = ctx_id_byte + struct.pack("!B", hdr) + data_bytes
-
-    context_id = property(lambda self: self.value[0] if self.value else 0,
-                          lambda self, v: setattr(self, 'value', struct.pack("!B", v) + (self.value[1:] if len(self.value) > 1 else b'\x00')))
-    is_command = property(lambda self: (self._get_msg_hdr() & 0x01) == 1,
-                          lambda self, v: self._set_msg_hdr(v, self.is_last))
-    is_last = property(lambda self: (self._get_msg_hdr() >> 1 & 0x01) == 1,
-                       lambda self, v: self._set_msg_hdr(self.is_command, v))
-    data = property(lambda self: self.value[2:] if len(self.value) > 2 else b'',
-                    lambda self, v: setattr(self, 'value', (self.value[:2] if len(self.value) >= 2 else b'\x01\x03') + v))
-
+        if is_command_kw is not None: self.is_command = is_command_kw
+        if is_last_kw is not None: self.is_last = is_last_kw
+    is_command = property(
+        lambda self: (self.message_control_header & 0x01) == 1,
+        lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x01) | (0x01 if v else 0x00))
+    )
+    is_last = property(
+        lambda self: (self.message_control_header >> 1 & 0x01) == 1,
+        lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x02) | (0x02 if v else 0x00))
+    )
 
 class P_DATA_TF(Packet):
     """
@@ -747,12 +624,11 @@ bind_layers(DICOM, A_ABORT, pdu_type=0x07)
 # --- DICOM Session Helper Class (Optional, but useful for tests) ---
 # (You might already have a more complete version of this)
 class DICOMSession:
-    # __init__ and connect are unchanged
     def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", read_timeout=10):
         self.dst_ip, self.dst_port = dst_ip, dst_port
         self.dst_ae, self.src_ae = _pad_ae_title(dst_ae), _pad_ae_title(src_ae)
         self.sock, self.stream, self.assoc_established = None, None, False
-        self.accepted_contexts, self.peer_max_pdu = {}, 16384
+        self.accepted_contexts = {}
         self.read_timeout = read_timeout
         self._current_message_id_counter = int(time.time()) % 50000
     def connect(self, retries=3, delay=1):
@@ -765,7 +641,6 @@ class DICOMSession:
                 if attempt == retries: return False
                 time.sleep(delay)
         return False
-    # Simplified associate and c_echo to use the improved Scapy layers
     def associate(self, requested_contexts=None):
         if not self.stream and not self.connect(): return False
         if requested_contexts is None:
@@ -781,27 +656,25 @@ class DICOMSession:
             ctx_id += 2
         variable_items.append(DICOMVariableItem(item_type=0x50, data=bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))))
         
-        # Build packet using Scapy layers directly
         assoc_rq_payload = A_ASSOCIATE_RQ(called_ae_title=self.dst_ae, calling_ae_title=self.src_ae)
         assoc_rq_payload.variable_items = variable_items
         assoc_rq = DICOM() / assoc_rq_payload
         
-        log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port}")
         response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=0)
 
         if response and response.haslayer(A_ASSOCIATE_AC):
-            log.info("Association Accepted (A-ASSOCIATE-AC received)")
             self.assoc_established = True
             for item in response[A_ASSOCIATE_AC].variable_items:
                 if item.item_type == 0x21 and item.data[2] == 0:
                     ctx_id = item.data[0]
                     abs_syntax_key_list = list(requested_contexts.keys())
-                    key_index = (ctx_id -1) // 2
+                    key_index = (ctx_id - 1) // 2
                     if key_index < len(abs_syntax_key_list):
                         abs_syntax = abs_syntax_key_list[key_index]
                         ts_item_data = item.data[4:]
-                        ts_uid = DICOMVariableItem(ts_item_data).data.rstrip(b'\x00').decode()
-                        self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
+                        if len(ts_item_data) > 4:
+                            ts_uid = DICOMVariableItem(ts_item_data).data.rstrip(b'\x00').decode()
+                            self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
             return True
         log.error(f"Association failed. Response: {response.summary() if response else 'None'}")
         return False
@@ -809,6 +682,7 @@ class DICOMSession:
     def _get_next_message_id(self):
         self._current_message_id_counter += 1
         return self._current_message_id_counter & 0xFFFF
+        
     def _find_accepted_context_id(self, sop_class_uid):
         for ctx_id, (abs_syntax, _) in self.accepted_contexts.items():
             if abs_syntax == sop_class_uid: return ctx_id
@@ -824,30 +698,24 @@ class DICOMSession:
         pdv_rq = PresentationDataValueItem(context_id=echo_ctx_id, data=dimse_rq, is_command=True, is_last=True)
         pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
         
-        log.info(f"Sending C-ECHO-RQ (Message ID: {msg_id})")
         response = self.stream.sr1(pdata_rq, timeout=self.read_timeout, verbose=0)
         
         if response and response.haslayer(P_DATA_TF) and response[P_DATA_TF].pdv_items:
             pdv_rsp = response[P_DATA_TF].pdv_items[0]
             status = parse_dimse_status(pdv_rsp.data)
-            log.info(f"C-ECHO completed with DIMSE Status: {status}")
             return status
         return None
     
     def release(self):
         if not self.assoc_established: return True
-        log.info("Sending A-RELEASE-RQ...")
         response = self.stream.sr1(DICOM()/A_RELEASE_RQ(), timeout=self.read_timeout, verbose=0)
         self.close()
-        if response and response.haslayer(A_RELEASE_RP):
-            log.info("Association released successfully.")
-            return True
-        log.warning("Did not receive A-RELEASE-RP.")
-        return False
+        return response and response.haslayer(A_RELEASE_RP)
 
     def close(self):
         if self.stream: self.stream.close()
         self.sock, self.stream, self.assoc_established = None, None, False
+
 # --- Example Usage (if run as main script) ---
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
