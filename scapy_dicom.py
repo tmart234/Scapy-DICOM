@@ -119,11 +119,18 @@ class A_ASSOCIATE_RQ(Packet):
         StrFixedLenField("calling_ae_title", b"", 16),
         StrFixedLenField("reserved2", b"\x00"*32, 32),
     ]
+
     def __init__(self, *args, **kwargs):
+        # This init is now correct - pop the kwarg, then call super.
         variable_items = kwargs.pop('variable_items', [])
         super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
         self.variable_items = variable_items
 
+    # This method builds the payload from the self.variable_items list
+    def do_build_payload(self):
+        return b"".join(bytes(item) for item in self.variable_items)
+
+    # This method dissects the payload into the self.variable_items list
     def do_dissect_payload(self, s):
         self.variable_items = []
         stream = BytesIO(s)
@@ -134,21 +141,20 @@ class A_ASSOCIATE_RQ(Packet):
                 _, _, item_length = struct.unpack("!BBH", header)
                 item_data = stream.read(item_length)
                 if len(item_data) < item_length: break
+                # Append a dissected DICOMVariableItem
                 self.variable_items.append(DICOMVariableItem(header + item_data))
             except Exception:
                 break
+        # Handle any leftover bytes if dissection fails midway
         remaining_bytes = stream.read()
-        if remaining_bytes: self.payload = Raw(remaining_bytes)
-
-    def do_build_payload(self):
-        return b"".join(bytes(item) for item in self.variable_items)
-    
+        if remaining_bytes:
+            self.payload = Raw(remaining_bytes)
+            
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     name = "A-ASSOCIATE-AC"
 
 class A_ASSOCIATE_RJ(Packet): name = "A-ASSOCIATE-RJ"; fields_desc = [ByteField("reserved1", 0), ByteField("result", 1), ByteField("source", 1), ByteField("reason_diag", 1)]
 
-# FIX: Redefined PresentationDataValueItem as a proper Scapy Packet with real fields.
 class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
@@ -157,15 +163,16 @@ class PresentationDataValueItem(Packet):
         ByteField("message_control_header", 0x03),
         StrLenField("data", "", length_from=lambda pkt: pkt.length - 2 if pkt.length is not None else 0)
     ]
-    
+
     def post_build(self, p, pay):
-        # Calculate the length field if it wasn't specified
         if self.length is None:
-            # Length = len(context_id) + len(msg_control) + len(data)
-            length = 1 + 1 + len(self.data)
-            # Pack the calculated length into the raw bytes
+            length = 2 + len(self.data)  # context_id + message_control_header + data
             p = struct.pack("!I", length) + p[4:]
         return p + pay
+
+    # This method prevents the "greedy" dissection
+    def guess_payload_class(self, payload):
+        return NoPayload
 
     def __init__(self, *args, **kwargs):
         is_command_kw = kwargs.pop('is_command', None)
@@ -182,7 +189,6 @@ class PresentationDataValueItem(Packet):
         lambda self: (self.message_control_header >> 1 & 0x01) == 1,
         lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x02) | (0x02 if v else 0x00))
     )
-
 class P_DATA_TF(Packet):
     name = "P-DATA-TF"
     fields_desc = [
