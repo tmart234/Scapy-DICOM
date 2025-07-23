@@ -198,6 +198,57 @@ def parse_dimse_status(dimse_bytes):
         return None
 
 
+def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1, priority=0x0002,
+                           move_originator_aet=None, move_originator_msg_id=None):
+    """
+    Builds raw bytes for a C-STORE-RQ DIMSE command message using Implicit VR LE encoding.
+    """
+    log.debug(f"Building C-STORE-RQ DIMSE (Message ID: {message_id})")
+    elements_payload = b''
+
+    # (0000,0002) Affected SOP Class UID
+    affected_sop_class_uid_bytes = _uid_to_bytes(sop_class_uid)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0002) + struct.pack("<I", len(affected_sop_class_uid_bytes)) + affected_sop_class_uid_bytes
+
+    # (0000,0100) Command Field (C-STORE-RQ = 0x0001)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0100) + struct.pack("<I", 2) + struct.pack("<H", 0x0001)
+
+    # (0000,0110) Message ID
+    elements_payload += struct.pack("<HH", 0x0000, 0x0110) + struct.pack("<I", 2) + struct.pack("<H", message_id)
+
+    # (0000,0700) Priority (MEDIUM = 0x0002)
+    elements_payload += struct.pack("<HH", 0x0000, 0x0700) + struct.pack("<I", 2) + struct.pack("<H", priority)
+
+    # (0000,0800) Command Data Set Type (Indicates that a Data Set is present in the Message)
+    # For C-STORE-RQ, this refers to the command itself. The dataset follows in P-DATA.
+    # Standard says "Set to any value other than 0101H (Null)". Typically 0x0000 or 0x0102.
+    # Let's use 0x0102, indicating "Data Set Present (Command)" - but this usually refers to attributes *within* the command.
+    # More common practice for C-STORE-RQ is that the command dataset itself is NULL (0x0101),
+    # and the image dataset follows in the P-DATA stream.
+    elements_payload += struct.pack("<HH", 0x0000, 0x0800) + struct.pack("<I", 2) + struct.pack("<H", 0x0101) # No Command Dataset
+
+    # (0000,1000) Affected SOP Instance UID
+    affected_sop_instance_uid_bytes = _uid_to_bytes(sop_instance_uid)
+    elements_payload += struct.pack("<HH", 0x0000, 0x1000) + struct.pack("<I", len(affected_sop_instance_uid_bytes)) + affected_sop_instance_uid_bytes
+
+    # (0000,1002) Move Originator Application Entity Title (Conditional)
+    if move_originator_aet:
+        move_aet_bytes = _pad_ae_title(move_originator_aet) # AE titles are fixed 16 bytes
+        elements_payload += struct.pack("<HH", 0x0000, 0x1002) + struct.pack("<I", len(move_aet_bytes)) + move_aet_bytes
+    
+    # (0000,1003) Move Originator Message ID (Conditional)
+    if move_originator_msg_id is not None: # Check for None as 0 is a valid ID
+        elements_payload += struct.pack("<HH", 0x0000, 0x1003) + struct.pack("<I", 2) + struct.pack("<H", move_originator_msg_id)
+
+    # Calculate Command Group Length
+    cmd_group_len = len(elements_payload)
+    group_length_element = struct.pack("<HH", 0x0000, 0x0000) + struct.pack("<I", 4) + struct.pack("<I", cmd_group_len)
+    
+    dimse_command_set = group_length_element + elements_payload
+    log.debug(f"Built C-STORE-RQ DIMSE (len={len(dimse_command_set)}): {dimse_command_set.hex()}")
+    return dimse_command_set
+
+
 # --- DICOM Base PDU ---
 class DICOM(Packet):
     """
@@ -1282,6 +1333,188 @@ class DICOMSession:
             # Consider aborting if the state is unexpected
             self.abort()
             return None # Indicate failure: unexpected PDU
+
+    def _get_next_message_id(self):
+        if not hasattr(self, '_current_message_id_counter'):
+            # Initialize with a value that's somewhat unique per session start
+            self._current_message_id_counter = int(time.time()) % 50000 
+        self._current_message_id_counter += 1
+        if self._current_message_id_counter > 0xFFFF: # UShort max
+            self._current_message_id_counter = 1
+        return self._current_message_id_counter
+
+    def c_store(self, dataset_bytes, sop_class_uid, sop_instance_uid, 
+                original_dataset_transfer_syntax_uid, # TS of the dataset_bytes
+                move_originator_aet=None, move_originator_msg_id=None,
+                priority=0x0002):
+        """
+        Performs a C-STORE operation to send a dataset.
+
+        Args:
+            dataset_bytes (bytes): The raw dataset to send.
+            sop_class_uid (str): Affected SOP Class UID for the dataset.
+            sop_instance_uid (str): Affected SOP Instance UID for the dataset.
+            original_dataset_transfer_syntax_uid (str): The Transfer Syntax UID of the provided dataset_bytes.
+                                                        A presentation context for this combination must have been accepted.
+            move_originator_aet (str, optional): Move Originator AE Title.
+            move_originator_msg_id (int, optional): Move Originator Message ID.
+            priority (int, optional): DIMSE priority.
+
+        Returns:
+            int or None: The DIMSE status from C-STORE-RSP, or None on failure.
+        """
+        if not self.assoc_established:
+            log.error("C-STORE: Association not established.")
+            return None
+
+        # 1. Find an accepted presentation context for the given SOP Class and original Transfer Syntax
+        target_context_id = None
+        negotiated_ts_for_context = None # This is the TS the SCP accepted for this context
+        
+        log.debug(f"C-STORE: Looking for context for SOPClass={sop_class_uid}, OfferedTS={original_dataset_transfer_syntax_uid}")
+        log.debug(f"Accepted contexts from association: {self.accepted_contexts}")
+
+        for ctx_id, (abs_syntax, accepted_trn_syntax) in self.accepted_contexts.items():
+            if abs_syntax == sop_class_uid:
+                # The SCP must have accepted the *original_dataset_transfer_syntax_uid* for this SOP Class.
+                # The `accepted_contexts` stores {req_ctx_id: (abs_syntax_UID, accepted_transfer_syntax_UID)}
+                # This means we should have proposed original_dataset_transfer_syntax_uid during association.
+                if accepted_trn_syntax == original_dataset_transfer_syntax_uid:
+                    target_context_id = ctx_id
+                    negotiated_ts_for_context = accepted_trn_syntax
+                    log.info(f"C-STORE: Using Presentation Context ID: {target_context_id} "
+                             f"(Abstract Syntax: {abs_syntax}, Negotiated Transfer Syntax: {negotiated_ts_for_context})")
+                    break
+        
+        if target_context_id is None:
+            log.error(f"C-STORE: No accepted presentation context found for SOP Class {sop_class_uid} "
+                      f"with Transfer Syntax {original_dataset_transfer_syntax_uid}.")
+            # FUZZING: Could attempt to send with a default context_id (e.g., 1) and see what happens.
+            # For now, we require a valid negotiated context.
+            return None
+
+        # 2. Build C-STORE-RQ DIMSE command
+        message_id = self._get_next_message_id()
+        c_store_rq_bytes = build_c_store_rq_dimse(
+            sop_class_uid=sop_class_uid,
+            sop_instance_uid=sop_instance_uid,
+            message_id=message_id,
+            priority=priority,
+            move_originator_aet=move_originator_aet,
+            move_originator_msg_id=move_originator_msg_id
+        )
+        if not c_store_rq_bytes:
+            log.error("C-STORE: Failed to build C-STORE-RQ DIMSE command.")
+            return None
+
+        # 3. Prepare list of PDVs: command first, then data fragments
+        all_pdvs_for_c_store = []
+
+        # Command PDV
+        cmd_pdv = PresentationDataValueItem()
+        cmd_pdv.context_id = target_context_id
+        cmd_pdv.is_command = True
+        cmd_pdv.is_last = not bool(dataset_bytes) # True if no dataset follows, else False (dataset is part of same DIMSE message)
+                                                # Correction: C-STORE-RQ is one DIMSE message. The dataset is its payload.
+                                                # The command PDV is the only *command* fragment.
+                                                # If there's a dataset, it will be sent as *data* fragments.
+        cmd_pdv.is_last = True # The command itself is sent as one fragment.
+        cmd_pdv.data = c_store_rq_bytes
+        all_pdvs_for_c_store.append(cmd_pdv)
+
+        # Data PDVs (if dataset exists)
+        if dataset_bytes:
+            offset = 0
+            # Max data bytes per PDV. peer_max_pdu is for the entire P-DATA-TF item.
+            # A P-DATA-TF PDU item has a 6-byte UL header.
+            # Max content for P-DATA-TF is self.peer_max_pdu.
+            # Each PDV within that has: 4 (len) + 1 (ctx) + 1 (ctrl).
+            # For simplicity, make fragments small enough that multiple can fit if needed,
+            # or that one large fragment forms one PDV.
+            fragment_size = (self.peer_max_pdu or 16384) - 256 # Conservative for PDU/PDV overheads
+            if fragment_size <= 0: fragment_size = 1024 
+
+            log.debug(f"C-STORE: Fragmenting dataset of {len(dataset_bytes)} bytes into PDVs (fragment size ~{fragment_size})")
+            while offset < len(dataset_bytes):
+                chunk = dataset_bytes[offset : offset + fragment_size]
+                offset += len(chunk)
+
+                data_pdv = PresentationDataValueItem()
+                data_pdv.context_id = target_context_id
+                data_pdv.is_command = False # This is dataset
+                data_pdv.is_last = (offset >= len(dataset_bytes)) # True if this is the last chunk
+                data_pdv.data = chunk
+                all_pdvs_for_c_store.append(data_pdv)
+                log.debug(f"  Created data PDV: len={len(chunk)}, is_last={data_pdv.is_last}")
+        else:
+            log.info("C-STORE: No dataset_bytes provided. Sending C-STORE-RQ command only (will likely be rejected by SCP).")
+
+
+        # 4. Send PDVs in one or more P-DATA-TF PDUs
+        # The current self.send_p_data sends all PDVs in its list in ONE P-DATA-TF PDU.
+        # This is fine if the total size of PDVs is <= self.peer_max_pdu.
+        # For very large datasets, this list of PDVs needs to be split.
+        # For fuzzing, sending an overly large single P-DATA-TF can be a test case.
+
+        # Simple approach: Send all PDVs in one go. send_p_data builds one P-DATA-TF.
+        # DICOM.post_build will calculate the P-DATA-TF PDU length.
+        # If it's too big for the peer, that's part of the test.
+        log.info(f"C-STORE: Sending {len(all_pdvs_for_c_store)} PDVs (Command + Data Fragments) in one P-DATA-TF PDU.")
+        if not self.send_p_data(pdv_list=all_pdvs_for_c_store):
+            log.error("C-STORE: Failed to send P-DATA for C-STORE.")
+            return None # Send error
+
+        # 5. Receive and process C-STORE-RSP
+        log.info("C-STORE: Waiting for C-STORE-RSP...")
+        response_pdu = None
+        try:
+            response_pdu = self.stream.recv()
+        except socket.timeout:
+            log.error(f"C-STORE: Socket timeout ({self.read_timeout}s) waiting for C-STORE-RSP.")
+            self.abort()
+            return None
+        except Exception as e:
+            log.error(f"C-STORE: Error receiving C-STORE-RSP: {e}", exc_info=True)
+            self.abort()
+            return None
+
+        if not response_pdu:
+            log.error("C-STORE: No C-STORE-RSP PDU received (connection likely closed).")
+            return None
+
+        log.debug("C-STORE: Processing C-STORE-RSP PDU.")
+        # response_pdu.show(dump=True) # Can be verbose
+
+        dimse_status = None
+        if response_pdu.pdu_type == 0x04: # P-DATA-TF (expected for RSP)
+            if hasattr(response_pdu, 'pdata_instance') and \
+               response_pdu.pdata_instance.parsed_pdv_items:
+                
+                parsed_rsp_pdvs = response_pdu.pdata_instance.parsed_pdv_items
+                # C-STORE-RSP should be in one PDV
+                if len(parsed_rsp_pdvs) == 1:
+                    rsp_pdv = parsed_rsp_pdvs[0]
+                    if rsp_pdv.context_id == target_context_id and rsp_pdv.is_command and rsp_pdv.is_last:
+                        dimse_status = parse_dimse_status(rsp_pdv.data)
+                        if dimse_status is not None:
+                            log.info(f"C-STORE successful. DIMSE Status: 0x{dimse_status:04X}")
+                        else:
+                            log.error("C-STORE: Failed to parse DIMSE status from RSP PDV.")
+                    else:
+                        log.error(f"C-STORE: Received PDV has unexpected context/flags. CtxID {rsp_pdv.context_id}, IsCmd {rsp_pdv.is_command}, IsLast {rsp_pdv.is_last}")
+                else:
+                    log.error(f"C-STORE: Expected 1 PDV in C-STORE-RSP, got {len(parsed_rsp_pdvs)}")
+            else:
+                log.error("C-STORE: P-DATA-TF for RSP received, but no parsed PDV items found.")
+        elif response_pdu.haslayer(A_ABORT):
+            log.error("C-STORE: Association aborted by peer instead of C-STORE-RSP.")
+            self.assoc_established = False # Handled by abort logic too
+            # self.close() # abort() calls close()
+        else:
+            log.error(f"C-STORE: Unexpected PDU type {response_pdu.pdu_type} received instead of C-STORE-RSP.")
+            self.abort()
+
+        return dimse_status
 
     def release(self):
         """Sends A-RELEASE-RQ and waits for A-RELEASE-RP."""
