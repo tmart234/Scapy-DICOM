@@ -759,242 +759,53 @@ class A_ABORT(Packet):
         }) # Reason/Diag - interpretation depends on source
     ]
 class PresentationDataValueItem(Packet):
-    """
-    Represents a single PDV Item conceptually.
-    Serialization (`build_bytes`) and manual parsing within P_DATA_TF handle the structure.
-    """
-    name = "PDV Item"
-    # No Scapy fields_desc needed as it's manually handled
+    name = "PresentationDataValueItem"
+    fields_desc = [
+        FieldLenField("length", None, length_of="value", fmt="!I"),
+        # The 'value' field contains the context_id, header, and data
+        StrLenField("value", "", length_from=lambda x: x.length)
+    ]
+    # We define properties to easily access the sub-fields of 'value'
+    def __init__(self, *args, **kwargs):
+        super(PresentationDataValueItem, self).__init__(*args, **kwargs)
+        if 'context_id' in kwargs: self.context_id = kwargs['context_id']
+        if 'is_command' in kwargs: self.is_command = kwargs['is_command']
+        if 'is_last' in kwargs: self.is_last = kwargs['is_last']
+        if 'data' in kwargs: self.data = kwargs['data']
 
-    # --- Attributes to hold parsed data ---
-    context_id = 0
-    message_control_header = 0
-    data = b""
-    _parsed_pdv_value_len = None # Store the length read during dissection
+    def _get_msg_hdr(self):
+        return struct.unpack("!B", self.value[1:2])[0] if len(self.value) > 1 else 0
 
-    # --- Properties for message_control_header ---
-    @property
-    def is_last(self):
-        return (self.message_control_header >> 1) & 0x01
-    @is_last.setter
-    def is_last(self, value):
-        if value: self.message_control_header |= 0x02
-        else: self.message_control_header &= ~0x02
-    @property
-    def is_command(self):
-        return self.message_control_header & 0x01
-    @is_command.setter
-    def is_command(self, value):
-        if value: self.message_control_header |= 0x01
-        else: self.message_control_header &= ~0x01
+    def _set_msg_hdr(self, is_command, is_last):
+        hdr = 0
+        if is_last: hdr |= 0x02
+        if is_command: hdr |= 0x01
+        ctx_id_byte = self.value[0:1] if self.value else b'\x01'
+        data_bytes = self.value[2:] if len(self.value) > 2 else b''
+        self.value = ctx_id_byte + struct.pack("!B", hdr) + data_bytes
 
-    def build_bytes(self):
-        """Manually builds the complete PDV Item bytes including the length prefix."""
-        try:
-            # Ensure context_id and header are within byte range
-            ctx_id = self.context_id & 0xFF
-            msg_hdr = self.message_control_header & 0xFF
-            packed_fields = struct.pack("!BB", ctx_id, msg_hdr)
-        except Exception as e:
-            log.error(f"PDV build_bytes: Error packing fields: {e}", exc_info=True)
-            packed_fields = b'\x00\x00' # Default to 0 on error
-
-        # Ensure data is bytes
-        data_payload = self.data if isinstance(self.data, bytes) else b''
-
-        value_payload = packed_fields + data_payload
-        pdv_value_len = len(value_payload)
-        full_pdv_bytes = struct.pack("!I", pdv_value_len) + value_payload # Big Endian Length
-        log.debug(f"PDV build_bytes: ValueLen={pdv_value_len}. TotalBytes={len(full_pdv_bytes)}.")
-        return full_pdv_bytes
-
-    # Removed from_bytes as parsing is now done in P_DATA_TF.dissect_payload
-
-    # Prevent Scapy's default building/dissection for this specific class
-    def build(self):
-        # This method is typically called by Scapy internally.
-        # We want to use our manual build_bytes() instead.
-        log.warning("PDV build() called unexpectedly - use build_bytes() directly if needed.")
-        # Return empty bytes or raise error? Returning bytes() might be safer.
-        return b'' # Avoid Scapy trying to build based on non-existent fields_desc
-
-    def do_build(self):
-        # Overriding do_build might be necessary if build() isn't enough
-        log.debug("PDV do_build() called.")
-        return self.build_bytes() # Delegate to manual builder
-
-    def do_dissect(self, s):
-        # Dissection is handled entirely by P_DATA_TF.dissect_payload
-        log.error("PDV do_dissect called - This should not happen. Parsing occurs in P_DATA_TF.")
-        # Return the original bytes, indicating Scapy shouldn't process further
-        return s
-
-    def summary(self):
-        cmd_data = "Command" if self.is_command else "Data"
-        last = "Last" if self.is_last else "More"
-        data_len = len(self.data) if hasattr(self, 'data') else 'N/A'
-        # Use the stored length if available from dissection
-        pdv_len_val = self._parsed_pdv_value_len if self._parsed_pdv_value_len is not None else 'N/A'
-        return f"PDV Item (Context: {self.context_id}, {cmd_data}, {last}, ValueLen: {pdv_len_val}, DataLen: {data_len})"
+    context_id = property(lambda self: self.value[0] if self.value else 0,
+                          lambda self, v: setattr(self, 'value', struct.pack("!B", v) + self.value[1:] if self.value else struct.pack("!B", v)))
+    is_command = property(lambda self: (self._get_msg_hdr() & 0x01) == 1,
+                          lambda self, v: self._set_msg_hdr(v, self.is_last))
+    is_last = property(lambda self: (self._get_msg_hdr() >> 1 & 0x01) == 1,
+                       lambda self, v: self._set_msg_hdr(self.is_command, v))
+    data = property(lambda self: self.value[2:] if len(self.value) > 2 else b'',
+                    lambda self, v: setattr(self, 'value', self.value[:2] + v if len(self.value) >= 2 else b'\x01\x00' + v))
 
 # ---- FIXED P_DATA_TF ----
 class P_DATA_TF(Packet):
     """
     P-DATA-TF PDU (PS3.8 Section 9.3.5)
-    Payload contains concatenated PDV Items. Dissection parses them manually.
+    Contains a list of Presentation Data Value Items.
     """
     name = "P-DATA-TF"
-    # No fields_desc needed, payload is manually parsed/built
+    fields_desc = [
+        PacketListField("pdv_items", [], PresentationDataValueItem,
+                        length_from=lambda pkt: pkt.underlayer.length)
+    ]
 
-    # Store parsed items here
-    parsed_pdv_items = []
-
-
-    def do_dissect_payload(self, s):
-        """
-        Manually parse the PDU payload 's' into PresentationDataValueItem objects.
-        Consume exactly the number of bytes specified by the DICOM UL length.
-        Store parsed items on THIS instance, and store a reference to this
-        instance on the underlayer (DICOM packet).
-        """
-        # Initialize the list ON THIS TEMPORARY INSTANCE
-        self.parsed_pdv_items = [] # Changed back from self.underlayer
-
-        # Store a reference to this P_DATA_TF instance on the DICOM underlayer
-        if self.underlayer:
-            self.underlayer.pdata_instance = self # Store reference to self
-        else:
-             log.error("P_DATA_TF.do_dissect_payload: Cannot access underlayer (DICOM) to store instance reference.")
-             self.payload = NoPayload()
-             return
-
-        # Determine the exact number of bytes belonging to this PDU's payload
-        total_payload_len = getattr(self.underlayer, 'length', len(s))
-        log.debug(f"P_DATA_TF.do_dissect_payload: Starting. UL length field = {total_payload_len}. Available bytes in buffer = {len(s)}.")
-
-        # ...(logic for payload_to_process and remaining_after_pdu remains the same)...
-        if total_payload_len > len(s):
-            log.warning(f"P_DATA_TF.do_dissect_payload: UL length ({total_payload_len}) > available bytes ({len(s)}). Processing only available bytes.")
-            payload_to_process = s
-            remaining_after_pdu = b''
-        elif total_payload_len < len(s):
-             log.debug(f"P_DATA_TF.do_dissect_payload: UL length ({total_payload_len}) < available bytes ({len(s)}). Processing UL length; {len(s) - total_payload_len} bytes will remain for next PDU.")
-             payload_to_process = s[:total_payload_len]
-             remaining_after_pdu = s[total_payload_len:]
-        else:
-            payload_to_process = s
-            remaining_after_pdu = b''
-
-        log.debug(f"P_DATA_TF.do_dissect_payload: Determined PDU payload length to process: {len(payload_to_process)}. Remaining after PDU: {len(remaining_after_pdu)}")
-        stream = BytesIO(payload_to_process)
-        processed_bytes_count = 0
-
-        while processed_bytes_count < len(payload_to_process):
-            start_offset = stream.tell()
-            log.debug(f" P_DATA_TF loop: Current offset={start_offset}, Total to process={len(payload_to_process)}")
-
-            # ...(Reading/unpacking PDV length and value bytes remains the same)...
-            if start_offset + 4 > len(payload_to_process):
-                 log.warning(f" P_DATA_TF loop: Not enough bytes left ({len(payload_to_process) - start_offset}) for PDV length field. Stopping parse.")
-                 break
-            packed_length_bytes = stream.read(4)
-            if len(packed_length_bytes) < 4:
-                log.warning(f" P_DATA_TF loop: Short read on PDV length field (got {len(packed_length_bytes)} bytes). Stopping parse.")
-                stream.seek(start_offset)
-                break
-            try:
-                pdv_value_len = struct.unpack("!I", packed_length_bytes)[0]
-                log.debug(f" P_DATA_TF loop: Read PDV Value Length = {pdv_value_len}")
-                current_stream_pos_after_len = stream.tell()
-                bytes_remaining_in_stream = len(payload_to_process) - current_stream_pos_after_len
-                if pdv_value_len > bytes_remaining_in_stream:
-                    log.warning(f" P_DATA_TF loop: Declared PDV value length ({pdv_value_len}) exceeds remaining bytes in PDU payload ({bytes_remaining_in_stream}). Truncated item? Stopping parse.")
-                    stream.seek(start_offset)
-                    break
-                log.debug(f" P_DATA_TF loop: Attempting to read {pdv_value_len} bytes for PDV value...")
-                pdv_value_bytes = stream.read(pdv_value_len)
-                log.debug(f" P_DATA_TF loop: Read {len(pdv_value_bytes)} actual bytes for value.")
-                if len(pdv_value_bytes) < pdv_value_len:
-                    log.error(f" P_DATA_TF loop: Short read for PDV value. Expected {pdv_value_len}, got {len(pdv_value_bytes)}. Stopping parse.")
-                    stream.seek(start_offset)
-                    break
-                if len(pdv_value_bytes) < 2:
-                    log.error(f" P_DATA_TF loop: PDV value too short ({len(pdv_value_bytes)} bytes) for Context ID and Header. Stopping parse.")
-                    stream.seek(start_offset)
-                    break
-
-                context_id = pdv_value_bytes[0]
-                msg_hdr = pdv_value_bytes[1]
-                data_bytes = pdv_value_bytes[2:]
-                log.debug(f" P_DATA_TF loop: Parsed ContextID={context_id}, MsgHdr={msg_hdr:02X} (Cmd={(msg_hdr & 0x01)}, Last={(msg_hdr >> 1) & 0x01}), DataLen={len(data_bytes)}")
-
-                try:
-                    log.debug(" P_DATA_TF loop: Creating PresentationDataValueItem instance...")
-                    pdv_item = PresentationDataValueItem()
-                    pdv_item.context_id = context_id
-                    pdv_item.message_control_header = msg_hdr
-                    pdv_item.data = data_bytes
-                    pdv_item._parsed_pdv_value_len = pdv_value_len
-                    log.debug(f" P_DATA_TF loop: Appending PDV Item object: {pdv_item.summary()}")
-
-                    # **** CHANGE HERE: Append to self.parsed_pdv_items ****
-                    self.parsed_pdv_items.append(pdv_item)
-                    # **** END CHANGE ****
-
-                    log.debug(f" P_DATA_TF loop: Successfully appended PDV Item to self. List size now: {len(self.parsed_pdv_items)}")
-                except Exception as item_ex:
-                    log.error(f" P_DATA_TF loop: Failed to create/append PDV Item object: {item_ex}", exc_info=True)
-                    stream.seek(start_offset)
-                    break
-
-            # ...(Exception handling for struct.error etc. remains the same)...
-            except struct.error as e:
-                log.error(f" P_DATA_TF loop: Struct error unpacking PDV length at offset {start_offset}: {e}. Stopping parse.", exc_info=True)
-                stream.seek(start_offset) # Rewind
-                break
-            except Exception as e:
-                 log.error(f" P_DATA_TF loop: Unexpected error processing PDV at offset {start_offset}: {e}", exc_info=True)
-                 stream.seek(start_offset)
-                 break
-
-            processed_bytes_count = stream.tell()
-            log.debug(f" P_DATA_TF loop: End of loop iteration. processed_bytes_count updated to {processed_bytes_count}")
-
-        # ...(Handling leftover_pdu_bytes and remaining_after_pdu remains the same)...
-        leftover_pdu_bytes = stream.read()
-        if leftover_pdu_bytes:
-            log.warning(f"P_DATA_TF.do_dissect_payload: {len(leftover_pdu_bytes)} unparsed bytes remaining within PDU payload buffer (offset {processed_bytes_count} to {len(payload_to_process)}).")
-            remaining_after_pdu = leftover_pdu_bytes + remaining_after_pdu
-
-        self.payload = Raw(remaining_after_pdu) if remaining_after_pdu else NoPayload()
-
-        # Log the final state
-        final_parsed_count = len(self.parsed_pdv_items)
-        # Confirm the instance reference was stored on the underlayer
-        instance_stored = hasattr(self.underlayer, 'pdata_instance') if self.underlayer else False
-        log.debug(f"P_DATA_TF.do_dissect_payload: Finished. Instance stored on underlayer: {instance_stored}. Parsed {final_parsed_count} PDV items onto self. Next layer payload length: {len(self.payload.load if isinstance(self.payload, Raw) else 0)}")   
-
-    def build_payload(self):
-        """Builds the P-DATA-TF payload by concatenating the bytes of PDV items."""
-        log.debug(f"P_DATA_TF.build_payload: Building from {len(self.parsed_pdv_items)} items.")
-        payload = b"".join(item.build_bytes() for item in self.parsed_pdv_items)
-        return payload
-
-    # Override post_build to ensure payload comes from build_payload
-    def post_build(self, p, pay):
-        """Ensures the payload is built from parsed_pdv_items if they exist."""
-        # 'p' is the header bytes, 'pay' is the payload from subsequent layers (should be empty for P-DATA-TF)
-        if self.parsed_pdv_items:
-            built_payload = self.build_payload()
-            log.debug(f"P_DATA_TF.post_build: Using built payload (len={len(built_payload)}) from parsed_pdv_items.")
-            # The DICOM UL layer above this will handle adding the PDU length header
-            return p + built_payload + pay # Should normally just be 'p + built_payload'
-        else:
-            # If no items, just return header and any existing payload (e.g., Raw)
-             log.debug("P_DATA_TF.post_build: No parsed_pdv_items, returning header + existing payload.")
-             return p + pay
-
-
+    
 # --- Bind Layers ---
 bind_layers(TCP, DICOM, dport=DICOM_PORT)
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
