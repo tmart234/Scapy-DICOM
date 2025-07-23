@@ -671,18 +671,27 @@ class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
         FieldLenField("length", None, length_of="value", fmt="!I"),
-        # The 'value' contains the context_id, header, and data.
-        # We define them as separate fields for easy access and construction.
+        # The 'value' is an internal detail. The fields below are what matter.
         ByteField("context_id", 1),
-        ByteField("message_control_header", 0x03),
+        ByteField("message_control_header", 0x03), # Default: is_command=True, is_last=True
         StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
     ]
-    # Define properties to easily get/set the control header bits from keywords.
-    def __init__(self, *args, **kwargs):
-        super(PresentationDataValueItem, self).__init__(*args, **kwargs)
-        if 'is_command' in kwargs: self.is_command = kwargs['is_command']
-        if 'is_last' in kwargs: self.is_last = kwargs['is_last']
 
+    def __init__(self, *args, **kwargs):
+        # 1. Pop our custom keywords out of the dictionary first.
+        is_command_kw = kwargs.pop('is_command', None)
+        is_last_kw = kwargs.pop('is_last', None)
+
+        # 2. Call the main Scapy constructor with the remaining keywords.
+        super(PresentationDataValueItem, self).__init__(*args, **kwargs)
+
+        # 3. Now, set the properties using the values we saved.
+        if is_command_kw is not None:
+            self.is_command = is_command_kw
+        if is_last_kw is not None:
+            self.is_last = is_last_kw
+
+    # The properties correctly manipulate the message_control_header bits.
     is_command = property(
         lambda self: (self.message_control_header & 0x01) == 1,
         lambda self, v: setattr(self, 'message_control_header', (self.message_control_header & ~0x01) | (0x01 if v else 0x00))
