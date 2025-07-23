@@ -7,18 +7,11 @@ import sys
 import time
 import random
 import struct # For manual byte packing if needed
-import urllib.request # Added for downloading sample file
+import urllib.request
 
 # Ensure scapy_DICOM is accessible
 try:
-    from scapy_dicom import (
-        DICOMSession, DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_RJ, A_ABORT, P_DATA_TF,
-        PresentationDataValueItem, APP_CONTEXT_UID, DEFAULT_TRANSFER_SYNTAX_UID,
-        VERIFICATION_SOP_CLASS_UID, DICOMVariableItem, PresentationContextRQItem,
-        UserInformationItem, MaxLengthSubItem, ImplementationClassUIDSubItem,
-        ImplementationVersionNameSubItem, AbstractSyntaxSubItem, TransferSyntaxSubItem,
-        _pad_ae_title, _uid_to_bytes, build_c_store_rq_dimse
-    )
+    from scapy_dicom import *
     from scapy.all import Raw
 except ImportError:
     # Fallback path for environments like GitHub Actions
