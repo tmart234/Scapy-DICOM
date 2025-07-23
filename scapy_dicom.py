@@ -1398,13 +1398,16 @@ class DICOMSession:
         # 1. Find an accepted presentation context
         target_context_id = None
         for ctx_id, (abs_syntax, accepted_ts) in self.accepted_contexts.items():
-            if abs_syntax == sop_class_uid and accepted_ts == original_dataset_transfer_syntax_uid:
+            if abs_syntax == sop_class_uid:
+                # Prioritize the original transfer syntax if available and accepted
+                if accepted_ts == original_dataset_transfer_syntax_uid:
+                    target_context_id = ctx_id
+                    break
+                # Otherwise, find any accepted context for this abstract syntax
                 target_context_id = ctx_id
-                break
-        
+
         if target_context_id is None:
-            log.error(f"C-STORE: No accepted presentation context for SOP Class {sop_class_uid} "
-                      f"with Transfer Syntax {original_dataset_transfer_syntax_uid}.")
+            log.error(f"C-STORE: No accepted presentation context for SOP Class {sop_class_uid}.")
             return None
 
         # 2. Build C-STORE-RQ DIMSE command
@@ -1417,11 +1420,26 @@ class DICOMSession:
 
         # 3. Prepare list of PDVs: command first, then data
         all_pdvs_for_c_store = []
-        cmd_pdv = PresentationDataValueItem(context_id=target_context_id, is_command=True, is_last=True, data=c_store_rq_bytes)
+
+        # --- FIX: Create the command PDV using the correct two-step pattern ---
+        # a. Create the object
+        cmd_pdv = PresentationDataValueItem()
+        # b. Set the fields
+        cmd_pdv.context_id = target_context_id
+        cmd_pdv.is_command = True
+        cmd_pdv.is_last = True
+        cmd_pdv.data = c_store_rq_bytes
         all_pdvs_for_c_store.append(cmd_pdv)
 
         if dataset_bytes:
-            data_pdv = PresentationDataValueItem(context_id=target_context_id, is_command=False, is_last=True, data=dataset_bytes)
+            # --- FIX: Create the data PDV using the correct two-step pattern ---
+            # a. Create the object
+            data_pdv = PresentationDataValueItem()
+            # b. Set the fields
+            data_pdv.context_id = target_context_id
+            data_pdv.is_command = False
+            data_pdv.is_last = True
+            data_pdv.data = dataset_bytes
             all_pdvs_for_c_store.append(data_pdv)
 
         # 4. Send PDVs
@@ -1435,8 +1453,9 @@ class DICOMSession:
         try:
             response_pdu = self.stream.recv()
             if response_pdu and response_pdu.haslayer(P_DATA_TF):
-                # Simplified status parsing for this example
-                return 0x0000 # Assume success
+                # A real implementation would parse the status from the response
+                # For this example, we assume success if we get a P-DATA-TF back
+                return 0x0000
             else:
                 log.error(f"C-STORE: Received unexpected response: {response_pdu.summary() if response_pdu else 'None'}")
                 return None
@@ -1444,7 +1463,7 @@ class DICOMSession:
             log.error(f"C-STORE: Error receiving C-STORE-RSP: {e}")
             self.abort()
             return None
-
+        
     def release(self):
         """Sends A-RELEASE-RQ and waits for A-RELEASE-RP."""
         if not self.assoc_established or not self.stream:
