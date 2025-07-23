@@ -7,6 +7,7 @@ import sys
 import time
 import random
 import struct # For manual byte packing if needed
+import urllib.request # Added for downloading sample file
 
 # Ensure scapy_DICOM is accessible
 try:
@@ -43,21 +44,47 @@ from pydicom.uid import generate_uid, ImplicitVRLittleEndian, ExplicitVRLittleEn
 # Global logger
 script_log = logging.getLogger("unified_dicom_fuzzer")
 
+# --- Constants for Sample File Download ---
+SAMPLE_DCM_URL = "https://github.com/pydicom/pydicom/raw/main/pydicom/data/test_files/CT_small.dcm"
+DEFAULT_SAMPLE_DIR = "sample_files_for_fuzzing"
+DEFAULT_SAMPLE_FILE = os.path.join(DEFAULT_SAMPLE_DIR, "valid_ct.dcm")
+
 # --- Fallback UIDs ---
 FALLBACK_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture
 FALLBACK_TRANSFER_SYNTAX_UID = ImplicitVRLittleEndian._uid
+
+# --- Helper Functions ---
+def ensure_sample_file_exists(file_path=DEFAULT_SAMPLE_FILE):
+    """Checks if a sample DICOM file exists, and downloads it if not."""
+    dir_name = os.path.dirname(file_path)
+    if not os.path.exists(dir_name):
+        script_log.info(f"Creating sample file directory: {dir_name}")
+        os.makedirs(dir_name)
+    
+    if not os.path.exists(file_path):
+        script_log.info(f"Sample file not found at '{file_path}'. Downloading...")
+        try:
+            with urllib.request.urlopen(SAMPLE_DCM_URL) as response, open(file_path, 'wb') as out_file:
+                data = response.read()
+                out_file.write(data)
+            script_log.info(f"Successfully downloaded and saved sample file to '{file_path}'.")
+            return True
+        except Exception as e:
+            script_log.error(f"Failed to download sample file: {e}")
+            return False
+    else:
+        script_log.debug(f"Sample file already exists at '{file_path}'.")
+        return True
 
 # --- Fuzzing Functions ---
 
 def fuzz_association_handshake(session_args, fuzz_params):
     """
     Sends various malformed A-ASSOCIATE-RQ packets to a live target.
-    This function tests requirements that need a live connection to observe a response.
     """
     script_log.info("--- Starting Association Handshake Fuzzing ---")
     
-    # Test Case 1: Overlong Called AE Title (REQ-002)
-    # The pytest script confirms we can BUILD this; the fuzzer CONFIRMS how a server reacts.
+    # Test Case 1: Overlong Called AE Title
     script_log.info("Test Case: Overlong Called AE Title")
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
@@ -77,26 +104,24 @@ def fuzz_association_handshake(session_args, fuzz_params):
                     DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
                 ]
             )
-            # Manually override the field to be longer than the spec allows
             malformed_aarq_pkt[A_ASSOCIATE_RQ].called_ae_title = b"X"*20
             
-            script_log.debug("Sending malformed AARQ (overlong Called AE)")
             response = session.stream.sr1(malformed_aarq_pkt, timeout=session.read_timeout, verbose=0)
             
             if response:
                 script_log.info(f"Received response: {response.summary()}")
                 if response.haslayer(A_ABORT) or response.haslayer(A_ASSOCIATE_RJ):
-                    script_log.info("[PASS] Server correctly rejected or aborted the connection.")
+                    script_log.info("[PASS] Server correctly rejected or aborted.")
                 else:
                     script_log.warning("[FAIL?] Server accepted a malformed AARQ.")
             else:
-                script_log.warning("No response received (timeout or connection closed). This may indicate a crash.")
+                script_log.warning("No response received (timeout/closed). Possible crash?")
         except Exception as e:
             script_log.error(f"Error during overlong AE fuzz: {e}", exc_info=session_args['debug'])
         finally:
             session.close()
 
-    # Test Case 2: Invalid Protocol Version (REQ-L01 related)
+    # Test Case 2: Invalid Protocol Version
     script_log.info("Test Case: Invalid Protocol Version in AARQ")
     session = DICOMSession(
         dst_ip=session_args['ip'], dst_port=session_args['port'], dst_ae=session_args['ae_title'],
@@ -105,7 +130,7 @@ def fuzz_association_handshake(session_args, fuzz_params):
     if session.connect():
         try:
             invalid_ver_aarq_pkt = DICOM() / A_ASSOCIATE_RQ(
-                protocol_version=0xFFFE, # Invalid version
+                protocol_version=0xFFFE,
                 called_ae_title=_pad_ae_title(session_args['ae_title']),
                 calling_ae_title=_pad_ae_title(session_args['calling_ae']),
                 variable_items=[
@@ -118,7 +143,6 @@ def fuzz_association_handshake(session_args, fuzz_params):
                     DICOMVariableItem(item_type=0x50, data=bytes(MaxLengthSubItem()))
                 ]
             )
-            script_log.debug("Sending malformed AARQ (invalid protocol version)")
             response = session.stream.sr1(invalid_ver_aarq_pkt, timeout=session.read_timeout, verbose=0)
             if response:
                 script_log.info(f"Received response: {response.summary()}")
@@ -127,20 +151,15 @@ def fuzz_association_handshake(session_args, fuzz_params):
                 else:
                     script_log.warning(f"[FAIL?] Server responded unexpectedly: {response.summary()}")
             else:
-                script_log.warning("No response received. This may indicate a crash.")
+                script_log.warning("No response received. Possible crash?")
         except Exception as e:
             script_log.error(f"Error during invalid protocol version fuzz: {e}", exc_info=session_args['debug'])
         finally:
             session.close()
 
-    # NOTE: This is where a fuzzer would implement live tests for requirements like:
-    # - REQ-L11 (State Confusion): e.g., session.stream.send(P_DATA_TF(...)) before associating.
-    # - REQ-L12 (Resource Exhaustion): e.g., session.stream.send(b'\x04\x00\x10\x00\x00\x00\x01\x02')
-    # - REQ-L13 (Interleaving): Send multiple P-DATA-TF packets in a specific order.
     script_log.info("--- Finished Association Handshake Fuzzing ---")
     return True
 
-# This function remains unchanged but is necessary for the C-STORE fuzzing mode
 def extract_info_or_fallback(dcm_file_path):
     try:
         ds = pydicom.dcmread(dcm_file_path, force=True)
@@ -167,7 +186,6 @@ def extract_info_or_fallback(dcm_file_path):
 def fuzz_cstore_with_file(session_args, dcm_file_path, fuzz_params):
     """
     Uses the C-STORE mechanism with a (potentially fuzzed) DCM file.
-    This is the delivery mechanism for a PEDICOM payload.
     """
     script_log.info(f"--- Starting C-STORE Fuzzing with File: {dcm_file_path} ---")
     if not os.path.exists(dcm_file_path):
@@ -224,7 +242,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=10, help="Network timeout")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--mode", choices=['association', 'cstore_file', 'all'], required=True, help="Fuzzing mode.")
-    parser.add_argument("--fuzzed-file", help="Path to fuzzed DCM file (for 'cstore_file' mode)")
+    parser.add_argument("--fuzzed-file", help="Path to a DICOM file for C-STORE. If omitted, a sample file is downloaded.")
 
     args = parser.parse_args()
 
@@ -243,10 +261,15 @@ def main():
         fuzz_association_handshake(session_params, {})
 
     if args.mode in ['cstore_file', 'all']:
-        if not args.fuzzed_file:
-            script_log.error("--fuzzed-file is required for 'cstore_file' or 'all' modes.")
-            sys.exit(1)
-        fuzz_cstore_with_file(session_params, args.fuzzed_file, {})
+        target_file = args.fuzzed_file
+        if not target_file:
+            script_log.info("No --fuzzed-file provided. Using default sample file.")
+            target_file = DEFAULT_SAMPLE_FILE
+            if not ensure_sample_file_exists(target_file):
+                script_log.error("Failed to obtain a sample file. Aborting C-STORE mode.")
+                sys.exit(1)
+        
+        fuzz_cstore_with_file(session_params, target_file, {})
 
     script_log.info("=== DICOM Fuzzer Finished ===")
     sys.exit(0)
