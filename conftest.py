@@ -23,9 +23,10 @@ def scp_ip(request):
     """Fixture to get the --ip value from the command line."""
     return request.config.getoption("--ip")
 
-@pytest.axfixture
+@pytest.fixture
 def scp_port(request):
     """Fixture to get the --port value from the command line."""
+    # FIX: Corrected the typo from 'axfixture' to 'fixture'
     return request.config.getoption("--port")
 
 @pytest.fixture

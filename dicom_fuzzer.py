@@ -84,11 +84,9 @@ def fuzz_association_handshake(session_args, fuzz_params):
     )
     if session.connect():
         try:
-            # FIX 1: Create the A_ASSOCIATE_RQ object first...
             aarq_sub_packet = A_ASSOCIATE_RQ(
                 calling_ae_title=_pad_ae_title(session_args['calling_ae'])
             )
-            # ...then assign the variable_items list to the created object.
             aarq_sub_packet.variable_items=[
                 DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
                 DICOMVariableItem(item_type=0x20, data=(
@@ -100,7 +98,6 @@ def fuzz_association_handshake(session_args, fuzz_params):
             ]
             malformed_aarq_pkt = DICOM() / aarq_sub_packet
             
-            # Manually override the field to be longer than the spec allows
             malformed_aarq_pkt[A_ASSOCIATE_RQ].called_ae_title = b"X"*20
 
             script_log.debug("Sending malformed AARQ (overlong Called AE)")
@@ -127,7 +124,6 @@ def fuzz_association_handshake(session_args, fuzz_params):
     )
     if session.connect():
         try:
-            # FIX 1 (Applied here as well)
             aarq_sub_packet = A_ASSOCIATE_RQ(
                 protocol_version=0xFFFE, # Invalid version
                 called_ae_title=_pad_ae_title(session_args['ae_title']),
@@ -179,7 +175,7 @@ def extract_info_or_fallback(dcm_file_path):
         try:
             with open(dcm_file_path, 'rb') as f:
                 dataset_bytes = f.read()
-            # FIX 2: Remove trailing dot from the prefix for generate_uid
+            # FIX: Removed trailing dot from the prefix
             sop_instance_uid = generate_uid(prefix="1.2.3.999.fuzz")
             return FALLBACK_SOP_CLASS_UID, sop_instance_uid, dataset_bytes, FALLBACK_TRANSFER_SYNTAX_UID, "fallback_raw"
         except Exception as e_fallback:
