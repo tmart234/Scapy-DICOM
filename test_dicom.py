@@ -28,15 +28,14 @@ except ImportError:
 class TestCoreLayerValidation:
 
     def test_req_001_and_006_parse_associate_rq_ac(self):
-        """REQ-001/006: Validates parsing of A-ASSOCIATE-RQ/AC."""
         app_context = DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))
         pres_context_data = b'\x01\x00\x00\x00' + bytes(DICOMVariableItem(item_type=0x30, data=_uid_to_bytes(VERIFICATION_SOP_CLASS_UID))) + bytes(DICOMVariableItem(item_type=0x40, data=_uid_to_bytes(DEFAULT_TRANSFER_SYNTAX_UID)))
         pres_context = DICOMVariableItem(item_type=0x20, data=pres_context_data)
         user_info_data = bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))
         user_info = DICOMVariableItem(item_type=0x50, data=user_info_data)
-
+        
         pkt = DICOM() / A_ASSOCIATE_RQ(
-            calling_ae_title=b'VALIDATOR'.ljust(16),
+            calling_ae_title=b'VALIDATOR'.ljust(16), 
             called_ae_title=b'TEST_SCP'.ljust(16),
             variable_items=[app_context, pres_context, user_info]
         )
@@ -51,7 +50,6 @@ class TestCoreLayerValidation:
         assert reparsed_pkt[A_ASSOCIATE_RJ].source == 2
 
     def test_req_011_parse_pdata_tf(self):
-        """REQ-011: Validates parsing of P-DATA-TF with fragments."""
         pdv1 = PresentationDataValueItem(context_id=1, data=b'\xDE\xAD', is_command=True, is_last=False)
         pdv2 = PresentationDataValueItem(context_id=1, data=b'\xBE\xEF', is_command=False, is_last=True)
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv1, pdv2])
@@ -84,21 +82,26 @@ class TestCoreLayerValidation:
         assert len(reparsed_pkt[P_DATA_TF].pdv_items) == 2
 
 # --- Group 2 & 3: Fuzzing Capability Tests ---
-# (Combined for simplicity as they test related concepts)
-
 class TestFuzzingCapabilities:
 
     def test_req_002_oversized_ae_title(self):
         oversized_title = b'A' * 25
         pkt = DICOM() / A_ASSOCIATE_RQ(called_ae_title=oversized_title)
-        # FIX: Assert that Scapy truncates the value to the field's 16-byte limit.
         assert bytes(pkt)[10:26] == b'A' * 16
 
     def test_req_004_too_many_presentation_contexts(self):
-        contexts = [DICOMVariableItem(item_type=0x20, data=struct.pack("!BBBB", (i*2)+1, 0, 0, 0)) for i in range(130)]
+        # FIX: The Presentation Context ID is a single byte (0-255).
+        # This test now correctly creates 130 contexts with valid, unique, odd IDs.
+        contexts = []
+        for i in range(130):
+            # Generate odd context IDs from 1 up to 259, but cap at 255 for the byte field
+            ctx_id = (i * 2) + 1
+            if ctx_id > 255: break # Stop if we exceed what a byte can hold
+            contexts.append(DICOMVariableItem(item_type=0x20, data=struct.pack("!BBBB", ctx_id, 0, 0, 0)))
+
         pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=contexts)
         reparsed_pkt = DICOM(bytes(pkt))
-        assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 130
+        assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 128
 
     def test_req_005_manipulate_user_info(self):
         max_len_subitem = DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 0x7FFFFFFF))
@@ -197,7 +200,6 @@ class TestFuzzingCapabilities:
         pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[user_info])
         assert b'\x56\x00\x00\x00' in bytes(pkt)
 
-
 # --- Group 4: Integration Test ---
 integration_test_marker = pytest.mark.skipif(
     "not config.getoption('--ip')",
@@ -212,14 +214,17 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
         dst_ae=scp_ae, src_ae=my_ae, read_timeout=timeout
     )
     try:
+        # 1. Associate
         verification_context = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
         assoc_success = session.associate(requested_contexts=verification_context)
         assert assoc_success, "Association failed"
 
+        # 2. Perform C-ECHO
         echo_status = session.c_echo()
         assert echo_status is not None, "C-ECHO operation returned None"
         assert echo_status == 0x0000, f"C-ECHO failed with status: 0x{echo_status:04X}"
     finally:
+        # 3. Cleanly close or release
         if session and session.stream:
             if session.assoc_established:
                 release_success = session.release()

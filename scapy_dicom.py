@@ -591,100 +591,12 @@ class A_ASSOCIATE_RQ(Packet):
     """A-ASSOCIATE-RQ PDU (PS3.8 Section 9.3.2)"""
     name = "A-ASSOCIATE-RQ"
     fields_desc = [
-        ShortField("protocol_version", 0x0001), # Current version is 1 (!H)
-        ShortField("reserved1", 0), # Reserved, shall be 0x0000 (!H)
-        StrFixedLenField("called_ae_title", b"DefaultCalled ".ljust(16), 16), # Space padded
-        StrFixedLenField("calling_ae_title", b"DefaultCalling".ljust(16), 16), # Space padded
-        StrFixedLenField("reserved2", b"\x00"*32, 32), # Reserved, shall be 0x00...
-        # Variable Items are dissected manually in dissect_payload
+        ShortField("protocol_version", 1), ShortField("reserved1", 0),
+        StrFixedLenField("called_ae_title", b"DefaultCalled".ljust(16), 16),
+        StrFixedLenField("calling_ae_title", b"DefaultCalling".ljust(16), 16),
+        StrFixedLenField("reserved2", b"\x00"*32, 32),
+        PacketListField("variable_items", [], DICOMVariableItem, length_from=lambda x: x.underlayer.length - 68),
     ]
-    # Store dissected variable items here
-    variable_items = []
-
-        # *** ADDED Correct dissect_payload for A-ASSOCIATE-RQ/AC ***
-    def dissect_payload(self, s):
-        """Manually dissect variable items from the payload 's'."""
-        self.variable_items = []
-        # Calculate expected payload length based on DICOM UL header length
-        # The fixed header for A-ASSOCIATE-RQ/AC is 68 bytes.
-        total_payload_len = getattr(self.underlayer, 'length', len(s))
-        fixed_header_len = 68
-        if total_payload_len >= fixed_header_len :
-             variable_item_len = total_payload_len - fixed_header_len
-             payload_bytes = s[:variable_item_len]
-             remaining_bytes_after_vars = s[variable_item_len:]
-        else:
-            # If length is too small or not set, guess based on available bytes 's'
-            log.warning(f"A-ASSOCIATE-RQ/AC UL length ({total_payload_len}) < fixed header ({fixed_header_len}), dissecting all available bytes.")
-            payload_bytes = s
-            remaining_bytes_after_vars = b''
-
-        items = []
-        stream = BytesIO(payload_bytes) # Use BytesIO for easier reading
-
-        while True:
-            current_pos = stream.tell()
-            header = stream.read(4)
-            if len(header) < 4:
-                # End of stream or truncated item
-                if len(header) > 0:
-                    log.warning(f"Trailing {len(header)} bytes found after last complete variable item in A-ASSOCIATE-RQ/AC.")
-                    # Add leftover bytes to remaining_bytes to avoid losing them
-                    remaining_bytes_after_vars = header + remaining_bytes_after_vars
-                break # Exit loop
-
-            try:
-                item_type, _, item_length = struct.unpack("!BBH", header)
-                log.debug(f"Reading Variable Item: Type=0x{item_type:02X}, Length={item_length}")
-                item_data = stream.read(item_length)
-
-                if len(item_data) < item_length:
-                    log.warning(f"Variable item 0x{item_type:02X} truncated. Expected {item_length}, got {len(item_data)}.")
-                    # Put back partially read header and data to remaining_bytes
-                    stream.seek(current_pos) # Rewind to start of this item
-                    remaining_bytes_after_vars = stream.read() + remaining_bytes_after_vars
-                    break # Stop on truncation
-
-                # Attempt to dissect this item using the base class
-                # Reconstruct full item bytes for dissection
-                full_item_bytes = header + item_data
-                item_pkt = DICOMVariableItem(full_item_bytes) # Dissect using base class
-                items.append(item_pkt)
-                log.debug(f"Dissected Variable Item: {item_pkt.summary()}")
-
-            except struct.error as e:
-                 log.error(f"Struct error dissecting variable item header at pos {current_pos}: {e}")
-                 stream.seek(current_pos) # Rewind
-                 remaining_bytes_after_vars = stream.read() + remaining_bytes_after_vars
-                 break
-            except Exception as e:
-                log.error(f"Failed to dissect variable item starting at pos {current_pos}: {e}", exc_info=True)
-                # Append as Raw data to avoid losing bytes, try to continue
-                stream.seek(current_pos) # Rewind to start of item
-                # Read the problematic item's expected full length if possible
-                try:
-                    # Reread header to get length again
-                    header = stream.read(4)
-                    item_type, _, item_length = struct.unpack("!BBH", header)
-                    item_bytes_to_skip = stream.read(item_length)
-                    log.warning(f"Appending problematic item 0x{item_type:02X} as Raw.")
-                    items.append(Raw(header + item_bytes_to_skip))
-                except:
-                    log.error("Could not recover from variable item dissection error, stopping parse.")
-                    remaining_bytes_after_vars = stream.read() + remaining_bytes_after_vars # Add rest as remaining
-                    break # Give up
-
-        self.variable_items = items # Assign the manually dissected list
-        # Assign any leftover bytes (including those from parsing errors)
-        self.payload = Raw(remaining_bytes_after_vars) if remaining_bytes_after_vars else NoPayload()
-    # *** END Correct dissect_payload for A-ASSOCIATE-RQ/AC ***
-
-
-    def build_payload(self):
-        """Builds the variable items part of the payload."""
-        payload = b"".join(bytes(item) for item in self.variable_items)
-        return payload
-
 
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     """A-ASSOCIATE-AC PDU (PS3.8 Section 9.3.3)"""
@@ -723,64 +635,52 @@ class A_ASSOCIATE_RJ(Packet):
 class A_RELEASE_RQ(Packet):
     """A-RELEASE-RQ PDU (PS3.8 Section 9.3.6)"""
     name = "A-RELEASE-RQ"
-    fields_desc = [
-        IntField("reserved1", 0), # 4 bytes reserved, shall be 0x00000000 (!I)
-    ]
+    fields_desc = [IntField("reserved1", 0)]
 
 class A_RELEASE_RP(Packet):
     """A-RELEASE-RP PDU (PS3.8 Section 9.3.7)"""
     name = "A-RELEASE-RP"
-    fields_desc = [
-        IntField("reserved1", 0), # 4 bytes reserved, shall be 0x00000000 (!I)
-    ]
+    fields_desc = [IntField("reserved1", 0)]
 
 class A_ABORT(Packet):
     """A-ABORT PDU (PS3.8 Section 9.3.8 & Table 9-21)"""
     name = "A-ABORT"
-    fields_desc = [
-        ByteField("reserved1", 0), # Reserved, shall be 0x00
-        ByteField("reserved2", 0), # Reserved, shall be 0x00
-        ByteEnumField("source", 0, {
-            0: "DICOM UL service-user", # Includes application aborts
-            2: "DICOM UL service-provider" # Includes transport, TCP errors etc.
-            # 1 is reserved
-        }),
-        ByteEnumField("reason_diag", 0, {
-            # Source 0 (User/Application) - Not specified by standard, often 0
-            0: "Not specified",
-            # Source 2 (Provider) - Need unique keys if combining
-            # 0: "Not specified", # Duplicate Key
-            201: "Unrecognized PDU", # Assign arbitrary unique keys >= 200 for src 2
-            202: "Unexpected PDU",
-            204: "Unrecognized PDU parameter",
-            205: "Unexpected PDU parameter",
-            206: "Invalid PDU parameter value"
-            # 203 is reserved
-        }) # Reason/Diag - interpretation depends on source
-    ]
+    fields_desc = [ByteField("reserved1", 0), ByteField("reserved2", 0), ByteField("source", 0), ByteField("reason_diag", 0)]
+
 class PresentationDataValueItem(Packet):
     name = "PresentationDataValueItem"
     fields_desc = [
         FieldLenField("length", None, length_of="value", fmt="!I"),
-        # The 'value' field contains the context_id, header, and data.
-        # It's easier to define the sub-fields directly.
-        ByteField("context_id", 1),
-        ByteField("message_control_header", 0x03), # is_command=True, is_last=True
-        StrLenField("data", "", length_from=lambda pkt: pkt.length - 2)
+        StrLenField("value", "", length_from=lambda x: x.length)
     ]
-    # Define properties to easily get/set the control header bits
-    def _get_is_command(self): return (self.message_control_header & 0x01) == 1
-    def _set_is_command(self, val):
-        if val: self.message_control_header |= 0x01
-        else: self.message_control_header &= ~0x01
-    is_command = property(_get_is_command, _set_is_command)
 
-    def _get_is_last(self): return (self.message_control_header >> 1 & 0x01) == 1
-    def _set_is_last(self, val):
-        if val: self.message_control_header |= 0x02
-        else: self.message_control_header &= ~0x02
-    is_last = property(_get_is_last, _set_is_last)
-# ---- FIXED P_DATA_TF ----
+    # Define properties to easily access the sub-fields of 'value'
+    def __init__(self, *args, **kwargs):
+        super(PresentationDataValueItem, self).__init__(*args, **kwargs)
+        # Handle keyword arguments for easy creation
+        if 'context_id' in kwargs: self.context_id = kwargs['context_id']
+        if 'is_command' in kwargs: self.is_command = kwargs['is_command']
+        if 'is_last' in kwargs: self.is_last = kwargs['is_last']
+        if 'data' in kwargs: self.data = kwargs['data']
+
+    def _get_msg_hdr(self):
+        return struct.unpack("!B", self.value[1:2])[0] if len(self.value) > 1 else 0
+
+    def _set_msg_hdr(self, is_command, is_last):
+        hdr = (0b01 if is_last else 0b00) << 1 | (0b01 if is_command else 0b00)
+        ctx_id_byte = self.value[0:1] if self.value else b'\x01'
+        data_bytes = self.value[2:] if len(self.value) > 2 else b''
+        self.value = ctx_id_byte + struct.pack("!B", hdr) + data_bytes
+
+    context_id = property(lambda self: self.value[0] if self.value else 0,
+                          lambda self, v: setattr(self, 'value', struct.pack("!B", v) + (self.value[1:] if len(self.value) > 1 else b'\x00')))
+    is_command = property(lambda self: (self._get_msg_hdr() & 0x01) == 1,
+                          lambda self, v: self._set_msg_hdr(v, self.is_last))
+    is_last = property(lambda self: (self._get_msg_hdr() >> 1 & 0x01) == 1,
+                       lambda self, v: self._set_msg_hdr(self.is_command, v))
+    data = property(lambda self: self.value[2:] if len(self.value) > 2 else b'',
+                    lambda self, v: setattr(self, 'value', (self.value[:2] if len(self.value) >= 2 else b'\x01\x00') + v))
+
 class P_DATA_TF(Packet):
     """
     P-DATA-TF PDU (PS3.8 Section 9.3.5)
@@ -809,551 +709,107 @@ bind_layers(DICOM, A_ABORT, pdu_type=0x07)
 # --- DICOM Session Helper Class (Optional, but useful for tests) ---
 # (You might already have a more complete version of this)
 class DICOMSession:
-    """A simple helper to manage a DICOM association state."""
     def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", read_timeout=10):
-        self.dst_ip = dst_ip
-        self.dst_port = dst_port
-        self.dst_ae = _pad_ae_title(dst_ae)
-        self.src_ae = _pad_ae_title(src_ae)
-        self.sock = None
-        self.stream = None
-        self.assoc_established = False
-        self.accepted_contexts = {} # Store accepted {context_id: (abs_syntax, trn_syntax)}
-        self.peer_max_pdu = 16384 # Default max PDU peer can receive
+        self.dst_ip, self.dst_port = dst_ip, dst_port
+        self.dst_ae, self.src_ae = _pad_ae_title(dst_ae), _pad_ae_title(src_ae)
+        self.sock, self.stream, self.assoc_established = None, None, False
+        self.accepted_contexts, self.peer_max_pdu = {}, 16384
         self.read_timeout = read_timeout
+        self._current_message_id_counter = int(time.time()) % 50000
 
     def connect(self, retries=3, delay=1):
-        """Establishes TCP connection."""
         for attempt in range(1, retries + 1):
             try:
                 log.info(f"Attempting TCP connection to {self.dst_ip}:{self.dst_port} (Attempt {attempt}/{retries})")
                 self.sock = socket.create_connection((self.dst_ip, self.dst_port), timeout=self.read_timeout)
-                # Wrap socket for Scapy StreamSocket usage
                 self.stream = StreamSocket(self.sock, basecls=DICOM)
                 log.info(f"TCP Connection established to {self.dst_ip}:{self.dst_port}")
                 return True
-            except (socket.timeout, socket.error, ConnectionRefusedError) as e:
+            except Exception as e:
                 log.warning(f"TCP Connection attempt {attempt} failed: {e}")
-                if attempt == retries:
-                    log.error("TCP Connection failed after multiple retries.")
-                    return False
+                if attempt == retries: return False
                 time.sleep(delay)
-        return False # Should not be reached
+        return False
 
     def associate(self, requested_contexts=None):
-        """Sends A-ASSOCIATE-RQ and waits for A-ASSOCIATE-AC using manual PDU build for RQ."""
-        if not self.stream:
-            if not self.connect():
-                return False
-
+        if not self.stream and not self.connect(): return False
         if requested_contexts is None:
-            # Default: Request Verification SOP Class with Implicit VR LE
             requested_contexts = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
 
-        # --- Manually Build Variable Items Byte Payload ---
-        variable_items_payload = b''
-        context_id_map = {}
-
-        # 1. Application Context Item (Type 0x10)
-        try:
-            app_context_uid_bytes = _uid_to_bytes(APP_CONTEXT_UID)
-            app_context_len = len(app_context_uid_bytes)
-            variable_items_payload += struct.pack("!BBH", 0x10, 0, app_context_len) + app_context_uid_bytes
-            log.debug(f"Packed App Context Item: Type=0x10, Len={app_context_len}")
-        except Exception as e:
-            log.error(f"Failed to pack Application Context: {e}", exc_info=True); return False
-
-        # 2. Presentation Context Items (Type 0x20)
-        context_id_counter = 1
+        variable_items = [DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))]
+        ctx_id = 1
         for abs_syntax, trn_syntaxes in requested_contexts.items():
-            try:
-                context_id_map[context_id_counter] = abs_syntax
-                abs_syntax_uid_bytes = _uid_to_bytes(abs_syntax)
-                abs_syntax_subitem_len = len(abs_syntax_uid_bytes)
-                abs_syntax_subitem_bytes = struct.pack("!BBH", 0x30, 0, abs_syntax_subitem_len) + abs_syntax_uid_bytes
-                trn_syntax_subitems_bytes = b''
-                for ts_uid in trn_syntaxes:
-                    ts_uid_bytes = _uid_to_bytes(ts_uid)
-                    ts_subitem_len = len(ts_uid_bytes)
-                    trn_syntax_subitems_bytes += struct.pack("!BBH", 0x40, 0, ts_subitem_len) + ts_uid_bytes
-                pres_context_data_header = struct.pack("!BBBB", context_id_counter, 0, 0, 0)
-                pres_context_data = pres_context_data_header + abs_syntax_subitem_bytes + trn_syntax_subitems_bytes
-                pres_context_len = len(pres_context_data)
-                variable_items_payload += struct.pack("!BBH", 0x20, 0, pres_context_len) + pres_context_data
-                log.debug(f"Packed Pres Context Item {context_id_counter}: Type=0x20, Len={pres_context_len}")
-                context_id_counter += 2
-            except Exception as e: log.error(f"Failed to pack Pres Ctx {context_id_counter}: {e}", exc_info=True)
+            sub_items_data = bytes(DICOMVariableItem(item_type=0x30, data=_uid_to_bytes(abs_syntax)))
+            for ts in trn_syntaxes:
+                sub_items_data += bytes(DICOMVariableItem(item_type=0x40, data=_uid_to_bytes(ts)))
+            variable_items.append(DICOMVariableItem(item_type=0x20, data=struct.pack("!BBBB", ctx_id, 0, 0, 0) + sub_items_data))
+            ctx_id += 2
+        variable_items.append(DICOMVariableItem(item_type=0x50, data=bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))))
 
-        # 3. User Information Item (Type 0x50)
-        try:
-            user_info_subitems_payload = b''
-            max_len_data = struct.pack("!I", 16384)
-            user_info_subitems_payload += struct.pack("!BBH", 0x51, 0, 4) + max_len_data
-            impl_class_uid_str = "1.2.826.0.1.3680043.9.3811.1.0" # Fixed UID
-            impl_class_uid_bytes = _uid_to_bytes(impl_class_uid_str)
-            impl_class_uid_len = len(impl_class_uid_bytes)
-            user_info_subitems_payload += struct.pack("!BBH", 0x52, 0, impl_class_uid_len) + impl_class_uid_bytes
-            impl_version_name = b"SCAPY_DICOM_TEST"[:16]
-            impl_version_name_len = len(impl_version_name)
-            user_info_subitems_payload += struct.pack("!BBH", 0x55, 0, impl_version_name_len) + impl_version_name
-            user_info_len = len(user_info_subitems_payload)
-            variable_items_payload += struct.pack("!BBH", 0x50, 0, user_info_len) + user_info_subitems_payload
-            log.debug(f"Packed User Info Item: Type=0x50, Len={user_info_len}")
-        except Exception as e: log.error(f"Failed to pack User Info Item: {e}", exc_info=True)
+        assoc_rq = DICOM() / A_ASSOCIATE_RQ(called_ae_title=self.dst_ae, calling_ae_title=self.src_ae, variable_items=variable_items)
+        log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port}")
+        response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=0)
 
-        # --- Manually build fixed part and header ---
-        try:
-            fixed_part = struct.pack("!HH", 1, 0) + self.dst_ae + self.src_ae + (b'\x00' * 32)
-            a_associate_rq_payload = fixed_part + variable_items_payload
-            pdu_length = len(a_associate_rq_payload)
-            pdu_header = struct.pack("!BBI", 0x01, 0, pdu_length)
-        except Exception as e: log.error(f"Failed to pack fixed fields/header: {e}", exc_info=True); return False
-
-        # --- Final raw PDU bytes ---
-        raw_pdu_to_send = pdu_header + a_associate_rq_payload
-        log.debug(f"Raw A-ASSOCIATE-RQ PDU length: {len(raw_pdu_to_send)}")
-        log.debug(f"Raw PDU Hex: {raw_pdu_to_send.hex('.')}")
-
-        log.info(f"Sending A-ASSOCIATE-RQ to {self.dst_ip}:{self.dst_port} (manual build)")
-
-        try:
-            # --- Send raw bytes ---
-            bytes_sent = self.stream.send(raw_pdu_to_send)
-            # Optional: Check if bytes_sent matches len(raw_pdu_to_send)
-
-            # --- Receive and Dissect Response ---
-            log.info("Waiting for association response...")
-            # *** FIX: Use recv() instead of raw_recv() ***
-            # recv() uses the basecls (DICOM) for dissection
-            response = self.stream.recv()
-
-            if not response: # recv() returns None on timeout/close
-                log.error("No response received for A-ASSOCIATE-RQ (timeout / connection closed).")
-                self.close()
-                return False
-
-            log.debug("Received Response:")
-            log.debug(response.show(dump=True)) # Show dissected response
-
-        except socket.timeout:
-            log.error(f"Socket timeout ({self.read_timeout}s) waiting for association response.")
-            self.close(); return False
-        except KeyboardInterrupt:
-            log.warning("Operation interrupted by user."); self.close(); return False
-        except Exception as e:
-            log.error(f"Error sending/receiving association request: {e}", exc_info=True)
-            self.close(); return False
-
-        # --- Process Response (using dissected 'response' object) ---
-        if response.haslayer(A_ASSOCIATE_AC):
-            ac_layer = response[A_ASSOCIATE_AC]
+        if response and response.haslayer(A_ASSOCIATE_AC):
             log.info("Association Accepted (A-ASSOCIATE-AC received)")
-            self.accepted_contexts = {}
-            try:
-                # Manually parse AC variable items payload from response payload
-                ac_payload_bytes = bytes(ac_layer.payload)
-                log.debug(f"A-ASSOCIATE-AC raw payload length: {len(ac_payload_bytes)}")
-                ac_stream = BytesIO(ac_payload_bytes)
-                while True:
-                    header = ac_stream.read(4)
-                    if len(header) < 4: break
-                    item_type, _, item_length = struct.unpack("!BBH", header)
-                    item_data = ac_stream.read(item_length)
-                    if len(item_data) < item_length: log.warning(f"Truncated item 0x{item_type:02X} in AC"); break
-
-                    log.debug(f"  Parsing AC Item Type: 0x{item_type:02X}, Length: {item_length}")
-
-                    if item_type == 0x10: # App Context
-                        uid = item_data.rstrip(b'\x00').decode('ascii', errors='replace')
-                        log.debug(f"    App Context UID: {uid}")
-                    elif item_type == 0x21: # Pres Context AC
-                        if len(item_data) >= 4:
-                            ctx_id, _, result, _ = struct.unpack("!BBBB", item_data[:4])
-                            log.debug(f"    Pres Ctx AC (ID: {ctx_id}): Result: {result}")
-                            if result == 0: # Acceptance
-                                log.info(f"      Pres Ctx ID {ctx_id} ACCEPTED")
-                                ts_item_bytes = item_data[4:]
-                                if len(ts_item_bytes) >= 4:
-                                    ts_type, _, ts_len = struct.unpack("!BBH", ts_item_bytes[:4])
-                                    if ts_type == 0x40 and len(ts_item_bytes) >= 4 + ts_len:
-                                        ts_uid_bytes = ts_item_bytes[4:4 + ts_len]
-                                        ts_uid = ts_uid_bytes.rstrip(b'\x00').decode('ascii', errors='replace')
-                                        log.info(f"        Tx Syntax: {ts_uid}")
-                                        abs_syntax = context_id_map.get(ctx_id, "<Unknown Abstract Syntax>")
-                                        self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
-                                    else: log.warning(f"      Malformed/Truncated TS sub-item in AC Ctx {ctx_id}")
-                                else: log.warning(f"      Missing/Truncated TS sub-item in AC Ctx {ctx_id}")
-                            else: log.warning(f"      Pres Ctx ID {ctx_id} REJECTED (Reason: {result})")
-                        else: log.warning("    Malformed/Truncated Pres Ctx AC item data.")
-                    elif item_type == 0x50: # User Info
-                        log.debug("    User Info Item:")
-                        ui_stream = BytesIO(item_data)
-                        while True: # Loop through sub-items
-                            sub_header = ui_stream.read(4);
-                            if len(sub_header) < 4: break
-                            sub_type, _, sub_len = struct.unpack("!BBH", sub_header)
-                            sub_data = ui_stream.read(sub_len);
-                            if len(sub_data) < sub_len: log.warning(f"      Truncated user info sub 0x{sub_type:02X}"); break
-                            if sub_type == 0x51: # Max Length
-                                if sub_len == 4: self.peer_max_pdu = struct.unpack("!I", sub_data)[0]; log.info(f"        Peer max PDU: {self.peer_max_pdu}")
-                                else: log.warning(f"        Malformed Max Len (len={sub_len})")
-                            elif sub_type == 0x52: log.info(f"        Peer Impl Class UID: {sub_data.rstrip(b' ').rstrip(b' ').decode('ascii', errors='replace')}") # Strip trailing space/null
-                            elif sub_type == 0x55:
-                                try: log.info(f"        Peer Impl Version: {sub_data.decode('ascii')}")
-                                except UnicodeDecodeError: log.warning(f"        Non-ASCII Impl Version: {sub_data.hex()}")
-            except Exception as e: log.error(f"Error parsing AC variable items: {e}", exc_info=True)
-
             self.assoc_established = True
-            return True # Association successful
-
-        elif response.haslayer(A_ASSOCIATE_RJ):
-            rj = response[A_ASSOCIATE_RJ]
-            log.error("Association Rejected (A-ASSOCIATE-RJ received)")
-            log.error(f"  Result: {rj.result} ({rj.get_field('result').i2s.get(rj.result, '?')})")
-            log.error(f"  Source: {rj.source} ({rj.get_field('source').i2s.get(rj.source, '?')})")
-            log.error(f"  Reason: {rj.reason_diag} ({rj.get_field('reason_diag').i2s.get(rj.reason_diag, '?')})")
-            self.close(); return False
-        else:
-            log.error(f"Unexpected response PDU type received: {response.summary()}")
-            if response.haslayer(A_ABORT):
-                abort_layer = response[A_ABORT]
-                log.error(f"  Received A-ABORT: Source={abort_layer.source}, Reason={abort_layer.reason_diag}")
-            self.close(); return False
-                    
-    def send_p_data(self, pdv_list):
-        """Sends one or more PDV items within a P-DATA-TF PDU by manually building the payload."""
-        if not self.assoc_established or not self.stream:
-            log.error("Cannot send P-DATA: Association not established.")
-            return False
-
-        # --- Manual Payload Construction ---
-        # Create a temporary P_DATA_TF layer instance just to use its build_payload method
-        p_data_tf_layer_builder = P_DATA_TF()
-        p_data_tf_layer_builder.parsed_pdv_items = pdv_list
-
-        # Manually build the payload bytes for this layer
-        pdata_payload_bytes = p_data_tf_layer_builder.build_payload()
-        log.debug(f"Manually built P-DATA payload length: {len(pdata_payload_bytes)}")
-        # --- End Manual Payload Construction ---
-
-        # Create the full PDU: DICOM UL header wrapping the manually built payload as Raw data.
-        # The DICOM UL layer will calculate its 'length' field based on this Raw payload.
-        full_pdu = DICOM() / Raw(load=pdata_payload_bytes)
-        # Explicitly set the PDU type for the DICOM UL header
-        full_pdu.pdu_type = 0x04 # P-DATA-TF
-
-        log.info(f"Sending P-DATA-TF ({len(pdv_list)} PDV(s))")
-
-        try:
-            # Send the manually constructed PDU
-            sent_len = self.stream.send(full_pdu)
-
-            # Optional: Log the raw bytes sent for debugging
-            # We need to re-build the packet to get the final bytes including the calculated length
-            final_bytes = bytes(full_pdu)
-            log.debug(f"Final Bytes Sent ({len(final_bytes)} bytes):")
-            log.debug(final_bytes.hex('.')) # Use hex with separator for readability
-            return sent_len > 0
-        except Exception as e:
-            log.error(f"Error sending P-DATA-TF: {e}", exc_info=True)
-            self.assoc_established = False # Assume connection broken
-            self.close()
-            return False
-
-    def find_accepted_context_id(self, sop_class_uid):
-        """Finds the first accepted presentation context ID for a given abstract syntax UID."""
-        for ctx_id, (abs_syntax, _trn_syntax) in self.accepted_contexts.items():
-            if abs_syntax == sop_class_uid:
-                log.debug(f"Found accepted context ID {ctx_id} for SOP Class {sop_class_uid}")
-                return ctx_id
-        log.warning(f"No accepted presentation context found for SOP Class {sop_class_uid}")
-        return None
-
-    def c_echo(self, msg_id=None):
-        """
-        Performs a C-ECHO verification.
-
-        Args:
-            msg_id (int, optional): The Message ID to use. If None, a default one is generated.
-
-        Returns:
-            int or None: The DICOM status code (e.g., 0x0000 for success) if a valid
-                         C-ECHO response is received, otherwise None indicating an error
-                         (e.g., association error, timeout, unexpected PDU, parsing failure).
-        """
-        if not self.assoc_established:
-            log.error("Cannot perform C-ECHO: Association not established.")
-            return None
-
-        # 1. Find accepted context ID for Verification SOP Class
-        echo_ctx_id = self.find_accepted_context_id(VERIFICATION_SOP_CLASS_UID)
-        if echo_ctx_id is None:
-            log.error("Cannot perform C-ECHO: No accepted context for Verification SOP Class.")
-            return None # Indicate failure: context not accepted
-
-        # 2. Prepare C-ECHO-RQ DIMSE Message
-        if msg_id is None:
-            msg_id = int(time.time()) % 10000
-        dimse_command_bytes = build_c_echo_rq_dimse(msg_id)
-
-        # 3. Create the PresentationDataValueItem object for C-ECHO-RQ
-        pdv_rq = PresentationDataValueItem()
-        pdv_rq.context_id = echo_ctx_id
-        pdv_rq.data = dimse_command_bytes
-        pdv_rq.is_command = True
-        pdv_rq.is_last = True
-
-        # 4. Send the PDV Item via P-DATA-TF
-        log.info(f"Sending C-ECHO-RQ (Message ID: {msg_id}) via DICOMSession.c_echo...")
-        if not self.send_p_data(pdv_list=[pdv_rq]):
-            log.error("C-ECHO failed: Could not send P-DATA.")
-            # send_p_data should handle closing on error
-            return None # Indicate failure: send error
-
-        # 5. Wait for and receive the response PDU
-        log.info("Waiting for C-ECHO response...")
-        response_pdata = None
-        try:
-            # Use the stream directly to receive the next PDU
-            response_pdata = self.stream.recv()
-        except socket.timeout:
-            log.error(f"Socket timeout ({self.read_timeout}s) waiting for C-ECHO response.")
-            self.abort() # Abort on timeout
-            return None # Indicate failure: timeout
-        except Exception as e:
-            log.error(f"Error receiving C-ECHO response: {e}", exc_info=True)
-            self.abort() # Abort on other errors
-            return None # Indicate failure: socket/other error
-
-        if not response_pdata:
-            log.error("No C-ECHO response PDU received (connection closed?).")
-            self.close() # Already closed or failed
-            return None # Indicate failure: no response/closed
-
-        # 6. Process the response
-        log.debug("Processing C-ECHO response PDU:")
-        log.debug(f"{response_pdata.show(dump=True)}")
-
-        # Check PDU type
-        if response_pdata.pdu_type == 0x04: # P-DATA-TF
-            log.debug("Response is P-DATA-TF (Type 0x04). Checking parsed items...")
-            # Check if dissector stored the instance and items
-            if hasattr(response_pdata, 'pdata_instance') and \
-               hasattr(response_pdata.pdata_instance, 'parsed_pdv_items') and \
-               response_pdata.pdata_instance.parsed_pdv_items:
-
-                parsed_items = response_pdata.pdata_instance.parsed_pdv_items
-                log.debug(f"Found {len(parsed_items)} PDV items in response.")
-                # Find the relevant PDV (usually the first/only one for C-ECHO RSP)
-                for pdv in parsed_items:
-                    if pdv.context_id == echo_ctx_id and pdv.is_command and pdv.is_last:
-                        log.debug(f"Found relevant response PDV (CtxID={echo_ctx_id}). Parsing status...")
-                        status = parse_dimse_status(pdv.data)
-                        if status is not None:
-                            log.info(f"C-ECHO completed with DIMSE Status: 0x{status:04X}")
-                            return status # Return the parsed status code
-                        else:
-                            log.error("Failed to parse DIMSE status from C-ECHO response PDV.")
-                            return None # Indicate failure: status parsing error
-                # If loop finishes without finding the right PDV
-                log.error("Did not find a suitable response PDV in the received P-DATA-TF.")
-                return None # Indicate failure: PDV not found/matched
-            else:
-                log.error("P-DATA-TF received, but failed to find populated parsed_pdv_items via pdata_instance.")
-                return None # Indicate failure: dissection access error
-
-        elif response_pdata.haslayer(A_ABORT):
-             log.error(f"Received A-ABORT instead of C-ECHO response:")
-             # Logging handled within abort handler if needed, or add here
-             self.assoc_established = False # Ensure state is updated
-             self.close()
-             return None # Indicate failure: aborted
-        else:
-            log.error(f"Received unexpected PDU type {response_pdata.pdu_type} instead of C-ECHO response.")
-            response_pdata.show()
-            # Consider aborting if the state is unexpected
-            self.abort()
-            return None # Indicate failure: unexpected PDU
+            for item in response[A_ASSOCIATE_AC].variable_items:
+                if item.item_type == 0x21 and item.data[2] == 0:
+                    ctx_id = item.data[0]
+                    abs_syntax_key_list = list(requested_contexts.keys())
+                    abs_syntax = abs_syntax_key_list[ (ctx_id - 1) // 2 ]
+                    ts_item_data = item.data[4:]
+                    if DICOMVariableItem.guess_payload_class(ts_item_data) != Raw:
+                        ts_uid = DICOMVariableItem(ts_item_data).data.rstrip(b'\x00').decode()
+                        self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
+            return True
+        log.error(f"Association failed. Response: {response.summary() if response else 'None'}")
+        return False
 
     def _get_next_message_id(self):
-        if not hasattr(self, '_current_message_id_counter'):
-            # Initialize with a value that's somewhat unique per session start
-            self._current_message_id_counter = int(time.time()) % 50000 
         self._current_message_id_counter += 1
-        if self._current_message_id_counter > 0xFFFF: # UShort max
-            self._current_message_id_counter = 1
+        if self._current_message_id_counter > 0xFFFF: self._current_message_id_counter = 1
         return self._current_message_id_counter
 
-    def c_store(self, dataset_bytes, sop_class_uid, sop_instance_uid,
-                original_dataset_transfer_syntax_uid):
-        """
-        Performs a C-STORE operation to send a dataset.
-        """
-        if not self.assoc_established:
-            log.error("C-STORE: Association not established.")
-            return None
+    def _find_accepted_context_id(self, sop_class_uid):
+        for ctx_id, (abs_syntax, _) in self.accepted_contexts.items():
+            if abs_syntax == sop_class_uid: return ctx_id
+        return None
 
-        # 1. Find an accepted presentation context
-        target_context_id = None
-        for ctx_id, (abs_syntax, accepted_ts) in self.accepted_contexts.items():
-            if abs_syntax == sop_class_uid:
-                # Prioritize the original transfer syntax if available and accepted
-                if accepted_ts == original_dataset_transfer_syntax_uid:
-                    target_context_id = ctx_id
-                    break
-                # Otherwise, find any accepted context for this abstract syntax
-                target_context_id = ctx_id
-
-        if target_context_id is None:
-            log.error(f"C-STORE: No accepted presentation context for SOP Class {sop_class_uid}.")
-            return None
-
-        # 2. Build C-STORE-RQ DIMSE command
-        message_id = self._get_next_message_id()
-        c_store_rq_bytes = build_c_store_rq_dimse(
-            sop_class_uid=sop_class_uid,
-            sop_instance_uid=sop_instance_uid,
-            message_id=message_id
-        )
-
-        # 3. Prepare list of PDVs: command first, then data
-        all_pdvs_for_c_store = []
-
-        # --- FIX: Create the command PDV using the correct two-step pattern ---
-        # a. Create the object
-        cmd_pdv = PresentationDataValueItem()
-        # b. Set the fields
-        cmd_pdv.context_id = target_context_id
-        cmd_pdv.is_command = True
-        cmd_pdv.is_last = True
-        cmd_pdv.data = c_store_rq_bytes
-        all_pdvs_for_c_store.append(cmd_pdv)
-
-        if dataset_bytes:
-            # --- FIX: Create the data PDV using the correct two-step pattern ---
-            # a. Create the object
-            data_pdv = PresentationDataValueItem()
-            # b. Set the fields
-            data_pdv.context_id = target_context_id
-            data_pdv.is_command = False
-            data_pdv.is_last = True
-            data_pdv.data = dataset_bytes
-            all_pdvs_for_c_store.append(data_pdv)
-
-        # 4. Send PDVs
-        log.info(f"C-STORE: Sending {len(all_pdvs_for_c_store)} PDVs.")
-        if not self.send_p_data(pdv_list=all_pdvs_for_c_store):
-            log.error("C-STORE: Failed to send P-DATA for C-STORE.")
-            return None
-
-        # 5. Receive and process C-STORE-RSP
-        log.info("C-STORE: Waiting for C-STORE-RSP...")
-        try:
-            response_pdu = self.stream.recv()
-            if response_pdu and response_pdu.haslayer(P_DATA_TF):
-                # A real implementation would parse the status from the response
-                # For this example, we assume success if we get a P-DATA-TF back
-                return 0x0000
-            else:
-                log.error(f"C-STORE: Received unexpected response: {response_pdu.summary() if response_pdu else 'None'}")
-                return None
-        except Exception as e:
-            log.error(f"C-STORE: Error receiving C-STORE-RSP: {e}")
-            self.abort()
-            return None
+    def c_echo(self):
+        if not self.assoc_established: return None
+        echo_ctx_id = self._find_accepted_context_id(VERIFICATION_SOP_CLASS_UID)
+        if echo_ctx_id is None: return None
         
+        msg_id = self._get_next_message_id()
+        dimse_rq = build_c_echo_rq_dimse(msg_id)
+        pdv_rq = PresentationDataValueItem(context_id=echo_ctx_id, data=dimse_rq, is_command=True, is_last=True)
+        pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
+        
+        log.info(f"Sending C-ECHO-RQ (Message ID: {msg_id})")
+        response = self.stream.sr1(pdata_rq, timeout=self.read_timeout, verbose=0)
+        
+        if response and response.haslayer(P_DATA_TF) and response[P_DATA_TF].pdv_items:
+            pdv_rsp = response[P_DATA_TF].pdv_items[0]
+            status = parse_dimse_status(pdv_rsp.data)
+            log.info(f"C-ECHO completed with DIMSE Status: {status}")
+            return status
+        return None
+    
     def release(self):
-        """Sends A-RELEASE-RQ and waits for A-RELEASE-RP."""
-        if not self.assoc_established or not self.stream:
-            log.info("Cannot release: Association not established or already closed.")
-            return True # Consider it released if not established
-
+        if not self.assoc_established: return True
         log.info("Sending A-RELEASE-RQ...")
-        release_rq = DICOM()/A_RELEASE_RQ()
-
-        try:
-            # Send the release request
-            bytes_sent = self.stream.send(release_rq)
-            if bytes_sent <= 0:
-                 log.error("Failed to send A-RELEASE-RQ (socket reported 0 bytes sent).")
-                 self.assoc_established = False
-                 self.close()
-                 return False
-
-            # Wait for the response using recv()
-            log.info("Waiting for A-RELEASE-RP response...")
-            response = self.stream.recv() # Use recv() to get the next PDU
-
-        except socket.timeout:
-            log.warning(f"Socket timeout ({self.read_timeout}s) waiting for A-RELEASE-RP. Closing connection.")
-            self.assoc_established = False
-            self.close()
-            return False
-        except Exception as e:
-            log.error(f"Error sending/receiving A-RELEASE-RQ: {e}", exc_info=True)
-            self.assoc_established = False
-            self.close()
-            return False
-
-
-        if not response:
-            log.warning("No response received for A-RELEASE-RQ (recv returned None - likely timeout/closed). Closing connection.")
-            self.assoc_established = False
-            self.close()
-            return False
-
-        # Check the received PDU
-        if response.haslayer(A_RELEASE_RP):
-            log.info("Association released successfully (A-RELEASE-RP received).")
-            self.assoc_established = False
-            self.close() # Close connection after successful release
+        response = self.stream.sr1(DICOM()/A_RELEASE_RQ(), timeout=self.read_timeout, verbose=0)
+        self.close()
+        if response and response.haslayer(A_RELEASE_RP):
+            log.info("Association released successfully.")
             return True
-        elif response.haslayer(A_ABORT):
-            log.warning(f"Received A-ABORT instead of A-RELEASE-RP:")
-            response.show()
-            abort_layer = response[A_ABORT]
-            log.warning(f"  Abort Source: {abort_layer.get_field('source').i2s.get(abort_layer.source, '?')} ({abort_layer.source})")
-            log.warning(f"  Abort Reason: {abort_layer.get_field('reason_diag').i2s.get(abort_layer.reason_diag, '?')} ({abort_layer.reason_diag})")
-            self.assoc_established = False
-            self.close() # Close connection after abort
-            return False # Release failed
-        else:
-            log.warning(f"Unexpected response received for A-RELEASE-RQ: {response.summary()}")
-            response.show()
-            # Should we abort here? Or just close? Closing is safer.
-            self.assoc_established = False
-            self.close()
-            return False # Release failed
-        
-    def abort(self):
-        """Sends A-ABORT PDU."""
-        if not self.stream:
-            log.info("Cannot abort: Connection already closed.")
-            return
-
-        log.warning("Sending A-ABORT...")
-        # Source 0 = User, Reason 0 = Not specified (typical for graceful user abort)
-        abort_pdu = DICOM()/A_ABORT(source=0, reason_diag=0)
-        try:
-            self.stream.send(abort_pdu)
-        except Exception as e:
-            log.error(f"Failed to send A-ABORT: {e}")
-        finally:
-            self.assoc_established = False
-            self.close() # Close connection after sending abort
+        log.warning("Did not receive A-RELEASE-RP.")
+        return False
 
     def close(self):
-        """Closes the socket connection."""
-        if self.stream:
-            log.info("Closing DICOM TCP connection.")
-            try:
-                self.stream.close() # Closes underlying socket
-            except Exception as e:
-                log.warning(f"Error closing stream socket: {e}")
-        self.sock = None
-        self.stream = None
-        self.assoc_established = False
-
+        if self.stream: self.stream.close()
+        self.sock, self.stream, self.assoc_established = None, None, False
 
 # --- Example Usage (if run as main script) ---
 if __name__ == '__main__':
