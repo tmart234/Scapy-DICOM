@@ -12,8 +12,9 @@ try:
     from scapy_dicom import (
         DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ASSOCIATE_RJ, A_RELEASE_RQ, A_RELEASE_RP, A_ABORT, P_DATA_TF,
         DICOMVariableItem, PresentationDataValueItem,
-        build_c_echo_rq_dimse, DICOMSession,
-        APP_CONTEXT_UID, VERIFICATION_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID, _uid_to_bytes
+        build_c_echo_rq_dimse, build_c_store_rq_dimse, DICOMSession,
+        APP_CONTEXT_UID, VERIFICATION_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
+        _uid_to_bytes
     )
 except ImportError:
     print("[-] ERROR: Could not import the DICOM layer.")
@@ -29,7 +30,6 @@ class TestCoreLayerValidation:
         user_info_data = bytes(DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384)))
         user_info = DICOMVariableItem(item_type=0x50, data=user_info_data)
         
-        # FIX: For classes with manual build logic, assign the list after creation.
         pkt_payload = A_ASSOCIATE_RQ(calling_ae_title=b'VALIDATOR'.ljust(16), called_ae_title=b'TEST_SCP'.ljust(16))
         pkt_payload.variable_items = [app_context, pres_context, user_info]
         pkt = DICOM() / pkt_payload
@@ -45,7 +45,6 @@ class TestCoreLayerValidation:
         assert reparsed_pkt[A_ASSOCIATE_RJ].source == 2
 
     def test_req_011_parse_pdata_tf(self):
-        # FIX: With the improved PresentationDataValueItem, direct initialization now works.
         pdv1 = PresentationDataValueItem(context_id=1, data=b'\xDE\xAD', is_command=True, is_last=False)
         pdv2 = PresentationDataValueItem(context_id=1, data=b'\xBE\xEF', is_command=False, is_last=True)
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv1, pdv2])
@@ -86,11 +85,9 @@ class TestFuzzingCapabilities:
         assert bytes(pkt)[10:26] == b'A' * 16
 
     def test_req_004_too_many_presentation_contexts(self):
-        # The standard allows up to 128 presentation contexts.
-        # Context IDs must be odd integers from 1 to 255.
         contexts = []
-        for i in range(128): # Max valid contexts is 128
-            ctx_id = (i * 2) + 1 # Generate valid odd IDs from 1 to 255
+        for i in range(128):
+            ctx_id = (i * 2) + 1
             contexts.append(DICOMVariableItem(item_type=0x20, data=struct.pack("!BBBB", ctx_id, 0, 0, 0)))
         pkt = DICOM() / A_ASSOCIATE_RQ()
         pkt.variable_items = contexts
@@ -215,6 +212,50 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
         echo_status = session.c_echo()
         assert echo_status is not None, "C-ECHO operation returned None"
         assert echo_status == 0x0000, f"C-ECHO failed with status: 0x{echo_status:04X}"
+    finally:
+        if session and session.stream:
+            if session.assoc_established:
+                release_success = session.release()
+                assert release_success, "Failed to cleanly release the association"
+            else:
+                session.close()
+
+# --- NEW: C-STORE Integration Test ---
+@integration_test_marker
+def test_c_store_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
+    """Performs a full C-STORE workflow against a live SCP."""
+    # Create a minimal, valid DICOM dataset in memory
+    # (Patient ID, SOP Class UID, SOP Instance UID)
+    sop_instance_uid = "1.2.3.4.5.6.7.8"
+    dataset_bytes = b''
+    # Patient ID (0010,0020) LO
+    dataset_bytes += struct.pack('<HHI', 0x0010, 0x0020, 4) + b'TEST'
+    # SOP Class UID (0008,0016) UI
+    sop_class_uid_bytes = _uid_to_bytes(CT_IMAGE_STORAGE_SOP_CLASS_UID)
+    dataset_bytes += struct.pack('<HHI', 0x0008, 0x0016, len(sop_class_uid_bytes)) + sop_class_uid_bytes
+    # SOP Instance UID (0008,0018) UI
+    sop_instance_uid_bytes = _uid_to_bytes(sop_instance_uid)
+    dataset_bytes += struct.pack('<HHI', 0x0008, 0x0018, len(sop_instance_uid_bytes)) + sop_instance_uid_bytes
+
+    session = DICOMSession(
+        dst_ip=scp_ip, dst_port=scp_port,
+        dst_ae=scp_ae, src_ae=my_ae, read_timeout=timeout
+    )
+    try:
+        # 1. Associate with CT Image Storage context
+        store_context = {CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
+        assoc_success = session.associate(requested_contexts=store_context)
+        assert assoc_success, "Association for C-STORE failed"
+
+        # 2. Perform C-STORE
+        store_status = session.c_store(
+            dataset_bytes=dataset_bytes,
+            sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            sop_instance_uid=sop_instance_uid,
+            transfer_syntax_uid=DEFAULT_TRANSFER_SYNTAX_UID
+        )
+        assert store_status is not None, "C-STORE operation returned None"
+        assert store_status == 0x0000, f"C-STORE failed with status: 0x{store_status:04X}"
     finally:
         if session and session.stream:
             if session.assoc_established:
