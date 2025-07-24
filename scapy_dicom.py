@@ -119,14 +119,16 @@ class A_ASSOCIATE_RQ(Packet):
         StrFixedLenField("called_ae_title", b"", 16),
         StrFixedLenField("calling_ae_title", b"", 16),
         StrFixedLenField("reserved2", b"\x00" * 32, 32),
+        # Treat the variable items as a single payload field
+        StrLenField("variable_items_payload", "",
+                    length_from=lambda pkt: pkt.underlayer.length - 68),
     ]
 
-    def __init__(self, *args, **kwargs):
-        super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
-        self.variable_items = kwargs.pop('variable_items', [])
-
-    def do_dissect_payload(self, s):
-        self.variable_items = []
+    # Property to get/set variable_items from the payload
+    @property
+    def variable_items(self):
+        items = []
+        s = self.variable_items_payload
         stream = BytesIO(s)
         while stream.tell() < len(s):
             try:
@@ -135,15 +137,14 @@ class A_ASSOCIATE_RQ(Packet):
                 _, _, item_length = struct.unpack("!BBH", header)
                 item_data = stream.read(item_length)
                 if len(item_data) < item_length: break
-                self.variable_items.append(DICOMVariableItem(header + item_data))
+                items.append(DICOMVariableItem(header + item_data))
             except Exception:
                 break
-        remaining_bytes = stream.read()
-        if remaining_bytes:
-            self.payload = Raw(remaining_bytes)
+        return items
 
-    def build_payload(self):
-        return b"".join(bytes(x) for x in self.variable_items)
+    @variable_items.setter
+    def variable_items(self, items_list):
+        self.variable_items_payload = b"".join(bytes(item) for item in items_list)
 
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     name = "A-ASSOCIATE-AC"
@@ -186,24 +187,29 @@ class PresentationDataValueItem(Packet):
 
 class P_DATA_TF(Packet):
     name = "P-DATA-TF"
-    fields_desc = [] 
+    fields_desc = [
+        # Treat the list of PDVs as a single payload field
+        StrLenField("pdv_items_payload", "",
+                    length_from=lambda pkt: pkt.underlayer.length),
+    ]
 
-    def __init__(self, *args, **kwargs):
-        super(P_DATA_TF, self).__init__(*args, **kwargs)
-        self.pdv_items = kwargs.pop('pdv_items', [])
-
-    def do_dissect_payload(self, s):
-        self.pdv_items = []
+    # Property to get/set pdv_items from the payload
+    @property
+    def pdv_items(self):
+        items = []
+        s = self.pdv_items_payload
         while s:
             item = PresentationDataValueItem(s)
-            self.pdv_items.append(item)
+            items.append(item)
+            if item.length is None or item.length <= 0: break
             item_total_size = 4 + item.length
-            if item_total_size > len(s) or item_total_size <= 0:
-                break
+            if item_total_size > len(s): break
             s = s[item_total_size:]
-            
-    def build_payload(self):
-        return b"".join(bytes(x) for x in self.pdv_items)
+        return items
+
+    @pdv_items.setter
+    def pdv_items(self, items_list):
+        self.pdv_items_payload = b"".join(bytes(item) for item in items_list)
 
 class A_RELEASE_RQ(Packet): name = "A-RELEASE-RQ"; fields_desc = [IntField("reserved1", 0)]
 class A_RELEASE_RP(Packet): name = "A-RELEASE-RP"; fields_desc = [IntField("reserved1", 0)]
