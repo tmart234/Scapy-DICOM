@@ -123,9 +123,19 @@ class A_ASSOCIATE_RQ(Packet):
 
     def __init__(self, *args, **kwargs):
         variable_items = kwargs.pop('variable_items', [])
-        super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
+        
+        # If items are provided, build the payload string and pass it as the
+        # main argument to the parent constructor.
+        if args and isinstance(args[0], list):
+             variable_items = args[0]
+             args = args[1:]
+
+        payload = b"".join(bytes(item) for item in variable_items)
+        super(A_ASSOCIATE_RQ, self).__init__(payload, *args, **kwargs)
+        
         self.variable_items = variable_items
 
+    # These payload handlers are still needed for dissection and showing
     def do_build_payload(self):
         return b"".join(bytes(item) for item in self.variable_items)
 
@@ -135,20 +145,17 @@ class A_ASSOCIATE_RQ(Packet):
         while stream.tell() < len(s):
             try:
                 header = stream.read(4)
-                if len(header) < 4:
-                    break
+                if len(header) < 4: break
                 _, _, item_length = struct.unpack("!BBH", header)
                 item_data = stream.read(item_length)
-                if len(item_data) < item_length:
-                    break
+                if len(item_data) < item_length: break
                 self.variable_items.append(DICOMVariableItem(header + item_data))
             except Exception:
-                # If parsing fails, stop and treat the rest as Raw
                 break
         remaining_bytes = stream.read()
         if remaining_bytes:
             self.payload = Raw(remaining_bytes)
-            
+
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     name = "A-ASSOCIATE-AC"
 
@@ -190,31 +197,37 @@ class PresentationDataValueItem(Packet):
 
 class P_DATA_TF(Packet):
     name = "P-DATA-TF"
-    # The PacketListField is removed in favor of manual handling
     fields_desc = [] 
 
     def __init__(self, *args, **kwargs):
+        # Pop the custom list argument
         pdv_items = kwargs.pop('pdv_items', [])
-        super(P_DATA_TF, self).__init__(*args, **kwargs)
+
+        # --- THIS IS THE FINAL FIX ---
+        if args and isinstance(args[0], list):
+             pdv_items = args[0]
+             args = args[1:]
+        
+        payload = b"".join(bytes(item) for item in pdv_items)
+        super(P_DATA_TF, self).__init__(payload, *args, **kwargs)
+        # --- END FIX ---
+
         self.pdv_items = pdv_items
 
+    # These payload handlers are still needed for dissection and showing
     def do_build_payload(self):
         return b"".join(bytes(item) for item in self.pdv_items)
 
     def do_dissect_payload(self, s):
         self.pdv_items = []
         while s:
-            # Dissect one item from the start of the buffer
             item = PresentationDataValueItem(s)
             self.pdv_items.append(item)
-            
-            # Calculate the size of the dissected item and advance the buffer
             item_total_size = 4 + item.length
-            if item_total_size > len(s):
-                # Avoid infinite loops on malformed packets
+            if item_total_size > len(s) or item_total_size <= 0:
                 break
             s = s[item_total_size:]
-            
+                     
 class A_RELEASE_RQ(Packet): name = "A-RELEASE-RQ"; fields_desc = [IntField("reserved1", 0)]
 class A_RELEASE_RP(Packet): name = "A-RELEASE-RP"; fields_desc = [IntField("reserved1", 0)]
 class A_ABORT(Packet): name = "A-ABORT"; fields_desc = [ByteField("reserved1", 0), ByteField("reserved2", 0), ByteField("source", 0), ByteField("reason_diag", 0)]
