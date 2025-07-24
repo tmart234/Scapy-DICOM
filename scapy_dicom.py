@@ -190,7 +190,7 @@ class P_DATA_TF(Packet):
 
     def __init__(self, *args, **kwargs):
         super(P_DATA_TF, self).__init__(*args, **kwargs)
-        self.variable_items = kwargs.pop('variable_items', [])
+        self.pdv_items = kwargs.pop('pdv_items', [])
 
     def do_dissect_payload(self, s):
         self.pdv_items = []
