@@ -122,8 +122,8 @@ class A_ASSOCIATE_RQ(Packet):
     ]
 
     def __init__(self, *args, **kwargs):
-        self.variable_items = kwargs.pop('variable_items', [])
         super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
+        self.variable_items = kwargs.pop('variable_items', [])
 
     def do_dissect_payload(self, s):
         self.variable_items = []
@@ -189,8 +189,8 @@ class P_DATA_TF(Packet):
     fields_desc = [] 
 
     def __init__(self, *args, **kwargs):
-        self.pdv_items = kwargs.pop('pdv_items', [])
         super(P_DATA_TF, self).__init__(*args, **kwargs)
+        self.variable_items = kwargs.pop('variable_items', [])
 
     def do_dissect_payload(self, s):
         self.pdv_items = []
