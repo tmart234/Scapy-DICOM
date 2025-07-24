@@ -130,10 +130,6 @@ class A_ASSOCIATE_RQ(Packet):
         
         self.variable_items = variable_items
 
-    # These payload handlers are still needed for dissection and showing
-    def do_build_payload(self):
-        return b"".join(bytes(item) for item in self.variable_items)
-
     def do_dissect_payload(self, s):
         self.variable_items = []
         stream = BytesIO(s)
@@ -150,6 +146,9 @@ class A_ASSOCIATE_RQ(Packet):
         remaining_bytes = stream.read()
         if remaining_bytes:
             self.payload = Raw(remaining_bytes)
+
+    def build_payload(self):
+        return b"".join(bytes(x) for x in self.variable_items)
 
 class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
     name = "A-ASSOCIATE-AC"
@@ -196,19 +195,9 @@ class P_DATA_TF(Packet):
 
     def __init__(self, *args, **kwargs):
         pdv_items = kwargs.pop('pdv_items', [])
-
-        # Pre-build the payload from the list of items
         payload = b"".join(bytes(item) for item in pdv_items)
-        
-        # Pass the pre-built payload as the FIRST argument to super()
         super(P_DATA_TF, self).__init__(payload, *args, **kwargs)
-        
-        # Now, re-assign the list so the object knows about it
         self.pdv_items = pdv_items
-
-    # These payload handlers are still needed for dissection and showing
-    def do_build_payload(self):
-        return b"".join(bytes(item) for item in self.pdv_items)
 
     def do_dissect_payload(self, s):
         self.pdv_items = []
@@ -219,6 +208,9 @@ class P_DATA_TF(Packet):
             if item_total_size > len(s) or item_total_size <= 0:
                 break
             s = s[item_total_size:]
+            
+    def build_payload(self):
+        return b"".join(bytes(x) for x in self.pdv_items)
 
 class A_RELEASE_RQ(Packet): name = "A-RELEASE-RQ"; fields_desc = [IntField("reserved1", 0)]
 class A_RELEASE_RP(Packet): name = "A-RELEASE-RP"; fields_desc = [IntField("reserved1", 0)]
