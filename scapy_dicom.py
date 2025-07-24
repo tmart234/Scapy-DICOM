@@ -124,12 +124,7 @@ class A_ASSOCIATE_RQ(Packet):
     def __init__(self, *args, **kwargs):
         variable_items = kwargs.pop('variable_items', [])
         
-        # If items are provided, build the payload string and pass it as the
-        # main argument to the parent constructor.
-        if args and isinstance(args[0], list):
-             variable_items = args[0]
-             args = args[1:]
-
+        # Pre-build the payload from the list of items
         payload = b"".join(bytes(item) for item in variable_items)
         super(A_ASSOCIATE_RQ, self).__init__(payload, *args, **kwargs)
         
@@ -200,18 +195,15 @@ class P_DATA_TF(Packet):
     fields_desc = [] 
 
     def __init__(self, *args, **kwargs):
-        # Pop the custom list argument
         pdv_items = kwargs.pop('pdv_items', [])
 
-        # --- THIS IS THE FINAL FIX ---
-        if args and isinstance(args[0], list):
-             pdv_items = args[0]
-             args = args[1:]
-        
+        # Pre-build the payload from the list of items
         payload = b"".join(bytes(item) for item in pdv_items)
+        
+        # Pass the pre-built payload as the FIRST argument to super()
         super(P_DATA_TF, self).__init__(payload, *args, **kwargs)
-        # --- END FIX ---
-
+        
+        # Now, re-assign the list so the object knows about it
         self.pdv_items = pdv_items
 
     # These payload handlers are still needed for dissection and showing
@@ -227,7 +219,7 @@ class P_DATA_TF(Packet):
             if item_total_size > len(s) or item_total_size <= 0:
                 break
             s = s[item_total_size:]
-                     
+
 class A_RELEASE_RQ(Packet): name = "A-RELEASE-RQ"; fields_desc = [IntField("reserved1", 0)]
 class A_RELEASE_RP(Packet): name = "A-RELEASE-RP"; fields_desc = [IntField("reserved1", 0)]
 class A_ABORT(Packet): name = "A-ABORT"; fields_desc = [ByteField("reserved1", 0), ByteField("reserved2", 0), ByteField("source", 0), ByteField("reason_diag", 0)]
