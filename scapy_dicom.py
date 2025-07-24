@@ -122,13 +122,8 @@ class A_ASSOCIATE_RQ(Packet):
     ]
 
     def __init__(self, *args, **kwargs):
-        variable_items = kwargs.pop('variable_items', [])
-        
-        # Pre-build the payload from the list of items
-        payload = b"".join(bytes(item) for item in variable_items)
-        super(A_ASSOCIATE_RQ, self).__init__(payload, *args, **kwargs)
-        
-        self.variable_items = variable_items
+        self.variable_items = kwargs.pop('variable_items', [])
+        super(A_ASSOCIATE_RQ, self).__init__(*args, **kwargs)
 
     def do_dissect_payload(self, s):
         self.variable_items = []
@@ -194,10 +189,8 @@ class P_DATA_TF(Packet):
     fields_desc = [] 
 
     def __init__(self, *args, **kwargs):
-        pdv_items = kwargs.pop('pdv_items', [])
-        payload = b"".join(bytes(item) for item in pdv_items)
-        super(P_DATA_TF, self).__init__(payload, *args, **kwargs)
-        self.pdv_items = pdv_items
+        self.pdv_items = kwargs.pop('pdv_items', [])
+        super(P_DATA_TF, self).__init__(*args, **kwargs)
 
     def do_dissect_payload(self, s):
         self.pdv_items = []
