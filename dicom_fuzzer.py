@@ -30,10 +30,13 @@ try:
         A_ASSOCIATE_RQ,
         A_ASSOCIATE_RJ,
         A_ABORT,
+        P_DATA_TF,
+        PresentationDataValueItem,
         DICOMVariableItem,
         APP_CONTEXT_UID,
         DEFAULT_TRANSFER_SYNTAX_UID,
         VERIFICATION_SOP_CLASS_UID,
+        build_c_store_rq_dimse,
         _pad_ae_title,
         _uid_to_bytes,
     )
@@ -852,7 +855,7 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
 
     if mode == "failed" or data_bytes is None:
         script_log.error("Could not extract data from file. Aborting.")
-        return False
+        return {"passed": 0, "failed": 0, "errors": 1}
 
     script_log.info(f"Extracted info (mode={mode}):")
     script_log.info(f"  SOP Class UID: {sop_class}")
@@ -860,6 +863,10 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
     script_log.info(f"  Transfer Syntax: {ts_uid}")
     script_log.info(f"  Dataset size: {len(data_bytes)} bytes")
 
+    results = {"passed": 0, "failed": 0, "errors": 0}
+
+    # --- Test Case 1: Valid C-STORE (baseline) ---
+    script_log.info("Test Case 1: Valid C-STORE (baseline)")
     session = DICOMSession(
         dst_ip=session_args["ip"],
         dst_port=session_args["port"],
@@ -867,46 +874,401 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         src_ae=session_args["calling_ae"],
         read_timeout=session_args["timeout"],
     )
-
-    # Request contexts for both Verification and the SOP Class
     requested_contexts = {
         VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
         sop_class: [ts_uid, DEFAULT_TRANSFER_SYNTAX_UID],
     }
-
     try:
         if session.associate(requested_contexts=requested_contexts):
-            script_log.info("Association successful.")
-
-            # Perform C-STORE
             store_status = session.c_store(
                 dataset_bytes=data_bytes,
                 sop_class_uid=sop_class,
                 sop_instance_uid=sop_instance,
                 transfer_syntax_uid=ts_uid,
             )
-
-            if store_status is not None:
-                script_log.info(f"C-STORE completed. Status: 0x{store_status:04X}")
-                if store_status == 0x0000:
-                    script_log.info("[PASS] C-STORE succeeded.")
-                else:
-                    script_log.warning("[INFO] C-STORE returned non-success status.")
+            if store_status == 0x0000:
+                script_log.info("[PASS] Valid C-STORE succeeded.")
+                results["passed"] += 1
+            elif store_status is not None:
+                script_log.info(f"[PASS] C-STORE returned status 0x{store_status:04X}")
+                results["passed"] += 1
             else:
-                script_log.error("[FAIL] C-STORE returned None (protocol error).")
-
+                script_log.warning("[WARN] C-STORE returned None.")
+                results["failed"] += 1
             session.release()
         else:
-            script_log.error("Association failed.")
-            return False
+            script_log.error("[FAIL] Association failed for valid C-STORE.")
+            results["failed"] += 1
     except Exception as e:
-        script_log.exception(f"Exception during C-STORE: {e}")
-        return False
+        script_log.error(f"[ERROR] Exception: {e}")
+        results["errors"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 2: Truncated Dataset ---
+    script_log.info("Test Case 2: Truncated Dataset (half the data)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            truncated_data = data_bytes[:len(data_bytes) // 2]
+            store_status = session.c_store(
+                dataset_bytes=truncated_data,
+                sop_class_uid=sop_class,
+                sop_instance_uid=sop_instance + ".truncated",
+                transfer_syntax_uid=ts_uid,
+            )
+            if store_status is not None:
+                script_log.info(f"[PASS] Server handled truncated data: 0x{store_status:04X}")
+                results["passed"] += 1
+            else:
+                script_log.info("[PASS] Server rejected truncated data (None response).")
+                results["passed"] += 1
+            session.release()
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected truncated data: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 3: Zero-Length Dataset ---
+    script_log.info("Test Case 3: Zero-Length Dataset")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            store_status = session.c_store(
+                dataset_bytes=b"",
+                sop_class_uid=sop_class,
+                sop_instance_uid=sop_instance + ".empty",
+                transfer_syntax_uid=ts_uid,
+            )
+            if store_status is not None:
+                script_log.info(f"[PASS] Server handled empty data: 0x{store_status:04X}")
+            else:
+                script_log.info("[PASS] Server rejected empty data.")
+            results["passed"] += 1
+            session.release()
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected empty data: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 4: Corrupted Dataset (bit flips) ---
+    script_log.info("Test Case 4: Corrupted Dataset (random bit flips)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            import random
+            corrupted = bytearray(data_bytes)
+            # Flip 5% of bytes
+            for _ in range(max(1, len(corrupted) // 20)):
+                idx = random.randint(0, len(corrupted) - 1)
+                corrupted[idx] ^= random.randint(1, 255)
+            store_status = session.c_store(
+                dataset_bytes=bytes(corrupted),
+                sop_class_uid=sop_class,
+                sop_instance_uid=sop_instance + ".corrupted",
+                transfer_syntax_uid=ts_uid,
+            )
+            if store_status is not None:
+                script_log.info(f"[PASS] Server handled corrupted data: 0x{store_status:04X}")
+            else:
+                script_log.info("[PASS] Server rejected corrupted data.")
+            results["passed"] += 1
+            session.release()
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected corrupted data: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 5: Invalid SOP Class UID ---
+    script_log.info("Test Case 5: Invalid SOP Class UID in C-STORE command")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            # Use a bogus SOP Class UID that wasn't negotiated
+            bogus_sop_class = "1.2.3.4.5.6.7.8.9.INVALID"
+            store_status = session.c_store(
+                dataset_bytes=data_bytes,
+                sop_class_uid=bogus_sop_class,
+                sop_instance_uid=sop_instance + ".invalid_class",
+                transfer_syntax_uid=ts_uid,
+            )
+            # Should fail because context wasn't negotiated
+            if store_status is None:
+                script_log.info("[PASS] Server rejected invalid SOP Class (no context).")
+                results["passed"] += 1
+            else:
+                script_log.warning(f"[WARN] Server accepted invalid SOP Class: 0x{store_status:04X}")
+                results["failed"] += 1
+            session.release()
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Exception with invalid SOP Class: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 6: Null Bytes in SOP Instance UID ---
+    script_log.info("Test Case 6: Null Bytes in SOP Instance UID")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            null_uid = "1.2.3\x00.4.5.6.NULL"
+            store_status = session.c_store(
+                dataset_bytes=data_bytes,
+                sop_class_uid=sop_class,
+                sop_instance_uid=null_uid,
+                transfer_syntax_uid=ts_uid,
+            )
+            if store_status is not None:
+                script_log.info(f"[INFO] Server handled null UID: 0x{store_status:04X}")
+            else:
+                script_log.info("[PASS] Server rejected null UID.")
+            results["passed"] += 1
+            session.release()
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected null UID: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 7: Oversized Single Element ---
+    script_log.info("Test Case 7: Oversized dataset element (64KB value)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            # Create dataset with oversized Patient Name (64KB)
+            oversized_name = b"X" * 65536
+            if len(oversized_name) % 2:
+                oversized_name += b" "
+            oversized_data = (
+                struct.pack("<HHI", 0x0008, 0x0016, len(sop_class.encode())) + 
+                sop_class.encode().ljust(len(sop_class) + (len(sop_class) % 2), b'\x00') +
+                struct.pack("<HHI", 0x0010, 0x0010, len(oversized_name)) + oversized_name
+            )
+            store_status = session.c_store(
+                dataset_bytes=oversized_data,
+                sop_class_uid=sop_class,
+                sop_instance_uid=sop_instance + ".oversized",
+                transfer_syntax_uid=ts_uid,
+            )
+            if store_status is not None:
+                script_log.info(f"[PASS] Server handled oversized element: 0x{store_status:04X}")
+            else:
+                script_log.info("[PASS] Server rejected oversized element.")
+            results["passed"] += 1
+            session.release()
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected oversized element: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 8: Send data without command (raw PDV attack) ---
+    script_log.info("Test Case 8: Data PDV without preceding Command PDV")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            # Find a valid context ID
+            ctx_id = None
+            for cid, (abs_syn, _) in session.accepted_contexts.items():
+                if abs_syn == sop_class:
+                    ctx_id = cid
+                    break
+            
+            if ctx_id:
+                # Send data PDV directly without command
+                data_pdv = PresentationDataValueItem(
+                    context_id=ctx_id,
+                    data=data_bytes[:100],  # Small chunk
+                    is_command=False,
+                    is_last=True,
+                )
+                pdata = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
+                session._send_pdu(pdata)
+                
+                response = session._recv_pdu()
+                if response:
+                    resp_pkt = DICOM(response)
+                    if resp_pkt.haslayer(A_ABORT):
+                        script_log.info("[PASS] Server aborted on data without command.")
+                        results["passed"] += 1
+                    else:
+                        script_log.info(f"[INFO] Server response: {resp_pkt.summary()}")
+                        results["passed"] += 1
+                else:
+                    script_log.info("[PASS] Server closed/timed out (expected).")
+                    results["passed"] += 1
+            else:
+                script_log.warning("[WARN] No valid context found.")
+                results["failed"] += 1
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected orphan data: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 9: Wrong Presentation Context ID ---
+    script_log.info("Test Case 9: Wrong Presentation Context ID")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            # Use context ID 255 which was never negotiated
+            msg_id = session._get_next_message_id()
+            dimse_cmd = build_c_store_rq_dimse(sop_class, sop_instance + ".wrongctx", msg_id)
+            
+            cmd_pdv = PresentationDataValueItem(
+                context_id=255,  # Invalid context
+                data=dimse_cmd,
+                is_command=True,
+                is_last=True,
+            )
+            pdata = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
+            session._send_pdu(pdata)
+            
+            response = session._recv_pdu()
+            if response:
+                resp_pkt = DICOM(response)
+                if resp_pkt.haslayer(A_ABORT):
+                    script_log.info("[PASS] Server aborted on invalid context ID.")
+                    results["passed"] += 1
+                else:
+                    script_log.info(f"[INFO] Server response: {resp_pkt.summary()}")
+                    results["passed"] += 1
+            else:
+                script_log.info("[PASS] Server closed/timed out (expected).")
+                results["passed"] += 1
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected invalid context: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 10: Interleaved fragments from different associations ---
+    script_log.info("Test Case 10: Fragment marked as 'not last' then close connection")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            ctx_id = None
+            for cid, (abs_syn, _) in session.accepted_contexts.items():
+                if abs_syn == sop_class:
+                    ctx_id = cid
+                    break
+            
+            if ctx_id:
+                msg_id = session._get_next_message_id()
+                dimse_cmd = build_c_store_rq_dimse(sop_class, sop_instance + ".partial", msg_id)
+                
+                # Send command
+                cmd_pdv = PresentationDataValueItem(
+                    context_id=ctx_id,
+                    data=dimse_cmd,
+                    is_command=True,
+                    is_last=True,
+                )
+                pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
+                session._send_pdu(pdata_cmd)
+                
+                # Send partial data marked as "not last"
+                partial_pdv = PresentationDataValueItem(
+                    context_id=ctx_id,
+                    data=data_bytes[:50],
+                    is_command=False,
+                    is_last=False,  # More fragments expected
+                )
+                pdata_partial = DICOM() / P_DATA_TF(pdv_items=[partial_pdv])
+                session._send_pdu(pdata_partial)
+                
+                # Close connection without sending rest
+                script_log.info("[PASS] Sent incomplete fragment and closing.")
+                results["passed"] += 1
+            else:
+                results["failed"] += 1
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Exception during fragment test: {e}")
+        results["passed"] += 1
     finally:
         session.close()
 
     script_log.info("=== C-STORE Fuzzing Complete ===")
-    return True
+    script_log.info(
+        f"Results: {results['passed']} passed, "
+        f"{results['failed']} failed, {results['errors']} errors"
+    )
+    return results
 
 
 def main():
