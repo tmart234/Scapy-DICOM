@@ -499,6 +499,46 @@ class DICOMSession:
             log.error("Connection failed: %s", e)
             return False
 
+    def _recv_pdu(self):
+        """
+        Receive a complete DICOM PDU from the socket.
+
+        Reads the 6-byte PDU header first to get the length,
+        then reads the complete PDU payload.
+
+        :return: Complete PDU bytes or None on error/timeout
+        """
+        try:
+            # Read PDU header (6 bytes: type, reserved, length)
+            header = b""
+            while len(header) < 6:
+                chunk = self.sock.recv(6 - len(header))
+                if not chunk:
+                    return None
+                header += chunk
+
+            # Parse length from header (bytes 2-6, big-endian)
+            pdu_length = struct.unpack("!I", header[2:6])[0]
+
+            # Read PDU payload
+            payload = b""
+            while len(payload) < pdu_length:
+                chunk = self.sock.recv(pdu_length - len(payload))
+                if not chunk:
+                    return None
+                payload += chunk
+
+            return header + payload
+        except socket.timeout:
+            return None
+        except Exception as e:
+            log.error("Error receiving PDU: %s", e)
+            return None
+
+    def _send_pdu(self, pkt):
+        """Send a DICOM PDU packet."""
+        self.sock.sendall(bytes(pkt))
+
     def associate(self, requested_contexts=None):
         """
         Request DICOM association with the server.
@@ -552,17 +592,25 @@ class DICOMSession:
             variable_items=variable_items,
         )
 
-        response = self.stream.sr1(assoc_rq, timeout=self.read_timeout, verbose=0)
+        self._send_pdu(assoc_rq)
+        response_data = self._recv_pdu()
 
-        if response and response.haslayer(A_ASSOCIATE_AC):
-            self.assoc_established = True
-            self._parse_accepted_contexts(response, requested_contexts)
-            return True
+        if response_data:
+            response = DICOM(response_data)
+            if response.haslayer(A_ASSOCIATE_AC):
+                self.assoc_established = True
+                self._parse_accepted_contexts(response, requested_contexts)
+                return True
+            elif response.haslayer(A_ASSOCIATE_RJ):
+                log.error(
+                    "Association rejected: result=%d, source=%d, reason=%d",
+                    response[A_ASSOCIATE_RJ].result,
+                    response[A_ASSOCIATE_RJ].source,
+                    response[A_ASSOCIATE_RJ].reason_diag,
+                )
+                return False
 
-        log.error(
-            "Association failed. Response: %s",
-            response.summary() if response else "None",
-        )
+        log.error("Association failed: no valid response received")
         return False
 
     def _parse_accepted_contexts(self, response, requested_contexts):
@@ -639,16 +687,19 @@ class DICOMSession:
         )
         pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
 
-        response = self.stream.sr1(pdata_rq, timeout=self.read_timeout, verbose=0)
+        self._send_pdu(pdata_rq)
+        response_data = self._recv_pdu()
 
-        if response and response.haslayer(P_DATA_TF):
-            pdv_items = response[P_DATA_TF].pdv_items
-            if pdv_items:
-                pdv_rsp = pdv_items[0]
-                data = pdv_rsp.data
-                if isinstance(data, str):
-                    data = data.encode("latin-1")
-                return parse_dimse_status(data)
+        if response_data:
+            response = DICOM(response_data)
+            if response.haslayer(P_DATA_TF):
+                pdv_items = response[P_DATA_TF].pdv_items
+                if pdv_items:
+                    pdv_rsp = pdv_items[0]
+                    data = pdv_rsp.data
+                    if isinstance(data, str):
+                        data = data.encode("latin-1")
+                    return parse_dimse_status(data)
         return None
 
     def c_store(self, dataset_bytes, sop_class_uid, sop_instance_uid,
@@ -697,16 +748,19 @@ class DICOMSession:
         )
         pdata_rq = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv, data_pdv])
 
-        response = self.stream.sr1(pdata_rq, timeout=self.read_timeout, verbose=0)
+        self._send_pdu(pdata_rq)
+        response_data = self._recv_pdu()
 
-        if response and response.haslayer(P_DATA_TF):
-            pdv_items = response[P_DATA_TF].pdv_items
-            if pdv_items:
-                pdv_rsp = pdv_items[0]
-                data = pdv_rsp.data
-                if isinstance(data, str):
-                    data = data.encode("latin-1")
-                return parse_dimse_status(data)
+        if response_data:
+            response = DICOM(response_data)
+            if response.haslayer(P_DATA_TF):
+                pdv_items = response[P_DATA_TF].pdv_items
+                if pdv_items:
+                    pdv_rsp = pdv_items[0]
+                    data = pdv_rsp.data
+                    if isinstance(data, str):
+                        data = data.encode("latin-1")
+                    return parse_dimse_status(data)
         return None
 
     def release(self):
@@ -719,9 +773,14 @@ class DICOMSession:
             return True
 
         release_rq = DICOM() / A_RELEASE_RQ()
-        response = self.stream.sr1(release_rq, timeout=self.read_timeout, verbose=0)
+        self._send_pdu(release_rq)
+        response_data = self._recv_pdu()
         self.close()
-        return response is not None and response.haslayer(A_RELEASE_RP)
+
+        if response_data:
+            response = DICOM(response_data)
+            return response.haslayer(A_RELEASE_RP)
+        return False
 
     def close(self):
         """Close the underlying socket connection."""
