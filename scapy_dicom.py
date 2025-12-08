@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # This file is part of Scapy
 # See https://scapy.net/ for more information
-# Copyright (C) 2024
+# Copyright (C) 2025
 
 """
 DICOM (Digital Imaging and Communications in Medicine) Protocol
