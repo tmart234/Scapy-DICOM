@@ -64,10 +64,11 @@ jobs:
             127.0.0.1 ${{ matrix.dicom_server.port }}
 
       - name: Start tcpdump capture
+        id: start_tcpdump
         run: |
           echo "Starting tcpdump capture for port ${{ matrix.dicom_server.port }}..."
-          sudo tcpdump -i any -w fuzzer_capture.pcap port ${{ matrix.dicom_server.port }} &
-          echo $! > tcpdump.pid
+          sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w fuzzer_capture_${{ matrix.dicom_server.name }}.pcap &
+          echo "tcpdump_pid=$!" >> $GITHUB_OUTPUT
           sleep 2
 
       - name: Run DICOM Fuzzer (Association Mode)
@@ -94,40 +95,32 @@ jobs:
             --debug
         continue-on-error: true
 
-      - name: Stop tcpdump and analyze capture
+      - name: Stop tcpdump capture
         if: always()
         run: |
-          if [ -f tcpdump.pid ]; then
-            sudo kill $(cat tcpdump.pid) 2>/dev/null || true
-            sleep 2
+          if [ -n "${{ steps.start_tcpdump.outputs.tcpdump_pid }}" ]; then
+            sudo kill ${{ steps.start_tcpdump.outputs.tcpdump_pid }} 2>/dev/null || true
           fi
-          
-          echo "--- PCAP Summary ---"
-          if [ -f fuzzer_capture.pcap ]; then
-            sudo chmod 644 fuzzer_capture.pcap
-            tshark -r fuzzer_capture.pcap -Y "dicom" -T fields \
-              -e frame.number \
-              -e ip.src \
-              -e ip.dst \
-              -e dicom.pdu.type \
-              -e dicom.assoc.reject.result \
-              -e dicom.assoc.reject.source \
-              -e dicom.assoc.reject.reason \
-              2>/dev/null || echo "No DICOM packets found or tshark error"
-            
-            echo ""
-            echo "--- Full PCAP (first 100 packets) ---"
-            tshark -r fuzzer_capture.pcap -c 100 2>/dev/null || true
+          sleep 2
+
+      - name: Print PCAP summary
+        if: always()
+        run: |
+          PCAP_FILE="fuzzer_capture_${{ matrix.dicom_server.name }}.pcap"
+          if [[ -f "$PCAP_FILE" ]]; then
+            echo "--- PCAP Summary for $PCAP_FILE ---"
+            tshark -r "$PCAP_FILE" -c 100 2>/dev/null || true
           else
-            echo "No pcap file found"
+            echo "No pcap file found: $PCAP_FILE"
           fi
+        continue-on-error: true
 
       - name: Upload pcap artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzzer-pcap-${{ matrix.dicom_server.name }}
-          path: fuzzer_capture.pcap
+          path: fuzzer_capture_${{ matrix.dicom_server.name }}.pcap
           if-no-files-found: ignore
 
       - name: Show server logs

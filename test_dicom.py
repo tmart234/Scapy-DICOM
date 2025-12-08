@@ -31,15 +31,14 @@ from scapy_dicom import (
     DICOMVariableItem,
     PresentationDataValueItem,
     build_c_echo_rq_dimse,
-    build_c_store_rq_dimse,
     DICOMSession,
     APP_CONTEXT_UID,
     VERIFICATION_SOP_CLASS_UID,
     DEFAULT_TRANSFER_SYNTAX_UID,
     CT_IMAGE_STORAGE_SOP_CLASS_UID,
+    _pad_ae_title,
+    _uid_to_bytes,
 )
-# Internal helper - import separately since it's not in __all__
-from scapy_dicom import _uid_to_bytes
 
 
 # --- Group 1: Layer Unit & Validation Tests ---
@@ -289,6 +288,164 @@ class TestFuzzingCapabilities:
         pkt = DICOM() / A_ASSOCIATE_RQ()
         pkt[A_ASSOCIATE_RQ].variable_items = [user_info]
         assert b'\x56\x00\x00\x00' in bytes(pkt)
+
+
+class TestRoundTripSerialization:
+    """Test that packets survive build -> serialize -> parse cycle."""
+
+    def test_associate_rq_round_trip(self):
+        """A-ASSOCIATE-RQ should survive serialization round-trip."""
+        original = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=_pad_ae_title("TARGET"),
+            calling_ae_title=_pad_ae_title("SOURCE"),
+        )
+        serialized = bytes(original)
+        parsed = DICOM(serialized)
+
+        assert parsed.haslayer(A_ASSOCIATE_RQ)
+        assert parsed[A_ASSOCIATE_RQ].called_ae_title == b"TARGET          "
+        assert parsed[A_ASSOCIATE_RQ].calling_ae_title == b"SOURCE          "
+
+    def test_pdata_round_trip(self):
+        """P-DATA-TF with PDV should survive serialization round-trip."""
+        test_data = b"\x01\x02\x03\x04\x05"
+        pdv = PresentationDataValueItem(
+            context_id=3, data=test_data, is_command=True, is_last=True
+        )
+        original = DICOM() / P_DATA_TF(pdv_items=[pdv])
+        serialized = bytes(original)
+        parsed = DICOM(serialized)
+
+        assert parsed.haslayer(P_DATA_TF)
+        assert len(parsed[P_DATA_TF].pdv_items) == 1
+        parsed_pdv = parsed[P_DATA_TF].pdv_items[0]
+        assert parsed_pdv.context_id == 3
+        # Data includes message control header byte
+        assert test_data in bytes(parsed_pdv)
+
+    def test_abort_round_trip(self):
+        """A-ABORT should survive serialization round-trip."""
+        original = DICOM() / A_ABORT(source=2, reason_diag=6)
+        serialized = bytes(original)
+        parsed = DICOM(serialized)
+
+        assert parsed.haslayer(A_ABORT)
+        assert parsed[A_ABORT].source == 2
+        assert parsed[A_ABORT].reason_diag == 6
+
+    def test_associate_rj_round_trip(self):
+        """A-ASSOCIATE-RJ should survive serialization round-trip."""
+        original = DICOM() / A_ASSOCIATE_RJ(result=1, source=1, reason_diag=3)
+        serialized = bytes(original)
+        parsed = DICOM(serialized)
+
+        assert parsed.haslayer(A_ASSOCIATE_RJ)
+        assert parsed[A_ASSOCIATE_RJ].result == 1
+        assert parsed[A_ASSOCIATE_RJ].source == 1
+        assert parsed[A_ASSOCIATE_RJ].reason_diag == 3
+
+
+class TestEdgeCases:
+    """Test edge cases and boundary conditions."""
+
+    def test_zero_length_pdu_payload(self):
+        """PDU with zero-length payload should be constructable."""
+        pkt = DICOM() / A_RELEASE_RQ()
+        serialized = bytes(pkt)
+        # A-RELEASE-RQ has fixed 4-byte payload (all reserved)
+        assert len(serialized) == 10  # 6 header + 4 payload
+
+    def test_empty_variable_items(self):
+        """A-ASSOCIATE-RQ with no variable items."""
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[])
+        serialized = bytes(pkt)
+        parsed = DICOM(serialized)
+        assert parsed.haslayer(A_ASSOCIATE_RQ)
+
+    def test_pdata_no_pdv_items(self):
+        """P-DATA-TF with empty PDV list."""
+        pkt = DICOM() / P_DATA_TF(pdv_items=[])
+        serialized = bytes(pkt)
+        # Should have just PDU header with zero-length payload
+        assert len(serialized) == 6
+
+    def test_maximum_ae_title_length(self):
+        """AE title at exactly 16 characters (max allowed)."""
+        max_ae = b"1234567890ABCDEF"
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=max_ae,
+            calling_ae_title=max_ae,
+        )
+        serialized = bytes(pkt)
+        parsed = DICOM(serialized)
+        assert parsed[A_ASSOCIATE_RQ].called_ae_title == max_ae
+
+    def test_pdu_type_preservation(self):
+        """Each PDU type should have correct type byte after serialization."""
+        test_cases = [
+            (A_ASSOCIATE_RQ(), 0x01),
+            (A_ASSOCIATE_AC(), 0x02),
+            (A_ASSOCIATE_RJ(), 0x03),
+            (P_DATA_TF(), 0x04),
+            (A_RELEASE_RQ(), 0x05),
+            (A_RELEASE_RP(), 0x06),
+            (A_ABORT(), 0x07),
+        ]
+        for pdu, expected_type in test_cases:
+            pkt = DICOM() / pdu
+            serialized = bytes(pkt)
+            assert serialized[0] == expected_type, f"PDU type mismatch for {pdu.__class__.__name__}"
+
+
+class TestMalformedPacketHandling:
+    """Test handling of malformed/invalid packets."""
+
+    def test_truncated_pdu_header(self):
+        """Truncated PDU (less than 6 bytes) should raise struct error."""
+        truncated = b"\x01\x00\x00"  # Only 3 bytes
+        # Scapy will raise struct.error when trying to unpack length field
+        with pytest.raises(struct.error):
+            DICOM(truncated)
+
+    def test_pdu_length_exceeds_data(self):
+        """PDU with length field larger than actual data."""
+        # A-ABORT with length claiming 100 bytes but only 4 bytes of data
+        malformed = b"\x07\x00\x00\x00\x00\x64\x00\x00\x00\x00"
+        pkt = DICOM(malformed)
+        # Should parse without crash
+        assert pkt is not None
+
+    def test_pdu_length_smaller_than_data(self):
+        """PDU with length field smaller than actual data (trailing garbage)."""
+        # A-ABORT normally 4 bytes, but we'll say length is 2
+        malformed = b"\x07\x00\x00\x00\x00\x02\x00\x00\x00\x00\xFF\xFF"
+        pkt = DICOM(malformed)
+        assert pkt.haslayer(A_ABORT)
+
+    def test_unknown_pdu_type(self):
+        """Unknown PDU type should be parseable as raw DICOM."""
+        unknown = b"\xFF\x00\x00\x00\x00\x04\x01\x02\x03\x04"
+        pkt = DICOM(unknown)
+        # Should parse header at minimum
+        assert pkt.pdu_type == 0xFF
+
+    def test_invalid_variable_item_type(self):
+        """Variable item with unknown type in A-ASSOCIATE-RQ."""
+        # Create item with invalid type 0xFF
+        invalid_item = DICOMVariableItem(item_type=0xFF, data=b"test")
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[invalid_item])
+        serialized = bytes(pkt)
+        # Should serialize without crash
+        assert b"\xFF" in serialized
+
+    def test_deeply_nested_variable_items(self):
+        """Variable items containing other variable items."""
+        inner = DICOMVariableItem(item_type=0x51, data=b"\x00\x00\x40\x00")
+        outer = DICOMVariableItem(item_type=0x50, data=bytes(inner))
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[outer])
+        serialized = bytes(pkt)
+        parsed = DICOM(serialized)
+        assert parsed.haslayer(A_ASSOCIATE_RQ)
 
 
 # --- Group 4: Integration Tests ---

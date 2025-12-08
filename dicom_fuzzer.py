@@ -443,6 +443,218 @@ def fuzz_association_handshake(session_args):
         finally:
             session.close()
 
+    # --- Test Case 5: PDU Length Mismatch (larger than actual) ---
+    script_log.info("Test Case 5: PDU Length Mismatch (claims more data)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    if session.connect():
+        try:
+            # Build valid AARQ then corrupt the length field
+            variable_items = [
+                DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
+                build_presentation_context_item(
+                    1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]
+                ),
+                build_user_info_item(),
+            ]
+            aarq = A_ASSOCIATE_RQ(
+                called_ae_title=_pad_ae_title(session_args["ae_title"]),
+                calling_ae_title=_pad_ae_title(session_args["calling_ae"]),
+                variable_items=variable_items,
+            )
+            pkt = DICOM() / aarq
+            raw_bytes = bytearray(bytes(pkt))
+
+            # Corrupt length field (bytes 2-5) to claim 10000 more bytes
+            actual_len = struct.unpack("!I", raw_bytes[2:6])[0]
+            raw_bytes[2:6] = struct.pack("!I", actual_len + 10000)
+
+            script_log.debug("Sending AARQ with inflated length field")
+            session.sock.sendall(bytes(raw_bytes))
+
+            # Server should timeout waiting for more data or reject
+            response_data = session._recv_pdu()
+            if response_data:
+                response = DICOM(response_data)
+                script_log.info(f"Received response: {response.summary()}")
+                script_log.info("[PASS] Server handled length mismatch.")
+                results["passed"] += 1
+            else:
+                script_log.info("[PASS] Server timed out (expected for inflated length).")
+                results["passed"] += 1
+        except Exception as e:
+            script_log.info(f"[PASS] Server rejected/closed connection: {e}")
+            results["passed"] += 1
+        finally:
+            session.close()
+
+    # --- Test Case 6: Unknown PDU Type ---
+    script_log.info("Test Case 6: Unknown PDU Type (0xFF)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    if session.connect():
+        try:
+            # Send PDU with unknown type 0xFF
+            unknown_pdu = struct.pack("!BBI", 0xFF, 0, 4) + b"\x00\x00\x00\x00"
+
+            script_log.debug("Sending unknown PDU type 0xFF")
+            session.sock.sendall(unknown_pdu)
+            response_data = session._recv_pdu()
+
+            if response_data:
+                response = DICOM(response_data)
+                script_log.info(f"Received response: {response.summary()}")
+                if response.haslayer(A_ABORT):
+                    script_log.info("[PASS] Server aborted on unknown PDU type.")
+                    results["passed"] += 1
+                else:
+                    script_log.warning("[WARN] Unexpected response to unknown PDU.")
+                    results["failed"] += 1
+            else:
+                script_log.info("[PASS] Server closed connection (expected).")
+                results["passed"] += 1
+        except Exception as e:
+            script_log.info(f"[PASS] Server rejected connection: {e}")
+            results["passed"] += 1
+        finally:
+            session.close()
+
+    # --- Test Case 7: Zero-Length AE Titles ---
+    script_log.info("Test Case 7: Empty/Null AE Titles")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    if session.connect():
+        try:
+            variable_items = [
+                DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
+                build_presentation_context_item(
+                    1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]
+                ),
+                build_user_info_item(),
+            ]
+            aarq = A_ASSOCIATE_RQ(
+                called_ae_title=b"\x00" * 16,  # All null bytes
+                calling_ae_title=b"\x00" * 16,
+                variable_items=variable_items,
+            )
+            pkt = DICOM() / aarq
+
+            script_log.debug("Sending AARQ with null AE titles")
+            session._send_pdu(pkt)
+            response_data = session._recv_pdu()
+
+            if response_data:
+                response = DICOM(response_data)
+                script_log.info(f"Received response: {response.summary()}")
+                # Either rejection or acceptance is valid - no crash is good
+                script_log.info("[PASS] Server handled null AE titles.")
+                results["passed"] += 1
+            else:
+                script_log.warning("[WARN] No response received.")
+                results["failed"] += 1
+        except Exception as e:
+            script_log.error(f"Error: {e}")
+            results["errors"] += 1
+        finally:
+            session.close()
+
+    # --- Test Case 8: Truncated PDU ---
+    script_log.info("Test Case 8: Truncated PDU (incomplete header)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    if session.connect():
+        try:
+            # Send only 3 bytes (incomplete PDU header)
+            truncated = b"\x01\x00\x00"
+
+            script_log.debug("Sending truncated PDU (3 bytes)")
+            session.sock.sendall(truncated)
+
+            # Wait briefly then check for response or connection close
+            import time
+            time.sleep(1)
+            response_data = session._recv_pdu()
+
+            if response_data:
+                script_log.info("[INFO] Server sent response to truncated PDU.")
+                results["passed"] += 1
+            else:
+                script_log.info("[PASS] Server handled truncated PDU gracefully.")
+                results["passed"] += 1
+        except Exception as e:
+            script_log.info(f"[PASS] Connection closed as expected: {e}")
+            results["passed"] += 1
+        finally:
+            session.close()
+
+    # --- Test Case 9: Null Bytes in UID ---
+    script_log.info("Test Case 9: Null Bytes Injected in Application Context UID")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+    )
+    if session.connect():
+        try:
+            # Inject null bytes into application context UID
+            malicious_uid = b"1.2.840\x00.10008.3.1.1.1"
+            variable_items = [
+                DICOMVariableItem(item_type=0x10, data=malicious_uid),
+                build_presentation_context_item(
+                    1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]
+                ),
+                build_user_info_item(),
+            ]
+            aarq = A_ASSOCIATE_RQ(
+                called_ae_title=_pad_ae_title(session_args["ae_title"]),
+                calling_ae_title=_pad_ae_title(session_args["calling_ae"]),
+                variable_items=variable_items,
+            )
+            pkt = DICOM() / aarq
+
+            script_log.debug("Sending AARQ with null-injected UID")
+            session._send_pdu(pkt)
+            response_data = session._recv_pdu()
+
+            if response_data:
+                response = DICOM(response_data)
+                script_log.info(f"Received response: {response.summary()}")
+                if response.haslayer(A_ASSOCIATE_RJ) or response.haslayer(A_ABORT):
+                    script_log.info("[PASS] Server rejected null-injected UID.")
+                else:
+                    script_log.warning("[WARN] Server accepted null-injected UID.")
+                results["passed"] += 1
+            else:
+                script_log.warning("[WARN] No response received.")
+                results["failed"] += 1
+        except Exception as e:
+            script_log.error(f"Error: {e}")
+            results["errors"] += 1
+        finally:
+            session.close()
+
     script_log.info("=== Association Fuzzing Complete ===")
     script_log.info(
         f"Results: {results['passed']} passed, "
