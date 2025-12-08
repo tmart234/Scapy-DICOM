@@ -3,15 +3,29 @@ Pytest configuration for DICOM integration tests.
 
 Provides command-line options and fixtures for connecting to DICOM SCPs.
 """
-# CRITICAL: Apply scapy IPv6 fix BEFORE any other imports
-# This avoids KeyError: 'scope' in containerized environments
-import scapy_ipv6_fix  # noqa: F401
+# =============================================================================
+# SCAPY IPv6 FIX - Must be at the VERY TOP before any scapy imports
+# Fixes KeyError: 'scope' in containerized environments without full IPv6
+# =============================================================================
+import warnings as _warnings
+_warnings.filterwarnings("ignore")
 
-import sys
-import warnings
+
+class _FakeRoute6:
+    """Fake Route6 class to avoid IPv6 routing errors in containers."""
+    routes = []
+    def resync(self): pass
+    def route(self, *args, **kwargs): return ("::", "::", "::")
+
+
+try:
+    import scapy.config
+    scapy.config.conf.route6 = _FakeRoute6()
+except Exception:
+    pass
+# =============================================================================
+
 import pytest
-
-warnings.filterwarnings("ignore")
 
 
 def pytest_addoption(parser):

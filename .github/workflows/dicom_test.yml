@@ -93,12 +93,14 @@ jobs:
         if: matrix.dicom_server.name == 'Pynetdicom'
         run: |
           echo "Starting pynetdicom storescp in background..."
-          # Use storescp which handles both C-ECHO and C-STORE
+          # pynetdicom storescp syntax: storescp [options] port
+          # -aet sets AE title, port is positional argument at the end
+          mkdir -p /tmp/dicom_received
           python -m pynetdicom storescp \
-            --ae-title ${{ matrix.dicom_server.aet }} \
-            --port ${{ matrix.dicom_server.port }} \
-            --debug \
-            --output /tmp/dicom_received &
+            -aet ${{ matrix.dicom_server.aet }} \
+            -od /tmp/dicom_received \
+            -d \
+            ${{ matrix.dicom_server.port }} &
           
           echo "Waiting for pynetdicom to start..."
           sleep 3
