@@ -473,6 +473,7 @@ class DICOMSession:
         :param dst_ae: Destination Application Entity title
         :param src_ae: Source Application Entity title (default: "SCAPY_SCU")
         :param read_timeout: Socket read timeout in seconds (default: 10)
+        :param max_pdu_length: Maximum PDU length to propose (default: 16384)
         """
         self.dst_ip = dst_ip
         self.dst_port = dst_port
@@ -484,6 +485,8 @@ class DICOMSession:
         self.accepted_contexts = {}
         self.read_timeout = read_timeout
         self._current_message_id_counter = int(time.time()) % 50000
+        self._proposed_max_pdu = 16384
+        self.max_pdu_length = 16384  # Will be updated during association
 
     def connect(self):
         """
@@ -603,6 +606,7 @@ class DICOMSession:
             if response.haslayer(A_ASSOCIATE_AC):
                 self.assoc_established = True
                 self._parse_accepted_contexts(response, requested_contexts)
+                self._parse_max_pdu_length(response)
                 return True
             elif response.haslayer(A_ASSOCIATE_RJ):
                 log.error(
@@ -615,6 +619,35 @@ class DICOMSession:
 
         log.error("Association failed: no valid response received")
         return False
+
+    def _parse_max_pdu_length(self, response):
+        """Parse max PDU length from A-ASSOCIATE-AC User Information."""
+        try:
+            for item in response[A_ASSOCIATE_AC].variable_items:
+                # User Information item (0x50)
+                if item.item_type == 0x50:
+                    user_data = item.data
+                    if isinstance(user_data, str):
+                        user_data = user_data.encode("latin-1")
+                    # Parse sub-items within User Information
+                    offset = 0
+                    while offset < len(user_data) - 4:
+                        sub_type = user_data[offset]
+                        sub_len = struct.unpack("!H", user_data[offset + 2:offset + 4])[0]
+                        # Max PDU Length sub-item (0x51)
+                        if sub_type == 0x51 and sub_len == 4:
+                            server_max = struct.unpack(
+                                "!I", user_data[offset + 4:offset + 8]
+                            )[0]
+                            # Use minimum of what we proposed and server accepts
+                            self.max_pdu_length = min(self._proposed_max_pdu, server_max)
+                            log.debug("Negotiated max PDU length: %d", self.max_pdu_length)
+                            return
+                        offset += 4 + sub_len
+        except Exception as e:
+            log.debug("Could not parse max PDU length: %s", e)
+        # Keep default if parsing fails
+        self.max_pdu_length = self._proposed_max_pdu
 
     def _parse_accepted_contexts(self, response, requested_contexts):
         """Parse accepted presentation contexts from A-ASSOCIATE-AC."""
@@ -742,16 +775,45 @@ class DICOMSession:
             is_command=True,
             is_last=True,
         )
-        # Data PDV (is_last=True means last fragment of data)
-        data_pdv = PresentationDataValueItem(
-            context_id=store_ctx_id,
-            data=dataset_bytes,
-            is_command=False,
-            is_last=True,
-        )
-        pdata_rq = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv, data_pdv])
+        pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
+        self._send_pdu(pdata_cmd)
 
-        self._send_pdu(pdata_rq)
+        # Fragment data if it exceeds max PDV size
+        # Max PDV data = max_pdu_length - 6 (PDV item header: 4 len + 1 ctx + 1 flags)
+        # Use conservative margin for safety
+        max_pdv_data = self.max_pdu_length - 12  # Extra margin for safety
+
+        if len(dataset_bytes) <= max_pdv_data:
+            # Data fits in single PDU
+            data_pdv = PresentationDataValueItem(
+                context_id=store_ctx_id,
+                data=dataset_bytes,
+                is_command=False,
+                is_last=True,
+            )
+            pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
+            self._send_pdu(pdata_data)
+        else:
+            # Fragment data across multiple PDUs
+            offset = 0
+            while offset < len(dataset_bytes):
+                chunk = dataset_bytes[offset:offset + max_pdv_data]
+                is_last = (offset + len(chunk) >= len(dataset_bytes))
+                data_pdv = PresentationDataValueItem(
+                    context_id=store_ctx_id,
+                    data=chunk,
+                    is_command=False,
+                    is_last=is_last,
+                )
+                pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
+                self._send_pdu(pdata_data)
+                offset += len(chunk)
+            log.debug(
+                "Fragmented %d bytes into %d PDUs",
+                len(dataset_bytes),
+                (len(dataset_bytes) + max_pdv_data - 1) // max_pdv_data,
+            )
+
         response_data = self._recv_pdu()
 
         if response_data:

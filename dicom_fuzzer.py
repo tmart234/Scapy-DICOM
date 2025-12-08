@@ -666,41 +666,174 @@ def fuzz_association_handshake(session_args):
 def extract_dicom_info(dcm_file_path):
     """
     Extract SOP Class UID, SOP Instance UID, and dataset bytes from a DICOM file.
-    Falls back to raw bytes if pydicom is not available or parsing fails.
+    Falls back to synthetic dataset if pydicom is not available or parsing fails.
+    
+    Note: Returns only the dataset portion (no file meta), suitable for C-STORE.
     """
     if PYDICOM_AVAILABLE:
         try:
             ds = pydicom.dcmread(dcm_file_path, force=True)
             sop_class_uid = str(ds.SOPClassUID)
             sop_instance_uid = str(ds.SOPInstanceUID)
-            ts_uid = str(ds.file_meta.TransferSyntaxUID)
-
-            # Write dataset (without file meta) to bytes
-            buffer = BytesIO()
-            pydicom.filewriter.write_dataset(buffer, ds)
-            dataset_bytes = buffer.getvalue()
-
-            return sop_class_uid, sop_instance_uid, dataset_bytes, ts_uid, "parsed"
+            
+            # Get transfer syntax, default to Implicit VR LE
+            try:
+                ts_uid = str(ds.file_meta.TransferSyntaxUID)
+            except (AttributeError, KeyError):
+                ts_uid = "1.2.840.10008.1.2"  # Implicit VR Little Endian
+            
+            # Encode dataset using manual method (more reliable across pydicom versions)
+            dataset_bytes = encode_dataset_implicit_vr(ds)
+            
+            if dataset_bytes:
+                script_log.info(f"Extracted dataset: {len(dataset_bytes)} bytes")
+                # Always use Implicit VR LE since that's what we encoded to
+                return sop_class_uid, sop_instance_uid, dataset_bytes, "1.2.840.10008.1.2", "parsed"
+            else:
+                script_log.warning("Manual encoding returned empty dataset")
+                
         except Exception as e:
-            script_log.warning(f"Failed to parse DICOM file: {e}")
+            script_log.warning(f"Failed to parse DICOM file with pydicom: {e}")
 
-    # Fallback: raw bytes
-    script_log.info("Using raw fallback for DICOM file.")
+    # Fallback: Use synthetic dataset
+    script_log.info("Using synthetic dataset fallback.")
     try:
-        with open(dcm_file_path, "rb") as f:
-            dataset_bytes = f.read()
-        # Generate a unique SOP Instance UID
+        dataset_bytes = create_minimal_dataset_bytes()
         sop_instance_uid = f"1.2.3.999.{os.getpid()}.{int(__import__('time').time())}"
         return (
             FALLBACK_SOP_CLASS_UID,
             sop_instance_uid,
             dataset_bytes,
             FALLBACK_TRANSFER_SYNTAX_UID,
-            "fallback",
+            "synthetic_fallback",
         )
     except Exception as e:
-        script_log.error(f"Failed to read file: {e}")
+        script_log.error(f"Failed to create synthetic dataset: {e}")
         return None, None, None, None, "failed"
+
+
+def encode_dataset_implicit_vr(ds):
+    """
+    Manually encode a pydicom dataset to Implicit VR Little Endian bytes.
+    This is a fallback when DicomBytesIO doesn't work.
+    """
+    elements = []
+    
+    # Sort elements by tag to ensure proper order
+    sorted_elems = sorted(ds, key=lambda x: x.tag)
+    
+    for elem in sorted_elems:
+        # Skip file meta elements (group 0002)
+        if elem.tag.group == 0x0002:
+            continue
+        # Skip pixel data for now (too large)
+        if elem.tag == 0x7FE00010:
+            continue
+            
+        try:
+            tag_bytes = struct.pack("<HH", elem.tag.group, elem.tag.element)
+            
+            if elem.VR in ('OB', 'OW', 'OF', 'SQ', 'UN', 'UC', 'UR', 'UT'):
+                # These would need special handling, skip for simplicity
+                continue
+            
+            # Get value as bytes
+            if elem.value is None:
+                value_bytes = b""
+            elif isinstance(elem.value, str):
+                value_bytes = elem.value.encode('latin-1', errors='replace')
+            elif isinstance(elem.value, bytes):
+                value_bytes = elem.value
+            elif isinstance(elem.value, int):
+                if elem.VR in ('US', 'SS'):
+                    value_bytes = struct.pack("<h" if elem.VR == 'SS' else "<H", elem.value)
+                elif elem.VR in ('UL', 'SL'):
+                    value_bytes = struct.pack("<i" if elem.VR == 'SL' else "<I", elem.value)
+                else:
+                    value_bytes = str(elem.value).encode('latin-1')
+            elif isinstance(elem.value, float):
+                if elem.VR == 'FL':
+                    value_bytes = struct.pack("<f", elem.value)
+                elif elem.VR == 'FD':
+                    value_bytes = struct.pack("<d", elem.value)
+                else:
+                    value_bytes = str(elem.value).encode('latin-1')
+            else:
+                value_bytes = str(elem.value).encode('latin-1', errors='replace')
+            
+            # Pad to even length
+            if len(value_bytes) % 2:
+                if elem.VR in ('UI',):
+                    value_bytes += b'\x00'
+                else:
+                    value_bytes += b' '
+            
+            # Implicit VR: tag (4) + length (4) + value
+            length_bytes = struct.pack("<I", len(value_bytes))
+            elements.append(tag_bytes + length_bytes + value_bytes)
+            
+        except Exception as e:
+            script_log.debug(f"Skipping element {elem.tag}: {e}")
+            continue
+    
+    return b"".join(elements) if elements else None
+
+
+def create_minimal_dataset_bytes():
+    """
+    Create minimal DICOM dataset bytes (without file meta) for C-STORE testing.
+    This is small enough to fit in a single PDU.
+    """
+    # All tags in ascending order, Implicit VR Little Endian
+    elements = []
+    
+    # (0008,0016) SOP Class UID - Secondary Capture
+    sop_class = b"1.2.840.10008.5.1.4.1.1.7"
+    if len(sop_class) % 2:
+        sop_class += b"\x00"
+    elements.append(struct.pack("<HHI", 0x0008, 0x0016, len(sop_class)) + sop_class)
+    
+    # (0008,0018) SOP Instance UID
+    sop_inst = f"1.2.3.999.{os.getpid()}.{int(__import__('time').time())}".encode()
+    if len(sop_inst) % 2:
+        sop_inst += b"\x00"
+    elements.append(struct.pack("<HHI", 0x0008, 0x0018, len(sop_inst)) + sop_inst)
+    
+    # (0008,0060) Modality
+    modality = b"OT"
+    elements.append(struct.pack("<HHI", 0x0008, 0x0060, len(modality)) + modality)
+    
+    # (0010,0010) Patient Name
+    patient_name = b"FUZZ^TEST"
+    if len(patient_name) % 2:
+        patient_name += b" "
+    elements.append(struct.pack("<HHI", 0x0010, 0x0010, len(patient_name)) + patient_name)
+    
+    # (0010,0020) Patient ID
+    patient_id = b"FUZZ001"
+    if len(patient_id) % 2:
+        patient_id += b" "
+    elements.append(struct.pack("<HHI", 0x0010, 0x0020, len(patient_id)) + patient_id)
+    
+    # (0020,000D) Study Instance UID
+    study_uid = b"1.2.3.4.5.6.7.8.9.10"
+    if len(study_uid) % 2:
+        study_uid += b"\x00"
+    elements.append(struct.pack("<HHI", 0x0020, 0x000D, len(study_uid)) + study_uid)
+    
+    # (0020,000E) Series Instance UID
+    series_uid = b"1.2.3.4.5.6.7.8.9.11"
+    if len(series_uid) % 2:
+        series_uid += b"\x00"
+    elements.append(struct.pack("<HHI", 0x0020, 0x000E, len(series_uid)) + series_uid)
+    
+    # (0020,0013) Instance Number
+    instance_num = b"1"
+    if len(instance_num) % 2:
+        instance_num += b" "
+    elements.append(struct.pack("<HHI", 0x0020, 0x0013, len(instance_num)) + instance_num)
+    
+    return b"".join(elements)
 
 
 def fuzz_cstore_with_file(session_args, dcm_file_path):
