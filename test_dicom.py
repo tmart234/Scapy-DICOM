@@ -19,31 +19,27 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 logging.getLogger("scapy.contrib.dicom").setLevel(logging.INFO)
 
-try:
-    from dicom import (
-        DICOM,
-        A_ASSOCIATE_RQ,
-        A_ASSOCIATE_AC,
-        A_ASSOCIATE_RJ,
-        A_RELEASE_RQ,
-        A_RELEASE_RP,
-        A_ABORT,
-        P_DATA_TF,
-        DICOMVariableItem,
-        PresentationDataValueItem,
-        build_c_echo_rq_dimse,
-        build_c_store_rq_dimse,
-        DICOMSession,
-        APP_CONTEXT_UID,
-        VERIFICATION_SOP_CLASS_UID,
-        DEFAULT_TRANSFER_SYNTAX_UID,
-        CT_IMAGE_STORAGE_SOP_CLASS_UID,
-    )
-    # Internal helper - import separately since it's not in __all__
-    from dicom import _uid_to_bytes
-except ImportError as e:
-    print(f"[-] ERROR: Could not import the DICOM layer: {e}")
-    sys.exit(1)
+from scapy_dicom import (
+    DICOM,
+    A_ASSOCIATE_RQ,
+    A_ASSOCIATE_AC,
+    A_ASSOCIATE_RJ,
+    A_RELEASE_RQ,
+    A_RELEASE_RP,
+    A_ABORT,
+    P_DATA_TF,
+    DICOMVariableItem,
+    PresentationDataValueItem,
+    build_c_echo_rq_dimse,
+    build_c_store_rq_dimse,
+    DICOMSession,
+    APP_CONTEXT_UID,
+    VERIFICATION_SOP_CLASS_UID,
+    DEFAULT_TRANSFER_SYNTAX_UID,
+    CT_IMAGE_STORAGE_SOP_CLASS_UID,
+)
+# Internal helper - import separately since it's not in __all__
+from scapy_dicom import _uid_to_bytes
 
 
 # --- Group 1: Layer Unit & Validation Tests ---
