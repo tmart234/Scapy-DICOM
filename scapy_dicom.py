@@ -56,6 +56,9 @@ __all__ = [
     "build_c_echo_rq_dimse",
     "build_c_store_rq_dimse",
     "parse_dimse_status",
+    # Utility functions
+    "_pad_ae_title",
+    "_uid_to_bytes",
 ]
 
 log = logging.getLogger("scapy.contrib.dicom")
