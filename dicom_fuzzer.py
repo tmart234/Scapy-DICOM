@@ -57,7 +57,7 @@ script_log = logging.getLogger("dicom_fuzzer")
 
 # --- Constants ---
 SAMPLE_DCM_URL = (
-    "https://github.com/pydicom/pydicom/raw/main/pydicom/data/test_files/CT_small.dcm"
+    "https://raw.githubusercontent.com/pydicom/pydicom/main/src/pydicom/data/test_files/CT_small.dcm"
 )
 DEFAULT_SAMPLE_DIR = "sample_files_for_fuzzing"
 DEFAULT_SAMPLE_FILE = os.path.join(DEFAULT_SAMPLE_DIR, "valid_ct.dcm")
@@ -68,23 +68,126 @@ FALLBACK_TRANSFER_SYNTAX_UID = "1.2.840.10008.1.2"  # Implicit VR Little Endian
 
 
 def ensure_sample_file_exists(file_path=DEFAULT_SAMPLE_FILE):
-    """Download sample DICOM file if not present."""
+    """Download sample DICOM file if not present, or create a synthetic one."""
     dir_name = os.path.dirname(file_path)
     if dir_name and not os.path.exists(dir_name):
         script_log.info(f"Creating sample file directory: {dir_name}")
         os.makedirs(dir_name)
 
-    if not os.path.exists(file_path):
-        script_log.info(f"Downloading sample file to '{file_path}'...")
+    if os.path.exists(file_path):
+        return True
+
+    # Try downloading first
+    script_log.info(f"Downloading sample file to '{file_path}'...")
+    try:
+        with urllib.request.urlopen(SAMPLE_DCM_URL, timeout=30) as response:
+            with open(file_path, "wb") as out_file:
+                out_file.write(response.read())
+        script_log.info("Download successful.")
+        return True
+    except Exception as e:
+        script_log.warning(f"Download failed: {e}")
+
+    # Fallback: create synthetic DICOM file using pydicom
+    if PYDICOM_AVAILABLE:
+        script_log.info("Creating synthetic DICOM file with pydicom...")
         try:
-            with urllib.request.urlopen(SAMPLE_DCM_URL) as response:
-                with open(file_path, "wb") as out_file:
-                    out_file.write(response.read())
-            script_log.info("Download successful.")
-            return True
+            return create_synthetic_dicom(file_path)
         except Exception as e:
-            script_log.error(f"Failed to download sample file: {e}")
-            return False
+            script_log.error(f"Failed to create synthetic file: {e}")
+
+    # Last resort: create minimal raw DICOM bytes
+    script_log.info("Creating minimal raw DICOM file...")
+    try:
+        return create_minimal_dicom_bytes(file_path)
+    except Exception as e:
+        script_log.error(f"Failed to create minimal file: {e}")
+        return False
+
+
+def create_synthetic_dicom(file_path):
+    """Create a synthetic DICOM file using pydicom."""
+    from pydicom.dataset import FileDataset, FileMetaDataset
+    from pydicom.uid import ImplicitVRLittleEndian, generate_uid
+    import datetime
+
+    # Create file meta
+    file_meta = FileMetaDataset()
+    file_meta.MediaStorageSOPClassUID = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture
+    file_meta.MediaStorageSOPInstanceUID = generate_uid()
+    file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+
+    # Create dataset
+    ds = FileDataset(file_path, {}, file_meta=file_meta, preamble=b"\x00" * 128)
+    ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
+    ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    ds.StudyInstanceUID = generate_uid()
+    ds.SeriesInstanceUID = generate_uid()
+    ds.PatientName = "Test^Patient"
+    ds.PatientID = "TEST001"
+    ds.Modality = "OT"
+    ds.StudyDate = datetime.date.today().strftime("%Y%m%d")
+    ds.SeriesNumber = 1
+    ds.InstanceNumber = 1
+
+    ds.save_as(file_path)
+    script_log.info(f"Created synthetic DICOM file: {file_path}")
+    return True
+
+
+def create_minimal_dicom_bytes(file_path):
+    """Create a minimal valid DICOM file from raw bytes."""
+    # DICOM preamble (128 bytes) + "DICM" magic
+    preamble = b"\x00" * 128 + b"DICM"
+
+    # File Meta Information (Group 0002) - Explicit VR Little Endian
+    # (0002,0000) File Meta Information Group Length
+    fmi_len = struct.pack("<HH", 0x0002, 0x0000) + b"UL" + struct.pack("<H", 4) + struct.pack("<I", 90)
+    # (0002,0001) File Meta Information Version
+    fmi_ver = struct.pack("<HH", 0x0002, 0x0001) + b"OB" + struct.pack("<HI", 0, 2) + b"\x00\x01"
+    # (0002,0002) Media Storage SOP Class UID (Secondary Capture)
+    sop_class = b"1.2.840.10008.5.1.4.1.1.7"
+    if len(sop_class) % 2:
+        sop_class += b"\x00"
+    fmi_sop = struct.pack("<HH", 0x0002, 0x0002) + b"UI" + struct.pack("<H", len(sop_class)) + sop_class
+    # (0002,0003) Media Storage SOP Instance UID
+    sop_inst = b"1.2.3.4.5.6.7.8.9"
+    if len(sop_inst) % 2:
+        sop_inst += b"\x00"
+    fmi_inst = struct.pack("<HH", 0x0002, 0x0003) + b"UI" + struct.pack("<H", len(sop_inst)) + sop_inst
+    # (0002,0010) Transfer Syntax UID (Implicit VR Little Endian)
+    ts = b"1.2.840.10008.1.2"
+    if len(ts) % 2:
+        ts += b"\x00"
+    fmi_ts = struct.pack("<HH", 0x0002, 0x0010) + b"UI" + struct.pack("<H", len(ts)) + ts
+
+    file_meta = fmi_len + fmi_ver + fmi_sop + fmi_inst + fmi_ts
+
+    # Dataset (Implicit VR Little Endian)
+    # (0008,0016) SOP Class UID
+    ds_sop = struct.pack("<HHI", 0x0008, 0x0016, len(sop_class)) + sop_class
+    # (0008,0018) SOP Instance UID
+    ds_inst = struct.pack("<HHI", 0x0008, 0x0018, len(sop_inst)) + sop_inst
+    # (0010,0020) Patient ID
+    pid = b"TEST"
+    ds_pid = struct.pack("<HHI", 0x0010, 0x0020, len(pid)) + pid
+    # (0020,000D) Study Instance UID
+    study_uid = b"1.2.3.4.5.6.7.8.9.10"
+    if len(study_uid) % 2:
+        study_uid += b"\x00"
+    ds_study = struct.pack("<HHI", 0x0020, 0x000D, len(study_uid)) + study_uid
+    # (0020,000E) Series Instance UID
+    series_uid = b"1.2.3.4.5.6.7.8.9.11"
+    if len(series_uid) % 2:
+        series_uid += b"\x00"
+    ds_series = struct.pack("<HHI", 0x0020, 0x000E, len(series_uid)) + series_uid
+
+    dataset = ds_sop + ds_inst + ds_pid + ds_study + ds_series
+
+    with open(file_path, "wb") as f:
+        f.write(preamble + file_meta + dataset)
+
+    script_log.info(f"Created minimal DICOM file: {file_path}")
     return True
 
 
