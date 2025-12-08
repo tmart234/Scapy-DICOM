@@ -332,8 +332,12 @@ def test_c_store_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
     """Performs a full C-STORE workflow against a live SCP."""
     # Create a minimal DICOM dataset with tags in ascending order (required by DICOM)
     sop_instance_uid = "1.2.3.4.5.6.7.8"
+    study_instance_uid = "1.2.3.4.5.6.7.8.9"
+    series_instance_uid = "1.2.3.4.5.6.7.8.9.10"
     sop_class_uid_bytes = _uid_to_bytes(CT_IMAGE_STORAGE_SOP_CLASS_UID)
     sop_instance_uid_bytes = _uid_to_bytes(sop_instance_uid)
+    study_instance_uid_bytes = _uid_to_bytes(study_instance_uid)
+    series_instance_uid_bytes = _uid_to_bytes(series_instance_uid)
 
     # Build dataset with tags in proper ascending order
     dataset_elements = []
@@ -352,6 +356,16 @@ def test_c_store_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
     patient_id = b'TEST'
     dataset_elements.append(
         struct.pack('<HHI', 0x0010, 0x0020, len(patient_id)) + patient_id
+    )
+    # (0020,000D) Study Instance UID - UI (required by Orthanc)
+    dataset_elements.append(
+        struct.pack('<HHI', 0x0020, 0x000D, len(study_instance_uid_bytes))
+        + study_instance_uid_bytes
+    )
+    # (0020,000E) Series Instance UID - UI (required by Orthanc)
+    dataset_elements.append(
+        struct.pack('<HHI', 0x0020, 0x000E, len(series_instance_uid_bytes))
+        + series_instance_uid_bytes
     )
 
     dataset_bytes = b''.join(dataset_elements)
