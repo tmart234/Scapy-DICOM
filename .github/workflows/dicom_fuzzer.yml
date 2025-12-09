@@ -56,8 +56,9 @@ jobs:
           echo " Port detected as open."
           sleep 5
 
-      - name: Verify server with echoscu
+      - name: Verify server with echoscu (pre-fuzzing baseline)
         run: |
+          echo "=== Pre-fuzzing server health check ==="
           echoscu -v \
             -aet FUZZER_SCU \
             -aec ${{ matrix.dicom_server.aet }} \
@@ -72,7 +73,21 @@ jobs:
           sleep 2
 
       - name: Run DICOM Fuzzer (Association Mode)
+        id: fuzz_association
         run: |
+          echo "=== Running Association Handshake Fuzzing ==="
+          echo "This tests malformed A-ASSOCIATE-RQ packets including:"
+          echo "  - Overlong AE titles"
+          echo "  - Invalid protocol versions"
+          echo "  - Missing application context"
+          echo "  - Excessive presentation contexts"
+          echo "  - PDU length mismatches"
+          echo "  - Unknown PDU types"
+          echo "  - Null AE titles"
+          echo "  - Truncated PDUs"
+          echo "  - Null bytes in UIDs"
+          echo "  - Odd-length UIDs (protocol fuzzing)"
+          echo ""
           python dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
@@ -83,8 +98,39 @@ jobs:
             --debug
         continue-on-error: true
 
-      - name: Run DICOM Fuzzer (C-STORE Mode)
+      - name: Verify server still alive (post-association fuzzing)
+        id: health_check_1
         run: |
+          echo "=== Post-association fuzzing health check ==="
+          if nc -z -w 5 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+            echo "✓ Server port still open"
+            if echoscu -aet HEALTH_CHECK -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }} 2>/dev/null; then
+              echo "✓ Server responding to C-ECHO"
+            else
+              echo "⚠ Server port open but not responding to C-ECHO"
+            fi
+          else
+            echo "✗ SERVER CRASHED - Port not responding!"
+            echo "server_crashed=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Run DICOM Fuzzer (C-STORE Mode)
+        id: fuzz_cstore
+        run: |
+          echo "=== Running C-STORE Fuzzing ==="
+          echo "This tests malformed C-STORE operations including:"
+          echo "  - Valid baseline C-STORE"
+          echo "  - Odd-length SOP Instance UID (raw mode)"
+          echo "  - Wrong presentation context ID (255)"
+          echo "  - Even context ID (protocol violation)"
+          echo "  - Zero-length dataset"
+          echo "  - Corrupted dataset (bit flips)"
+          echo "  - Dataset with odd-length UID elements"
+          echo "  - Data PDV without command"
+          echo "  - Incomplete fragmentation"
+          echo ""
           python dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
@@ -93,6 +139,66 @@ jobs:
             --mode cstore_file \
             --timeout 30 \
             --debug
+        continue-on-error: true
+
+      - name: Verify server still alive (post-C-STORE fuzzing)
+        id: health_check_2
+        run: |
+          echo "=== Post-C-STORE fuzzing health check ==="
+          if nc -z -w 5 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+            echo "✓ Server port still open"
+            if echoscu -aet HEALTH_CHECK -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }} 2>/dev/null; then
+              echo "✓ Server responding to C-ECHO"
+            else
+              echo "⚠ Server port open but not responding to C-ECHO"
+            fi
+          else
+            echo "✗ SERVER CRASHED - Port not responding!"
+            echo "server_crashed=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+        continue-on-error: true
+
+      - name: Run Full Fuzzing Suite (All Modes)
+        id: fuzz_all
+        run: |
+          echo "=== Running Complete Fuzzing Suite ==="
+          python dicom_fuzzer.py \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --calling-ae "FUZZ_ALL_SCU" \
+            --mode all \
+            --timeout 30 \
+            --debug
+        continue-on-error: true
+
+      - name: Final server health check
+        id: health_check_final
+        run: |
+          echo "=== Final health check after all fuzzing ==="
+          CRASHED=false
+          
+          if ! nc -z -w 5 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+            echo "✗ SERVER CRASHED - Port not responding!"
+            CRASHED=true
+          else
+            echo "✓ Server port still open"
+            if echoscu -aet FINAL_CHECK -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }} 2>/dev/null; then
+              echo "✓ Server responding to C-ECHO"
+            else
+              echo "⚠ Server port open but not responding to C-ECHO (may need restart)"
+            fi
+          fi
+          
+          if [ "$CRASHED" = "true" ]; then
+            echo ""
+            echo "=========================================="
+            echo "  ⚠️  POTENTIAL VULNERABILITY FOUND  ⚠️"
+            echo "  Server crashed during fuzzing!"
+            echo "=========================================="
+            echo ""
+          fi
         continue-on-error: true
 
       - name: Stop tcpdump capture
@@ -109,7 +215,14 @@ jobs:
           PCAP_FILE="fuzzer_capture_${{ matrix.dicom_server.name }}.pcap"
           if [[ -f "$PCAP_FILE" ]]; then
             echo "--- PCAP Summary for $PCAP_FILE ---"
-            tshark -r "$PCAP_FILE" -c 100 2>/dev/null || true
+            echo "Total packets captured:"
+            tshark -r "$PCAP_FILE" 2>/dev/null | wc -l || true
+            echo ""
+            echo "First 50 packets:"
+            tshark -r "$PCAP_FILE" -c 50 2>/dev/null || true
+            echo ""
+            echo "DICOM-specific traffic:"
+            tshark -r "$PCAP_FILE" -Y "dicom" -c 20 2>/dev/null || echo "No DICOM dissector matches (raw TCP)"
           else
             echo "No pcap file found: $PCAP_FILE"
           fi
@@ -127,10 +240,66 @@ jobs:
         if: always()
         run: |
           echo "--- ${{ matrix.dicom_server.name }} SCP Logs ---"
-          docker logs dicom-scp-fuzz || echo "Could not get docker logs."
+          echo ""
+          echo "Looking for parsing errors, crashes, or security warnings..."
+          echo ""
+          docker logs dicom-scp-fuzz 2>&1 | tail -200 || echo "Could not get docker logs."
+          echo ""
+          echo "--- Grep for potential issues ---"
+          docker logs dicom-scp-fuzz 2>&1 | grep -iE "(error|warning|crash|abort|segfault|odd|invalid|reject|failed)" | tail -50 || echo "No obvious errors found in logs."
+        continue-on-error: true
+
+      - name: Check for server crash indicators
+        if: always()
+        run: |
+          echo "=== Crash Detection Summary ==="
+          
+          # Check if container is still running
+          if docker ps | grep -q dicom-scp-fuzz; then
+            echo "✓ Container still running"
+          else
+            echo "✗ Container stopped/crashed"
+            echo ""
+            echo "Container exit info:"
+            docker ps -a | grep dicom-scp-fuzz || true
+          fi
+          
+          # Check docker logs for crash indicators
+          echo ""
+          echo "Scanning logs for crash indicators..."
+          CRASH_INDICATORS=$(docker logs dicom-scp-fuzz 2>&1 | grep -ciE "(segmentation fault|core dumped|fatal|panic|killed)" || echo "0")
+          if [ "$CRASH_INDICATORS" -gt "0" ]; then
+            echo "⚠️  Found $CRASH_INDICATORS potential crash indicators in logs!"
+          else
+            echo "✓ No obvious crash indicators found"
+          fi
         continue-on-error: true
 
       - name: Stop container
         if: always()
         run: |
           docker stop dicom-scp-fuzz || echo "Container already stopped."
+
+      - name: Generate fuzzing report
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "       DICOM FUZZING REPORT"
+          echo "=========================================="
+          echo ""
+          echo "Target: ${{ matrix.dicom_server.name }}"
+          echo "Image:  ${{ matrix.dicom_server.image }}"
+          echo "AE Title: ${{ matrix.dicom_server.aet }}"
+          echo "Port: ${{ matrix.dicom_server.port }}"
+          echo ""
+          echo "Test Results:"
+          echo "  Association Fuzzing: ${{ steps.fuzz_association.outcome }}"
+          echo "  C-STORE Fuzzing:     ${{ steps.fuzz_cstore.outcome }}"
+          echo "  Full Suite:          ${{ steps.fuzz_all.outcome }}"
+          echo ""
+          echo "Health Checks:"
+          echo "  Post-Association:    ${{ steps.health_check_1.outcome }}"
+          echo "  Post-C-STORE:        ${{ steps.health_check_2.outcome }}"
+          echo "  Final:               ${{ steps.health_check_final.outcome }}"
+          echo ""
+          echo "=========================================="
