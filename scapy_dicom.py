@@ -61,6 +61,10 @@ __all__ = [
     # Utility functions
     "_pad_ae_title",
     "_uid_to_bytes",
+    # Raw/Fuzzing utilities (no auto-correction)
+    "_uid_to_bytes_raw",
+    "build_c_echo_rq_dimse_raw",
+    "build_c_store_rq_dimse_raw",
 ]
 
 log = logging.getLogger("scapy.contrib.dicom")
@@ -94,7 +98,12 @@ def _pad_ae_title(title):
 
 
 def _uid_to_bytes(uid):
-    """Convert a UID string to bytes, padding to even length if needed."""
+    """
+    Convert a UID string to bytes, padding to even length if needed.
+    
+    Note: This function auto-corrects odd-length UIDs per DICOM spec.
+    For fuzzing with intentionally malformed UIDs, use _uid_to_bytes_raw().
+    """
     if isinstance(uid, bytes):
         b_uid = uid
     elif isinstance(uid, str):
@@ -105,6 +114,25 @@ def _uid_to_bytes(uid):
     if len(b_uid) % 2 != 0:
         b_uid += b"\x00"
     return b_uid
+
+
+def _uid_to_bytes_raw(uid):
+    """
+    Convert a UID string to bytes WITHOUT padding correction.
+    
+    Use this for fuzzing to send intentionally malformed odd-length UIDs.
+    The DICOM spec requires even-length UIDs, so odd-length UIDs will
+    trigger parsing errors on compliant servers.
+    
+    :param uid: UID as string or bytes
+    :return: Raw bytes without any padding correction
+    """
+    if isinstance(uid, bytes):
+        return uid
+    elif isinstance(uid, str):
+        return uid.encode("ascii")
+    else:
+        return b""
 
 
 # --- DIMSE Message Builders ---
@@ -118,6 +146,42 @@ def build_c_echo_rq_dimse(message_id=1):
     """
     elements = [
         (0x0000, 0x0002, _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)),  # Affected SOP Class
+        (0x0000, 0x0100, struct.pack("<H", 0x0030)),  # Command Field: C-ECHO-RQ
+        (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
+        (0x0000, 0x0800, struct.pack("<H", 0x0101)),  # Data Set Type: No dataset
+    ]
+    payload = b"".join(
+        struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
+        for g, e, v in elements
+    )
+    group_len = len(payload)
+    return (
+        struct.pack("<HHI", 0x0000, 0x0000, 4)
+        + struct.pack("<I", group_len)
+        + payload
+    )
+
+
+def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
+    """
+    Build a C-ECHO-RQ DIMSE command message WITHOUT auto-padding.
+    
+    Use this for fuzzing to send intentionally malformed commands.
+    
+    :param message_id: Message ID for the request (default: 1)
+    :param sop_class_uid: Optional custom SOP Class UID (default: Verification)
+                          Pass raw bytes to include odd-length or malformed UIDs.
+    :return: Bytes containing the encoded DIMSE command (no auto-correction)
+    """
+    if sop_class_uid is None:
+        sop_uid_bytes = _uid_to_bytes_raw(VERIFICATION_SOP_CLASS_UID)
+    elif isinstance(sop_class_uid, bytes):
+        sop_uid_bytes = sop_class_uid
+    else:
+        sop_uid_bytes = _uid_to_bytes_raw(sop_class_uid)
+    
+    elements = [
+        (0x0000, 0x0002, sop_uid_bytes),  # Affected SOP Class (raw)
         (0x0000, 0x0100, struct.pack("<H", 0x0030)),  # Command Field: C-ECHO-RQ
         (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
         (0x0000, 0x0800, struct.pack("<H", 0x0101)),  # Data Set Type: No dataset
@@ -150,6 +214,41 @@ def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1):
         (0x0000, 0x0700, struct.pack("<H", 0x0002)),  # Priority: MEDIUM
         (0x0000, 0x0800, struct.pack("<H", 0x0000)),  # Data Set Type: Dataset present
         (0x0000, 0x1000, _uid_to_bytes(sop_instance_uid)),  # Affected SOP Instance
+    ]
+    payload = b"".join(
+        struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
+        for g, e, v in elements
+    )
+    group_len = len(payload)
+    return (
+        struct.pack("<HHI", 0x0000, 0x0000, 4)
+        + struct.pack("<I", group_len)
+        + payload
+    )
+
+
+def build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, message_id=1):
+    """
+    Build a C-STORE-RQ DIMSE command message WITHOUT auto-padding.
+    
+    Use this for fuzzing to send intentionally malformed commands with
+    odd-length UIDs or other protocol violations.
+    
+    :param sop_class_uid: SOP Class UID (bytes or str, no auto-padding)
+    :param sop_instance_uid: SOP Instance UID (bytes or str, no auto-padding)
+    :param message_id: Message ID for the request (default: 1)
+    :return: Bytes containing the encoded DIMSE command (no auto-correction)
+    """
+    sop_class_bytes = sop_class_uid if isinstance(sop_class_uid, bytes) else _uid_to_bytes_raw(sop_class_uid)
+    sop_inst_bytes = sop_instance_uid if isinstance(sop_instance_uid, bytes) else _uid_to_bytes_raw(sop_instance_uid)
+    
+    elements = [
+        (0x0000, 0x0002, sop_class_bytes),  # Affected SOP Class (raw)
+        (0x0000, 0x0100, struct.pack("<H", 0x0001)),  # Command Field: C-STORE-RQ
+        (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
+        (0x0000, 0x0700, struct.pack("<H", 0x0002)),  # Priority: MEDIUM
+        (0x0000, 0x0800, struct.pack("<H", 0x0000)),  # Data Set Type: Dataset present
+        (0x0000, 0x1000, sop_inst_bytes),  # Affected SOP Instance (raw)
     ]
     payload = b"".join(
         struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
@@ -464,9 +563,14 @@ class DICOMSession:
             status = session.c_echo()
             print(f"C-ECHO status: {status}")
             session.release()
+    
+    For protocol fuzzing, use raw_mode=True to disable auto-corrections::
+    
+        session = DICOMSession("192.168.1.100", 104, "TARGET_AE", raw_mode=True)
     """
 
-    def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", read_timeout=10):
+    def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", 
+                 read_timeout=10, raw_mode=False):
         """
         Initialize a DICOM session.
 
@@ -475,7 +579,7 @@ class DICOMSession:
         :param dst_ae: Destination Application Entity title
         :param src_ae: Source Application Entity title (default: "SCAPY_SCU")
         :param read_timeout: Socket read timeout in seconds (default: 10)
-        :param max_pdu_length: Maximum PDU length to propose (default: 16384)
+        :param raw_mode: If True, disable auto-corrections for fuzzing (default: False)
         """
         self.dst_ip = dst_ip
         self.dst_port = dst_port
@@ -489,6 +593,12 @@ class DICOMSession:
         self._current_message_id_counter = int(time.time()) % 50000
         self._proposed_max_pdu = 16384
         self.max_pdu_length = 16384  # Will be updated during association
+        self.raw_mode = raw_mode
+        
+        # FIX: Track the mapping of context ID -> abstract syntax as we propose them
+        # This fixes the "Bad Presentation Context ID" bug where we previously
+        # used brittle math ((ctx_id - 1) // 2) to guess the mapping
+        self._proposed_context_map = {}  # ctx_id -> abstract_syntax_uid
 
     def connect(self):
         """
@@ -546,6 +656,17 @@ class DICOMSession:
     def _send_pdu(self, pkt):
         """Send a DICOM PDU packet."""
         self.sock.sendall(bytes(pkt))
+    
+    def send_raw_bytes(self, raw_bytes):
+        """
+        Send raw bytes directly to the socket without any processing.
+        
+        Use this for fuzzing to send completely malformed PDUs that
+        bypass Scapy's packet construction.
+        
+        :param raw_bytes: Raw bytes to send
+        """
+        self.sock.sendall(raw_bytes)
 
     def associate(self, requested_contexts=None):
         """
@@ -564,14 +685,20 @@ class DICOMSession:
                 VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]
             }
 
+        # Clear previous mapping
+        self._proposed_context_map = {}
+
         # Build variable items
         variable_items = [
             DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))
         ]
 
-        # Build presentation contexts
+        # Build presentation contexts and track the mapping
         ctx_id = 1
         for abs_syntax, trn_syntaxes in requested_contexts.items():
+            # FIX: Store the mapping BEFORE we increment ctx_id
+            self._proposed_context_map[ctx_id] = abs_syntax
+            
             sub_items_data = bytes(
                 DICOMVariableItem(item_type=0x30, data=_uid_to_bytes(abs_syntax))
             )
@@ -607,7 +734,7 @@ class DICOMSession:
             response = DICOM(response_data)
             if response.haslayer(A_ASSOCIATE_AC):
                 self.assoc_established = True
-                self._parse_accepted_contexts(response, requested_contexts)
+                self._parse_accepted_contexts(response)
                 self._parse_max_pdu_length(response)
                 return True
             elif response.haslayer(A_ASSOCIATE_RJ):
@@ -651,8 +778,13 @@ class DICOMSession:
         # Keep default if parsing fails
         self.max_pdu_length = self._proposed_max_pdu
 
-    def _parse_accepted_contexts(self, response, requested_contexts):
-        """Parse accepted presentation contexts from A-ASSOCIATE-AC."""
+    def _parse_accepted_contexts(self, response):
+        """
+        Parse accepted presentation contexts from A-ASSOCIATE-AC.
+        
+        FIX: Uses the stored _proposed_context_map to correctly map
+        context IDs to abstract syntaxes, instead of brittle math.
+        """
         for item in response[A_ASSOCIATE_AC].variable_items:
             # Presentation Context Accept item (0x21)
             if item.item_type == 0x21:
@@ -664,13 +796,20 @@ class DICOMSession:
                 ctx_id = item_data[0]
                 result = item_data[2]
                 if result != 0:  # Not accepted
+                    log.debug("Presentation context %d rejected (result=%d)", ctx_id, result)
                     continue
-                # Find corresponding abstract syntax
-                abs_syntax_key_list = list(requested_contexts.keys())
-                key_index = (ctx_id - 1) // 2
-                if key_index >= len(abs_syntax_key_list):
+                
+                # FIX: Look up the abstract syntax from our stored mapping
+                # instead of using brittle math ((ctx_id - 1) // 2)
+                abs_syntax = self._proposed_context_map.get(ctx_id)
+                if abs_syntax is None:
+                    log.warning(
+                        "Server accepted context ID %d which we didn't propose! "
+                        "This may indicate a server bug or a protocol attack.",
+                        ctx_id
+                    )
                     continue
-                abs_syntax = abs_syntax_key_list[key_index]
+                
                 # Parse transfer syntax from sub-item
                 ts_item_data = item_data[4:]
                 if len(ts_item_data) > 4:
@@ -680,6 +819,10 @@ class DICOMSession:
                         ts_data = ts_data.encode("latin-1")
                     ts_uid = ts_data.rstrip(b"\x00").decode("ascii")
                     self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
+                    log.debug(
+                        "Accepted context %d: %s with transfer syntax %s",
+                        ctx_id, abs_syntax, ts_uid
+                    )
 
     def _get_next_message_id(self):
         """Get the next message ID for DIMSE commands."""
@@ -768,7 +911,12 @@ class DICOMSession:
             return None
 
         msg_id = self._get_next_message_id()
-        dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
+        
+        # Use raw builder in raw_mode to allow malformed UIDs
+        if self.raw_mode:
+            dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
+        else:
+            dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
 
         # Command PDV (is_last=True means last fragment of command)
         cmd_pdv = PresentationDataValueItem(
@@ -829,6 +977,73 @@ class DICOMSession:
                         data = data.encode("latin-1")
                     return parse_dimse_status(data)
         return None
+    
+    def c_store_raw(self, dataset_bytes, sop_class_uid, sop_instance_uid,
+                    context_id, skip_padding=True):
+        """
+        Send a raw C-STORE request for fuzzing purposes.
+        
+        This method allows full control over the PDV construction,
+        enabling fuzzing of:
+        - Arbitrary context IDs (including non-negotiated ones)
+        - Odd-length UIDs
+        - Malformed dataset payloads
+        
+        :param dataset_bytes: Raw bytes of the DICOM dataset (no auto-correction)
+        :param sop_class_uid: SOP Class UID (bytes or str, no auto-padding if skip_padding)
+        :param sop_instance_uid: SOP Instance UID (bytes or str, no auto-padding if skip_padding)
+        :param context_id: Explicit context ID to use (can be any value for fuzzing)
+        :param skip_padding: If True, don't auto-pad UIDs to even length
+        :return: Status code or None
+        """
+        if not self.assoc_established:
+            log.error("Association not established")
+            return None
+
+        msg_id = self._get_next_message_id()
+        
+        # Build command with optional padding skip
+        if skip_padding:
+            dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
+        else:
+            dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
+
+        # Command PDV with explicit context ID
+        cmd_pdv = PresentationDataValueItem(
+            context_id=context_id,
+            data=dimse_rq,
+            is_command=True,
+            is_last=True,
+        )
+        pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
+        self._send_pdu(pdata_cmd)
+
+        # Data PDV - send as single chunk for fuzzing (no fragmentation logic)
+        data_pdv = PresentationDataValueItem(
+            context_id=context_id,
+            data=dataset_bytes,
+            is_command=False,
+            is_last=True,
+        )
+        pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
+        self._send_pdu(pdata_data)
+
+        response_data = self._recv_pdu()
+
+        if response_data:
+            response = DICOM(response_data)
+            if response.haslayer(P_DATA_TF):
+                pdv_items = response[P_DATA_TF].pdv_items
+                if pdv_items:
+                    pdv_rsp = pdv_items[0]
+                    data = pdv_rsp.data
+                    if isinstance(data, str):
+                        data = data.encode("latin-1")
+                    return parse_dimse_status(data)
+            elif response.haslayer(A_ABORT):
+                log.info("Server aborted connection (expected for malformed data)")
+                return None
+        return None
 
     def release(self):
         """
@@ -886,4 +1101,4 @@ if __name__ == "__main__":
         session.release()
         print("Association released")
     else:
-        print("Association failed")        
+        print("Association failed")

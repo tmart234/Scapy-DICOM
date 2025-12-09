@@ -6,6 +6,12 @@ DICOM Protocol Fuzzer
 A fuzzing tool for testing DICOM SCP implementations using the scapy_dicom module.
 Supports association handshake fuzzing and C-STORE operations with malformed data.
 
+This fuzzer now properly supports:
+- Fuzzing arbitrary context IDs (including non-negotiated ones)
+- Odd-length UIDs (bypassing auto-padding)
+- Raw PDU injection for protocol-level attacks
+- Malformed dataset payloads
+
 Usage:
     python dicom_fuzzer.py --ip 127.0.0.1 --port 4242 --ae-title ORTHANC --mode all
 """
@@ -37,8 +43,10 @@ try:
         DEFAULT_TRANSFER_SYNTAX_UID,
         VERIFICATION_SOP_CLASS_UID,
         build_c_store_rq_dimse,
+        build_c_store_rq_dimse_raw,
         _pad_ae_title,
         _uid_to_bytes,
+        _uid_to_bytes_raw,
     )
 except ImportError as e:
     print(
@@ -210,6 +218,31 @@ def build_presentation_context_item(ctx_id, abstract_syntax, transfer_syntaxes):
     for ts in transfer_syntaxes:
         sub_items += bytes(
             DICOMVariableItem(item_type=0x40, data=_uid_to_bytes(ts))
+        )
+
+    # Presentation context header: ID, reserved, reserved, reserved
+    pctx_data = struct.pack("!BBBB", ctx_id, 0, 0, 0) + sub_items
+    return DICOMVariableItem(item_type=0x20, data=pctx_data)
+
+
+def build_presentation_context_item_raw(ctx_id, abstract_syntax, transfer_syntaxes):
+    """
+    Build a Presentation Context Item WITHOUT auto-padding (for fuzzing).
+
+    :param ctx_id: Presentation Context ID (any value for fuzzing)
+    :param abstract_syntax: Abstract Syntax UID (bytes or str, no auto-padding)
+    :param transfer_syntaxes: List of Transfer Syntax UIDs (no auto-padding)
+    :return: DICOMVariableItem for the presentation context
+    """
+    # Build sub-items with raw UIDs (no padding)
+    abs_bytes = abstract_syntax if isinstance(abstract_syntax, bytes) else _uid_to_bytes_raw(abstract_syntax)
+    sub_items = bytes(
+        DICOMVariableItem(item_type=0x30, data=abs_bytes)
+    )
+    for ts in transfer_syntaxes:
+        ts_bytes = ts if isinstance(ts, bytes) else _uid_to_bytes_raw(ts)
+        sub_items += bytes(
+            DICOMVariableItem(item_type=0x40, data=ts_bytes)
         )
 
     # Presentation context header: ID, reserved, reserved, reserved
@@ -478,7 +511,8 @@ def fuzz_association_handshake(session_args):
             raw_bytes[2:6] = struct.pack("!I", actual_len + 10000)
 
             script_log.debug("Sending AARQ with inflated length field")
-            session.sock.sendall(bytes(raw_bytes))
+            # Use send_raw_bytes for direct injection
+            session.send_raw_bytes(bytes(raw_bytes))
 
             # Server should timeout waiting for more data or reject
             response_data = session._recv_pdu()
@@ -511,7 +545,7 @@ def fuzz_association_handshake(session_args):
             unknown_pdu = struct.pack("!BBI", 0xFF, 0, 4) + b"\x00\x00\x00\x00"
 
             script_log.debug("Sending unknown PDU type 0xFF")
-            session.sock.sendall(unknown_pdu)
+            session.send_raw_bytes(unknown_pdu)
             response_data = session._recv_pdu()
 
             if response_data:
@@ -591,7 +625,7 @@ def fuzz_association_handshake(session_args):
             truncated = b"\x01\x00\x00"
 
             script_log.debug("Sending truncated PDU (3 bytes)")
-            session.sock.sendall(truncated)
+            session.send_raw_bytes(truncated)
 
             # Wait briefly then check for response or connection close
             import time
@@ -655,6 +689,54 @@ def fuzz_association_handshake(session_args):
         except Exception as e:
             script_log.error(f"Error: {e}")
             results["errors"] += 1
+        finally:
+            session.close()
+
+    # --- NEW Test Case 10: Odd-Length UID in Presentation Context (FUZZING) ---
+    script_log.info("Test Case 10: Odd-Length UID in Presentation Context (Protocol Fuzzing)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+        raw_mode=True,  # Enable raw mode for fuzzing
+    )
+    if session.connect():
+        try:
+            # Create a presentation context with an ODD-LENGTH UID
+            # This should trigger "W: DcmItem: Length of element is odd" errors
+            odd_length_uid = b"1.2.840.10008.1"  # 15 bytes (odd!)
+            
+            variable_items = [
+                DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)),
+                build_presentation_context_item_raw(
+                    1, odd_length_uid, [b"1.2.840.10008.1.2"]  # Also raw
+                ),
+                build_user_info_item(),
+            ]
+            aarq = A_ASSOCIATE_RQ(
+                called_ae_title=_pad_ae_title(session_args["ae_title"]),
+                calling_ae_title=_pad_ae_title(session_args["calling_ae"]),
+                variable_items=variable_items,
+            )
+            pkt = DICOM() / aarq
+
+            script_log.debug("Sending AARQ with odd-length UID (15 bytes)")
+            session._send_pdu(pkt)
+            response_data = session._recv_pdu()
+
+            if response_data:
+                response = DICOM(response_data)
+                script_log.info(f"Received response: {response.summary()}")
+                script_log.info("[PASS] Server handled odd-length UID (check logs for parsing errors).")
+                results["passed"] += 1
+            else:
+                script_log.info("[PASS] Server rejected/closed on odd-length UID.")
+                results["passed"] += 1
+        except Exception as e:
+            script_log.info(f"[PASS] Exception with odd-length UID: {e}")
+            results["passed"] += 1
         finally:
             session.close()
 
@@ -839,6 +921,39 @@ def create_minimal_dataset_bytes():
     return b"".join(elements)
 
 
+def create_minimal_dataset_bytes_raw(sop_class_uid=None, sop_instance_uid=None):
+    """
+    Create minimal DICOM dataset bytes WITHOUT auto-padding.
+    
+    Use this for fuzzing to create datasets with odd-length UIDs.
+    
+    :param sop_class_uid: Optional SOP Class UID (bytes, no auto-padding)
+    :param sop_instance_uid: Optional SOP Instance UID (bytes, no auto-padding)
+    :return: Raw dataset bytes
+    """
+    elements = []
+    
+    # (0008,0016) SOP Class UID
+    sop_class = sop_class_uid or b"1.2.840.10008.5.1.4.1.1.7"
+    # NO PADDING - intentionally allow odd length for fuzzing
+    elements.append(struct.pack("<HHI", 0x0008, 0x0016, len(sop_class)) + sop_class)
+    
+    # (0008,0018) SOP Instance UID
+    sop_inst = sop_instance_uid or f"1.2.3.999.{os.getpid()}".encode()
+    # NO PADDING
+    elements.append(struct.pack("<HHI", 0x0008, 0x0018, len(sop_inst)) + sop_inst)
+    
+    # (0020,000D) Study Instance UID
+    study_uid = b"1.2.3.4.5.6.7.8.9.10"
+    elements.append(struct.pack("<HHI", 0x0020, 0x000D, len(study_uid)) + study_uid)
+    
+    # (0020,000E) Series Instance UID
+    series_uid = b"1.2.3.4.5.6.7.8.9.11"
+    elements.append(struct.pack("<HHI", 0x0020, 0x000E, len(series_uid)) + series_uid)
+    
+    return b"".join(elements)
+
+
 def fuzz_cstore_with_file(session_args, dcm_file_path):
     """
     Attempt C-STORE with a (potentially malformed) DICOM file.
@@ -905,41 +1020,130 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
     finally:
         session.close()
 
-    # --- Test Case 2: Truncated Dataset ---
-    script_log.info("Test Case 2: Truncated Dataset (half the data)")
+    # --- NEW Test Case 2: Odd-Length SOP Instance UID in C-STORE (FUZZING) ---
+    script_log.info("Test Case 2: Odd-Length SOP Instance UID in C-STORE Command")
     session = DICOMSession(
         dst_ip=session_args["ip"],
         dst_port=session_args["port"],
         dst_ae=session_args["ae_title"],
         src_ae=session_args["calling_ae"],
         read_timeout=session_args["timeout"],
+        raw_mode=True,  # Enable raw mode
     )
     try:
         if session.associate(requested_contexts=requested_contexts):
-            truncated_data = data_bytes[:len(data_bytes) // 2]
-            store_status = session.c_store(
-                dataset_bytes=truncated_data,
-                sop_class_uid=sop_class,
-                sop_instance_uid=sop_instance + ".truncated",
-                transfer_syntax_uid=ts_uid,
-            )
-            if store_status is not None:
-                script_log.info(f"[PASS] Server handled truncated data: 0x{store_status:04X}")
+            # Find a valid context ID
+            ctx_id = None
+            for cid, (abs_syn, _) in session.accepted_contexts.items():
+                if abs_syn == sop_class:
+                    ctx_id = cid
+                    break
+            
+            if ctx_id:
+                # Create an ODD-LENGTH SOP Instance UID (17 bytes)
+                odd_sop_instance = b"1.2.3.4.5.6.7.8.9"  # 17 bytes - odd!
+                
+                script_log.info(f"  Using odd-length SOP Instance UID: {len(odd_sop_instance)} bytes")
+                
+                # Use the raw c_store method
+                store_status = session.c_store_raw(
+                    dataset_bytes=data_bytes,
+                    sop_class_uid=sop_class,
+                    sop_instance_uid=odd_sop_instance,
+                    context_id=ctx_id,
+                    skip_padding=True,  # Don't auto-pad!
+                )
+                
+                if store_status is not None:
+                    script_log.info(f"[INFO] Server handled odd-length UID: 0x{store_status:04X}")
+                else:
+                    script_log.info("[PASS] Server rejected odd-length UID (expected).")
                 results["passed"] += 1
             else:
-                script_log.info("[PASS] Server rejected truncated data (None response).")
-                results["passed"] += 1
+                script_log.warning("[WARN] No valid context found.")
+                results["failed"] += 1
             session.release()
         else:
             results["failed"] += 1
     except Exception as e:
-        script_log.info(f"[PASS] Server rejected truncated data: {e}")
+        script_log.info(f"[PASS] Exception with odd-length UID: {e}")
         results["passed"] += 1
     finally:
         session.close()
 
-    # --- Test Case 3: Zero-Length Dataset ---
-    script_log.info("Test Case 3: Zero-Length Dataset")
+    # --- Test Case 3: Wrong Presentation Context ID (Non-Negotiated) ---
+    script_log.info("Test Case 3: Wrong Presentation Context ID (255 - non-negotiated)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+        raw_mode=True,
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            # Use context ID 255 which was NEVER negotiated
+            # This should trigger "Bad presentation context ID" error
+            store_status = session.c_store_raw(
+                dataset_bytes=data_bytes,
+                sop_class_uid=sop_class,
+                sop_instance_uid=sop_instance + ".wrongctx",
+                context_id=255,  # Invalid - not negotiated!
+                skip_padding=False,
+            )
+            
+            if store_status is None:
+                script_log.info("[PASS] Server rejected invalid context ID 255.")
+                results["passed"] += 1
+            else:
+                script_log.warning(f"[WARN] Server accepted invalid context: 0x{store_status:04X}")
+                results["failed"] += 1
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected invalid context: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 4: Even Context ID (Protocol Violation) ---
+    script_log.info("Test Case 4: Even Context ID (Protocol Violation - IDs must be odd)")
+    session = DICOMSession(
+        dst_ip=session_args["ip"],
+        dst_port=session_args["port"],
+        dst_ae=session_args["ae_title"],
+        src_ae=session_args["calling_ae"],
+        read_timeout=session_args["timeout"],
+        raw_mode=True,
+    )
+    try:
+        if session.associate(requested_contexts=requested_contexts):
+            # Use context ID 2 (even number - protocol violation!)
+            store_status = session.c_store_raw(
+                dataset_bytes=data_bytes,
+                sop_class_uid=sop_class,
+                sop_instance_uid=sop_instance + ".evenctx",
+                context_id=2,  # Even number - invalid per DICOM spec!
+                skip_padding=False,
+            )
+            
+            if store_status is None:
+                script_log.info("[PASS] Server rejected even context ID.")
+                results["passed"] += 1
+            else:
+                script_log.warning(f"[WARN] Server accepted even context ID: 0x{store_status:04X}")
+                results["failed"] += 1
+        else:
+            results["failed"] += 1
+    except Exception as e:
+        script_log.info(f"[PASS] Server rejected even context ID: {e}")
+        results["passed"] += 1
+    finally:
+        session.close()
+
+    # --- Test Case 5: Zero-Length Dataset ---
+    script_log.info("Test Case 5: Zero-Length Dataset")
     session = DICOMSession(
         dst_ip=session_args["ip"],
         dst_port=session_args["port"],
@@ -969,8 +1173,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
     finally:
         session.close()
 
-    # --- Test Case 4: Corrupted Dataset (bit flips) ---
-    script_log.info("Test Case 4: Corrupted Dataset (random bit flips)")
+    # --- Test Case 6: Corrupted Dataset (bit flips) ---
+    script_log.info("Test Case 6: Corrupted Dataset (random bit flips)")
     session = DICOMSession(
         dst_ip=session_args["ip"],
         dst_port=session_args["port"],
@@ -1006,114 +1210,61 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
     finally:
         session.close()
 
-    # --- Test Case 5: Invalid SOP Class UID ---
-    script_log.info("Test Case 5: Invalid SOP Class UID in C-STORE command")
+    # --- Test Case 7: Dataset with Odd-Length UID Element (FUZZING) ---
+    script_log.info("Test Case 7: Dataset with Odd-Length UID Element (Tag 0008,0016)")
     session = DICOMSession(
         dst_ip=session_args["ip"],
         dst_port=session_args["port"],
         dst_ae=session_args["ae_title"],
         src_ae=session_args["calling_ae"],
         read_timeout=session_args["timeout"],
+        raw_mode=True,
     )
     try:
         if session.associate(requested_contexts=requested_contexts):
-            # Use a bogus SOP Class UID that wasn't negotiated
-            bogus_sop_class = "1.2.3.4.5.6.7.8.9.INVALID"
-            store_status = session.c_store(
-                dataset_bytes=data_bytes,
-                sop_class_uid=bogus_sop_class,
-                sop_instance_uid=sop_instance + ".invalid_class",
-                transfer_syntax_uid=ts_uid,
-            )
-            # Should fail because context wasn't negotiated
-            if store_status is None:
-                script_log.info("[PASS] Server rejected invalid SOP Class (no context).")
+            ctx_id = None
+            for cid, (abs_syn, _) in session.accepted_contexts.items():
+                if abs_syn == sop_class:
+                    ctx_id = cid
+                    break
+            
+            if ctx_id:
+                # Create dataset with ODD-LENGTH SOP Class UID in the payload
+                # This triggers "W: DcmItem: Length of element (0008,0016) is odd"
+                odd_sop_class_in_dataset = b"1.2.840.10008.5.1.4.1.1"  # 23 bytes - odd!
+                
+                malformed_dataset = create_minimal_dataset_bytes_raw(
+                    sop_class_uid=odd_sop_class_in_dataset,
+                    sop_instance_uid=b"1.2.3.4.5.6.7.8.9",  # Also odd (17 bytes)
+                )
+                
+                script_log.info(f"  Dataset SOP Class UID length: {len(odd_sop_class_in_dataset)} bytes (odd)")
+                
+                store_status = session.c_store_raw(
+                    dataset_bytes=malformed_dataset,
+                    sop_class_uid=sop_class,
+                    sop_instance_uid=b"1.2.3.4.5.6.7.8.9",
+                    context_id=ctx_id,
+                    skip_padding=True,
+                )
+                
+                if store_status is not None:
+                    script_log.info(f"[INFO] Server handled odd-length dataset element: 0x{store_status:04X}")
+                else:
+                    script_log.info("[PASS] Server rejected odd-length dataset element.")
                 results["passed"] += 1
             else:
-                script_log.warning(f"[WARN] Server accepted invalid SOP Class: 0x{store_status:04X}")
                 results["failed"] += 1
             session.release()
         else:
             results["failed"] += 1
     except Exception as e:
-        script_log.info(f"[PASS] Exception with invalid SOP Class: {e}")
+        script_log.info(f"[PASS] Exception with odd-length dataset: {e}")
         results["passed"] += 1
     finally:
         session.close()
 
-    # --- Test Case 6: Null Bytes in SOP Instance UID ---
-    script_log.info("Test Case 6: Null Bytes in SOP Instance UID")
-    session = DICOMSession(
-        dst_ip=session_args["ip"],
-        dst_port=session_args["port"],
-        dst_ae=session_args["ae_title"],
-        src_ae=session_args["calling_ae"],
-        read_timeout=session_args["timeout"],
-    )
-    try:
-        if session.associate(requested_contexts=requested_contexts):
-            null_uid = "1.2.3\x00.4.5.6.NULL"
-            store_status = session.c_store(
-                dataset_bytes=data_bytes,
-                sop_class_uid=sop_class,
-                sop_instance_uid=null_uid,
-                transfer_syntax_uid=ts_uid,
-            )
-            if store_status is not None:
-                script_log.info(f"[INFO] Server handled null UID: 0x{store_status:04X}")
-            else:
-                script_log.info("[PASS] Server rejected null UID.")
-            results["passed"] += 1
-            session.release()
-        else:
-            results["failed"] += 1
-    except Exception as e:
-        script_log.info(f"[PASS] Server rejected null UID: {e}")
-        results["passed"] += 1
-    finally:
-        session.close()
-
-    # --- Test Case 7: Oversized Single Element ---
-    script_log.info("Test Case 7: Oversized dataset element (64KB value)")
-    session = DICOMSession(
-        dst_ip=session_args["ip"],
-        dst_port=session_args["port"],
-        dst_ae=session_args["ae_title"],
-        src_ae=session_args["calling_ae"],
-        read_timeout=session_args["timeout"],
-    )
-    try:
-        if session.associate(requested_contexts=requested_contexts):
-            # Create dataset with oversized Patient Name (64KB)
-            oversized_name = b"X" * 65536
-            if len(oversized_name) % 2:
-                oversized_name += b" "
-            oversized_data = (
-                struct.pack("<HHI", 0x0008, 0x0016, len(sop_class.encode())) + 
-                sop_class.encode().ljust(len(sop_class) + (len(sop_class) % 2), b'\x00') +
-                struct.pack("<HHI", 0x0010, 0x0010, len(oversized_name)) + oversized_name
-            )
-            store_status = session.c_store(
-                dataset_bytes=oversized_data,
-                sop_class_uid=sop_class,
-                sop_instance_uid=sop_instance + ".oversized",
-                transfer_syntax_uid=ts_uid,
-            )
-            if store_status is not None:
-                script_log.info(f"[PASS] Server handled oversized element: 0x{store_status:04X}")
-            else:
-                script_log.info("[PASS] Server rejected oversized element.")
-            results["passed"] += 1
-            session.release()
-        else:
-            results["failed"] += 1
-    except Exception as e:
-        script_log.info(f"[PASS] Server rejected oversized element: {e}")
-        results["passed"] += 1
-    finally:
-        session.close()
-
-    # --- Test Case 8: Send data without command (raw PDV attack) ---
+    # --- Test Case 8: Data PDV without preceding Command PDV ---
     script_log.info("Test Case 8: Data PDV without preceding Command PDV")
     session = DICOMSession(
         dst_ip=session_args["ip"],
@@ -1165,52 +1316,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
     finally:
         session.close()
 
-    # --- Test Case 9: Wrong Presentation Context ID ---
-    script_log.info("Test Case 9: Wrong Presentation Context ID")
-    session = DICOMSession(
-        dst_ip=session_args["ip"],
-        dst_port=session_args["port"],
-        dst_ae=session_args["ae_title"],
-        src_ae=session_args["calling_ae"],
-        read_timeout=session_args["timeout"],
-    )
-    try:
-        if session.associate(requested_contexts=requested_contexts):
-            # Use context ID 255 which was never negotiated
-            msg_id = session._get_next_message_id()
-            dimse_cmd = build_c_store_rq_dimse(sop_class, sop_instance + ".wrongctx", msg_id)
-            
-            cmd_pdv = PresentationDataValueItem(
-                context_id=255,  # Invalid context
-                data=dimse_cmd,
-                is_command=True,
-                is_last=True,
-            )
-            pdata = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
-            session._send_pdu(pdata)
-            
-            response = session._recv_pdu()
-            if response:
-                resp_pkt = DICOM(response)
-                if resp_pkt.haslayer(A_ABORT):
-                    script_log.info("[PASS] Server aborted on invalid context ID.")
-                    results["passed"] += 1
-                else:
-                    script_log.info(f"[INFO] Server response: {resp_pkt.summary()}")
-                    results["passed"] += 1
-            else:
-                script_log.info("[PASS] Server closed/timed out (expected).")
-                results["passed"] += 1
-        else:
-            results["failed"] += 1
-    except Exception as e:
-        script_log.info(f"[PASS] Server rejected invalid context: {e}")
-        results["passed"] += 1
-    finally:
-        session.close()
-
-    # --- Test Case 10: Interleaved fragments from different associations ---
-    script_log.info("Test Case 10: Fragment marked as 'not last' then close connection")
+    # --- Test Case 9: Fragment marked as 'not last' then close connection ---
+    script_log.info("Test Case 9: Fragment marked as 'not last' then close connection")
     session = DICOMSession(
         dst_ip=session_args["ip"],
         dst_port=session_args["port"],
