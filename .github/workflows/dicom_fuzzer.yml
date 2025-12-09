@@ -267,7 +267,8 @@ jobs:
           # Check docker logs for crash indicators
           echo ""
           echo "Scanning logs for crash indicators..."
-          CRASH_INDICATORS=$(docker logs dicom-scp-fuzz 2>&1 | grep -ciE "(segmentation fault|core dumped|fatal|panic|killed)" || echo "0")
+          CRASH_INDICATORS=$(docker logs dicom-scp-fuzz 2>&1 | grep -ciE "..." || true)
+          CRASH_INDICATORS=${CRASH_INDICATORS:-0}
           if [ "$CRASH_INDICATORS" -gt "0" ]; then
             echo "⚠️  Found $CRASH_INDICATORS potential crash indicators in logs!"
           else
