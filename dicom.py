@@ -18,13 +18,15 @@ import logging
 import socket
 import struct
 import time
-from io import BytesIO
 
-from scapy.packet import Packet, NoPayload, bind_layers
+from scapy.packet import Packet, bind_layers
 from scapy.fields import (
+    BitField,
     ByteEnumField,
     ByteField,
+    FieldLenField,
     IntField,
+    PacketListField,
     ShortField,
     StrFixedLenField,
     StrLenField,
@@ -50,8 +52,6 @@ __all__ = [
     "A_RELEASE_RQ",
     "A_RELEASE_RP",
     "A_ABORT",
-    "P_DATA_TF",
-    "PresentationDataValueItem",
     # Session helper
     "DICOMSession",
     # DIMSE builders
@@ -313,20 +313,59 @@ class DICOMVariableItem(Packet):
     DICOM Variable Item used in A-ASSOCIATE PDUs.
 
     Used for Application Context, Presentation Context, and User Information items.
+    
+    Item Types:
+        0x10: Application Context
+        0x20: Presentation Context (in RQ)
+        0x21: Presentation Context (in AC)
+        0x30: Abstract Syntax
+        0x40: Transfer Syntax
+        0x50: User Information
+        0x51: Maximum Length Sub-Item
+        0x52: Implementation Class UID
+        0x55: Implementation Version Name
+        0x56: User Identity Negotiation
     """
     name = "DICOM Variable Item"
     fields_desc = [
         ByteField("item_type", 0x10),
         ByteField("reserved", 0),
-        ShortField("length", None),
-        StrLenField("data", b"", length_from=lambda pkt: pkt.length),
+        FieldLenField("length", None, length_of="data", fmt="!H"),
+        StrLenField("data", b"", length_from=lambda pkt: pkt.length or 0),
     ]
 
-    def post_build(self, pkt, pay):
-        if self.length is None:
-            length = len(self.data) if self.data else 0
-            pkt = pkt[:2] + struct.pack("!H", length) + pkt[4:]
-        return pkt + pay
+    def extract_padding(self, s):
+        """Return remaining data for next packet in list."""
+        return b"", s
+
+
+class PresentationDataValueItem(Packet):
+    """
+    Presentation Data Value Item within a P-DATA-TF PDU.
+
+    Contains context ID, message control header, and the actual DIMSE data.
+    
+    Message Control Header bits:
+        Bit 0 (is_command): 1 = Command message, 0 = Data message
+        Bit 1 (is_last): 1 = Last fragment, 0 = More fragments follow
+    """
+    name = "PresentationDataValueItem"
+    fields_desc = [
+        # Length field: includes context_id (1) + control header (1) + data
+        FieldLenField("length", None, length_of="data", fmt="!I",
+                      adjust=lambda pkt, x: x + 2),
+        ByteField("context_id", 1),
+        # Message control header as bit fields (MSB to LSB)
+        BitField("reserved_bits", 0, 6),
+        BitField("is_last", 0, 1),
+        BitField("is_command", 0, 1),
+        StrLenField("data", b"",
+                    length_from=lambda pkt: max(0, (pkt.length or 2) - 2)),
+    ]
+
+    def extract_padding(self, s):
+        """Return remaining data for next packet in list."""
+        return b"", s
 
 
 class A_ASSOCIATE_RQ(Packet):
@@ -342,53 +381,38 @@ class A_ASSOCIATE_RQ(Packet):
         StrFixedLenField("called_ae_title", b"", 16),
         StrFixedLenField("calling_ae_title", b"", 16),
         StrFixedLenField("reserved2", b"\x00" * 32, 32),
-        StrLenField(
-            "variable_items_payload",
-            b"",
-            length_from=lambda pkt: pkt.underlayer.length - 68 if pkt.underlayer else 0,
-        ),
+        # DICOM allows up to 128 presentation contexts, plus app context and user info
+        # Use max_count=256 to allow for all standard items plus some headroom
+        PacketListField("variable_items", [],
+                        DICOMVariableItem,
+                        max_count=256,
+                        length_from=lambda pkt: (pkt.underlayer.length - 68
+                                                  if pkt.underlayer and pkt.underlayer.length
+                                                  else 0)),
     ]
 
-    def __init__(self, *args, variable_items=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        if variable_items is not None:
-            self.variable_items = variable_items
 
-    @property
-    def variable_items(self):
-        """Parse variable_items_payload into a list of DICOMVariableItem packets."""
-        items = []
-        data = self.variable_items_payload
-        if isinstance(data, str):
-            data = data.encode("latin-1")
-        stream = BytesIO(data)
-        while stream.tell() < len(data):
-            try:
-                header = stream.read(4)
-                if len(header) < 4:
-                    break
-                _, _, item_length = struct.unpack("!BBH", header)
-                item_data = stream.read(item_length)
-                if len(item_data) < item_length:
-                    break
-                items.append(DICOMVariableItem(header + item_data))
-            except Exception:
-                break
-        return items
-
-    @variable_items.setter
-    def variable_items(self, items_list):
-        """Serialize a list of DICOMVariableItem packets to variable_items_payload."""
-        self.variable_items_payload = b"".join(bytes(item) for item in items_list)
-
-
-class A_ASSOCIATE_AC(A_ASSOCIATE_RQ):
+class A_ASSOCIATE_AC(Packet):
     """
     A-ASSOCIATE-AC PDU for accepting an association.
 
     Has the same structure as A-ASSOCIATE-RQ.
     """
     name = "A-ASSOCIATE-AC"
+    fields_desc = [
+        ShortField("protocol_version", 1),
+        ShortField("reserved1", 0),
+        StrFixedLenField("called_ae_title", b"", 16),
+        StrFixedLenField("calling_ae_title", b"", 16),
+        StrFixedLenField("reserved2", b"\x00" * 32, 32),
+        # DICOM allows up to 128 presentation contexts, plus app context and user info
+        PacketListField("variable_items", [],
+                        DICOMVariableItem,
+                        max_count=256,
+                        length_from=lambda pkt: (pkt.underlayer.length - 68
+                                                  if pkt.underlayer and pkt.underlayer.length
+                                                  else 0)),
+    ]
 
 
 class A_ASSOCIATE_RJ(Packet):
@@ -406,68 +430,6 @@ class A_ASSOCIATE_RJ(Packet):
     ]
 
 
-class PresentationDataValueItem(Packet):
-    """
-    Presentation Data Value Item within a P-DATA-TF PDU.
-
-    Contains context ID, message control header, and the actual DIMSE data.
-    """
-    name = "PresentationDataValueItem"
-    fields_desc = [
-        IntField("length", None),
-        ByteField("context_id", 1),
-        ByteField("message_control_header", 0),
-        StrLenField(
-            "data",
-            b"",
-            length_from=lambda pkt: pkt.length - 2 if pkt.length is not None else 0,
-        ),
-    ]
-
-    def __init__(self, *args, is_command=None, is_last=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        if is_command is not None:
-            self.is_command = is_command
-        if is_last is not None:
-            self.is_last = is_last
-
-    def post_build(self, pkt, pay):
-        if self.length is None:
-            data = self.data
-            if isinstance(data, str):
-                data = data.encode("latin-1")
-            length = 2 + len(data)
-            pkt = struct.pack("!I", length) + pkt[4:]
-        return pkt + pay
-
-    def guess_payload_class(self, payload):
-        return NoPayload
-
-    @property
-    def is_command(self):
-        """True if this PDV contains a command message (bit 0)."""
-        return (self.message_control_header & 0x01) == 1
-
-    @is_command.setter
-    def is_command(self, value):
-        if value:
-            self.message_control_header |= 0x01
-        else:
-            self.message_control_header &= ~0x01
-
-    @property
-    def is_last(self):
-        """True if this is the last fragment of the message (bit 1)."""
-        return (self.message_control_header & 0x02) == 0x02
-
-    @is_last.setter
-    def is_last(self, value):
-        if value:
-            self.message_control_header |= 0x02
-        else:
-            self.message_control_header &= ~0x02
-
-
 class P_DATA_TF(Packet):
     """
     P-DATA-TF PDU for transferring presentation data.
@@ -476,40 +438,14 @@ class P_DATA_TF(Packet):
     """
     name = "P-DATA-TF"
     fields_desc = [
-        StrLenField(
-            "pdv_items_payload",
-            b"",
-            length_from=lambda pkt: pkt.underlayer.length if pkt.underlayer else 0,
-        ),
+        # Usually only a few PDV items per P-DATA-TF, but allow headroom
+        PacketListField("pdv_items", [],
+                        PresentationDataValueItem,
+                        max_count=256,
+                        length_from=lambda pkt: (pkt.underlayer.length
+                                                  if pkt.underlayer and pkt.underlayer.length
+                                                  else 0)),
     ]
-
-    def __init__(self, *args, pdv_items=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        if pdv_items is not None:
-            self.pdv_items = pdv_items
-
-    @property
-    def pdv_items(self):
-        """Parse pdv_items_payload into a list of PresentationDataValueItem packets."""
-        items = []
-        data = self.pdv_items_payload
-        if isinstance(data, str):
-            data = data.encode("latin-1")
-        while data:
-            item = PresentationDataValueItem(data)
-            items.append(item)
-            if item.length is None or item.length <= 0:
-                break
-            item_total_size = 4 + item.length
-            if item_total_size > len(data):
-                break
-            data = data[item_total_size:]
-        return items
-
-    @pdv_items.setter
-    def pdv_items(self, items_list):
-        """Serialize a list of PresentationDataValueItem packets to pdv_items_payload."""
-        self.pdv_items_payload = b"".join(bytes(item) for item in items_list)
 
 
 class A_RELEASE_RQ(Packet):
@@ -595,10 +531,8 @@ class DICOMSession:
         self.max_pdu_length = 16384  # Will be updated during association
         self.raw_mode = raw_mode
         
-        # FIX: Track the mapping of context ID -> abstract syntax as we propose them
-        # This fixes the "Bad Presentation Context ID" bug where we previously
-        # used brittle math ((ctx_id - 1) // 2) to guess the mapping
-        self._proposed_context_map = {}  # ctx_id -> abstract_syntax_uid
+        # Track the mapping of context ID -> abstract syntax as we propose them
+        self._proposed_context_map = {}
 
     def connect(self):
         """
@@ -696,7 +630,7 @@ class DICOMSession:
         # Build presentation contexts and track the mapping
         ctx_id = 1
         for abs_syntax, trn_syntaxes in requested_contexts.items():
-            # FIX: Store the mapping BEFORE we increment ctx_id
+            # Store the mapping BEFORE we increment ctx_id
             self._proposed_context_map[ctx_id] = abs_syntax
             
             sub_items_data = bytes(
@@ -782,8 +716,8 @@ class DICOMSession:
         """
         Parse accepted presentation contexts from A-ASSOCIATE-AC.
         
-        FIX: Uses the stored _proposed_context_map to correctly map
-        context IDs to abstract syntaxes, instead of brittle math.
+        Uses the stored _proposed_context_map to correctly map
+        context IDs to abstract syntaxes.
         """
         for item in response[A_ASSOCIATE_AC].variable_items:
             # Presentation Context Accept item (0x21)
@@ -799,8 +733,7 @@ class DICOMSession:
                     log.debug("Presentation context %d rejected (result=%d)", ctx_id, result)
                     continue
                 
-                # FIX: Look up the abstract syntax from our stored mapping
-                # instead of using brittle math ((ctx_id - 1) // 2)
+                # Look up the abstract syntax from our stored mapping
                 abs_syntax = self._proposed_context_map.get(ctx_id)
                 if abs_syntax is None:
                     log.warning(
@@ -863,8 +796,8 @@ class DICOMSession:
         pdv_rq = PresentationDataValueItem(
             context_id=echo_ctx_id,
             data=dimse_rq,
-            is_command=True,
-            is_last=True,
+            is_command=1,
+            is_last=1,
         )
         pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
 
@@ -918,12 +851,12 @@ class DICOMSession:
         else:
             dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
 
-        # Command PDV (is_last=True means last fragment of command)
+        # Command PDV (is_last=1 means last fragment of command)
         cmd_pdv = PresentationDataValueItem(
             context_id=store_ctx_id,
             data=dimse_rq,
-            is_command=True,
-            is_last=True,
+            is_command=1,
+            is_last=1,
         )
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
         self._send_pdu(pdata_cmd)
@@ -938,8 +871,8 @@ class DICOMSession:
             data_pdv = PresentationDataValueItem(
                 context_id=store_ctx_id,
                 data=dataset_bytes,
-                is_command=False,
-                is_last=True,
+                is_command=0,
+                is_last=1,
             )
             pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
             self._send_pdu(pdata_data)
@@ -948,11 +881,11 @@ class DICOMSession:
             offset = 0
             while offset < len(dataset_bytes):
                 chunk = dataset_bytes[offset:offset + max_pdv_data]
-                is_last = (offset + len(chunk) >= len(dataset_bytes))
+                is_last = 1 if (offset + len(chunk) >= len(dataset_bytes)) else 0
                 data_pdv = PresentationDataValueItem(
                     context_id=store_ctx_id,
                     data=chunk,
-                    is_command=False,
+                    is_command=0,
                     is_last=is_last,
                 )
                 pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
@@ -1012,8 +945,8 @@ class DICOMSession:
         cmd_pdv = PresentationDataValueItem(
             context_id=context_id,
             data=dimse_rq,
-            is_command=True,
-            is_last=True,
+            is_command=1,
+            is_last=1,
         )
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
         self._send_pdu(pdata_cmd)
@@ -1022,8 +955,8 @@ class DICOMSession:
         data_pdv = PresentationDataValueItem(
             context_id=context_id,
             data=dataset_bytes,
-            is_command=False,
-            is_last=True,
+            is_command=0,
+            is_last=1,
         )
         pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
         self._send_pdu(pdata_data)

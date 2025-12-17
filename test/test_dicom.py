@@ -13,8 +13,8 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-# Add current directory to path for local testing
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+# Add parent directory to path for local testing
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 logging.getLogger("scapy.contrib.dicom").setLevel(logging.INFO)
@@ -65,12 +65,11 @@ class TestCoreLayerValidation:
         )
         user_info = DICOMVariableItem(item_type=0x50, data=user_info_data)
 
-        pkt_payload = A_ASSOCIATE_RQ(
+        pkt = DICOM() / A_ASSOCIATE_RQ(
             calling_ae_title=b'VALIDATOR'.ljust(16),
             called_ae_title=b'TEST_SCP'.ljust(16),
+            variable_items=[app_context, pres_context, user_info],
         )
-        pkt_payload.variable_items = [app_context, pres_context, user_info]
-        pkt = DICOM() / pkt_payload
 
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt.haslayer(A_ASSOCIATE_RQ)
@@ -86,10 +85,10 @@ class TestCoreLayerValidation:
     def test_req_011_parse_pdata_tf(self):
         """Test P-DATA-TF with multiple PDV items."""
         pdv1 = PresentationDataValueItem(
-            context_id=1, data=b'\xDE\xAD', is_command=True, is_last=False
+            context_id=1, data=b'\xDE\xAD', is_command=1, is_last=0
         )
         pdv2 = PresentationDataValueItem(
-            context_id=1, data=b'\xBE\xEF', is_command=False, is_last=True
+            context_id=1, data=b'\xBE\xEF', is_command=0, is_last=1
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv1, pdv2])
         reparsed_pkt = DICOM(bytes(pkt))
@@ -116,7 +115,7 @@ class TestCoreLayerValidation:
         """Test P-DATA-TF with C-ECHO DIMSE command."""
         c_echo_dimse = build_c_echo_rq_dimse(message_id=123)
         pdv_echo = PresentationDataValueItem(
-            context_id=1, data=c_echo_dimse, is_command=True, is_last=True
+            context_id=1, data=c_echo_dimse, is_command=1, is_last=1
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv_echo])
         raw_bytes = bytes(pkt)
@@ -126,10 +125,10 @@ class TestCoreLayerValidation:
     def test_req_024_construct_pdata_with_cmd_and_data(self):
         """Test P-DATA-TF with command and data PDVs."""
         pdv_cmd = PresentationDataValueItem(
-            context_id=3, data=b'\x01\x02', is_command=True, is_last=True
+            context_id=3, data=b'\x01\x02', is_command=1, is_last=1
         )
         pdv_data = PresentationDataValueItem(
-            context_id=3, data=b'\xAA\xBB', is_command=False, is_last=True
+            context_id=3, data=b'\xAA\xBB', is_command=0, is_last=1
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv_cmd, pdv_data])
         reparsed_pkt = DICOM(bytes(pkt))
@@ -156,8 +155,7 @@ class TestFuzzingCapabilities:
                     item_type=0x20, data=struct.pack("!BBBB", ctx_id, 0, 0, 0)
                 )
             )
-        pkt = DICOM() / A_ASSOCIATE_RQ()
-        pkt[A_ASSOCIATE_RQ].variable_items = contexts
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=contexts)
         reparsed_pkt = DICOM(bytes(pkt))
         assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 128
 
@@ -167,8 +165,7 @@ class TestFuzzingCapabilities:
             item_type=0x51, data=struct.pack("!I", 0x7FFFFFFF)
         )
         user_info = DICOMVariableItem(item_type=0x50, data=bytes(max_len_subitem))
-        pkt = DICOM() / A_ASSOCIATE_RQ()
-        pkt[A_ASSOCIATE_RQ].variable_items = [user_info]
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[user_info])
         assert b'\x51\x00\x00\x04\x7f\xff\xff\xff' in bytes(pkt)
 
     @pytest.mark.parametrize("pdu_class, field, value", [
@@ -184,18 +181,18 @@ class TestFuzzingCapabilities:
     def test_req_013_illogical_fragmentation(self):
         """Test incomplete fragmentation flag handling."""
         pdv = PresentationDataValueItem(
-            context_id=1, data=b'fragment', is_last=False
+            context_id=1, data=b'fragment', is_last=0
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
         reparsed_pkt = DICOM(bytes(pkt))
-        assert not reparsed_pkt[P_DATA_TF].pdv_items[0].is_last
+        assert reparsed_pkt[P_DATA_TF].pdv_items[0].is_last == 0
 
     def test_req_025_incorrect_command_group_length(self):
         """Test corrupted DIMSE command group length."""
         c_echo_dimse = build_c_echo_rq_dimse(message_id=456)
         corrupt_dimse = c_echo_dimse[:8] + struct.pack("<I", 1000) + c_echo_dimse[12:]
         pdv = PresentationDataValueItem(
-            context_id=1, is_command=True, is_last=True, data=corrupt_dimse
+            context_id=1, is_command=1, is_last=1, data=corrupt_dimse
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
         assert corrupt_dimse in bytes(pkt)
@@ -235,10 +232,10 @@ class TestFuzzingCapabilities:
     def test_req_l13_advanced_fragmentation_interleaving(self):
         """Test interleaved fragmentation across contexts."""
         pdv_a1 = PresentationDataValueItem(
-            context_id=1, data=b'context A part 1', is_last=False
+            context_id=1, data=b'context A part 1', is_last=0
         )
         pdv_b1 = PresentationDataValueItem(
-            context_id=3, data=b'context B part 1', is_last=False
+            context_id=3, data=b'context B part 1', is_last=0
         )
         pkt_a1 = DICOM() / P_DATA_TF(pdv_items=[pdv_a1])
         pkt_b1 = DICOM() / P_DATA_TF(pdv_items=[pdv_b1])
@@ -250,11 +247,11 @@ class TestFuzzingCapabilities:
     def test_req_l14_dimse_mismatch_cross_context(self):
         """Test DIMSE command with arbitrary context ID."""
         pdv_cmd = PresentationDataValueItem(
-            context_id=5, data=b'\x01\x00', is_command=True, is_last=True
+            context_id=5, data=b'\x01\x00', is_command=1, is_last=1
         )
         pkt_cmd = DICOM() / P_DATA_TF(pdv_items=[pdv_cmd])
         assert pkt_cmd[P_DATA_TF].pdv_items[0].context_id == 5
-        assert pkt_cmd[P_DATA_TF].pdv_items[0].is_command
+        assert pkt_cmd[P_DATA_TF].pdv_items[0].is_command == 1
 
     def test_req_l15_file_stream_confusion(self):
         """Test DICOM file content embedded in P-DATA."""
@@ -267,7 +264,7 @@ class TestFuzzingCapabilities:
             + b'\x08\x00\x05\x00\x0a\x00\x43\x53\x49\x53\x4f\x31'
         )
         pdv = PresentationDataValueItem(
-            context_id=1, data=dicom_file_payload, is_command=False, is_last=True
+            context_id=1, data=dicom_file_payload, is_command=0, is_last=1
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
         assert b'DICM' in bytes(pkt)
@@ -276,7 +273,7 @@ class TestFuzzingCapabilities:
         """Test big-endian payload handling."""
         big_endian_payload = b'\x00\x08\x00\x20DA\x00\x0820250709'
         pdv = PresentationDataValueItem(
-            context_id=1, data=big_endian_payload, is_command=False, is_last=True
+            context_id=1, data=big_endian_payload, is_command=0, is_last=1
         )
         pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
         assert big_endian_payload in bytes(pkt)
@@ -285,8 +282,7 @@ class TestFuzzingCapabilities:
         """Test user identity negotiation item."""
         secure_item_bytes = bytes(DICOMVariableItem(item_type=0x56))
         user_info = DICOMVariableItem(item_type=0x50, data=secure_item_bytes)
-        pkt = DICOM() / A_ASSOCIATE_RQ()
-        pkt[A_ASSOCIATE_RQ].variable_items = [user_info]
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[user_info])
         assert b'\x56\x00\x00\x00' in bytes(pkt)
 
 
@@ -310,7 +306,7 @@ class TestRoundTripSerialization:
         """P-DATA-TF with PDV should survive serialization round-trip."""
         test_data = b"\x01\x02\x03\x04\x05"
         pdv = PresentationDataValueItem(
-            context_id=3, data=test_data, is_command=True, is_last=True
+            context_id=3, data=test_data, is_command=1, is_last=1
         )
         original = DICOM() / P_DATA_TF(pdv_items=[pdv])
         serialized = bytes(original)
@@ -320,8 +316,11 @@ class TestRoundTripSerialization:
         assert len(parsed[P_DATA_TF].pdv_items) == 1
         parsed_pdv = parsed[P_DATA_TF].pdv_items[0]
         assert parsed_pdv.context_id == 3
-        # Data includes message control header byte
-        assert test_data in bytes(parsed_pdv)
+        # Verify data survived round-trip
+        parsed_data = parsed_pdv.data
+        if isinstance(parsed_data, str):
+            parsed_data = parsed_data.encode('latin-1')
+        assert parsed_data == test_data
 
     def test_abort_round_trip(self):
         """A-ABORT should survive serialization round-trip."""
@@ -343,6 +342,20 @@ class TestRoundTripSerialization:
         assert parsed[A_ASSOCIATE_RJ].result == 1
         assert parsed[A_ASSOCIATE_RJ].source == 1
         assert parsed[A_ASSOCIATE_RJ].reason_diag == 3
+
+    def test_pdv_flags_round_trip(self):
+        """PresentationDataValueItem flags should survive round-trip."""
+        # Test all flag combinations
+        for is_cmd in [0, 1]:
+            for is_last in [0, 1]:
+                pdv = PresentationDataValueItem(
+                    context_id=1, data=b'test', is_command=is_cmd, is_last=is_last
+                )
+                pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+                parsed = DICOM(bytes(pkt))
+                parsed_pdv = parsed[P_DATA_TF].pdv_items[0]
+                assert parsed_pdv.is_command == is_cmd, f"is_command mismatch for {is_cmd}"
+                assert parsed_pdv.is_last == is_last, f"is_last mismatch for {is_last}"
 
 
 class TestEdgeCases:
@@ -446,6 +459,43 @@ class TestMalformedPacketHandling:
         serialized = bytes(pkt)
         parsed = DICOM(serialized)
         assert parsed.haslayer(A_ASSOCIATE_RQ)
+
+
+class TestBitFieldFlags:
+    """Test the BitField-based is_command and is_last flags."""
+
+    def test_is_command_flag(self):
+        """Test is_command flag encoding."""
+        # is_command=1 should set bit 0
+        pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=1, is_last=0)
+        raw = bytes(pdv)
+        # Message control header is at offset 5 (after 4-byte length + 1-byte context_id)
+        msg_ctrl = raw[5]
+        assert msg_ctrl & 0x01 == 1  # Bit 0 set
+        assert msg_ctrl & 0x02 == 0  # Bit 1 not set
+
+    def test_is_last_flag(self):
+        """Test is_last flag encoding."""
+        # is_last=1 should set bit 1
+        pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=0, is_last=1)
+        raw = bytes(pdv)
+        msg_ctrl = raw[5]
+        assert msg_ctrl & 0x01 == 0  # Bit 0 not set
+        assert msg_ctrl & 0x02 == 2  # Bit 1 set
+
+    def test_both_flags_set(self):
+        """Test both flags set together."""
+        pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=1, is_last=1)
+        raw = bytes(pdv)
+        msg_ctrl = raw[5]
+        assert msg_ctrl == 0x03  # Both bits set
+
+    def test_no_flags_set(self):
+        """Test neither flag set."""
+        pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=0, is_last=0)
+        raw = bytes(pdv)
+        msg_ctrl = raw[5]
+        assert msg_ctrl == 0x00  # No bits set
 
 
 # --- Group 4: Integration Tests ---
