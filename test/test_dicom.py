@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 logging.getLogger("scapy.contrib.dicom").setLevel(logging.INFO)
 
-from scapy_dicom import (
+from dicom import (
     DICOM,
     A_ASSOCIATE_RQ,
     A_ASSOCIATE_AC,

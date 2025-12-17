@@ -3,7 +3,7 @@
 """
 DICOM Protocol Fuzzer
 
-A fuzzing tool for testing DICOM SCP implementations using the scapy_dicom module.
+A fuzzing tool for testing DICOM SCP implementations using the dicom module.
 Supports association handshake fuzzing and C-STORE operations with malformed data.
 
 This fuzzer now properly supports:
@@ -30,7 +30,7 @@ if root_dir not in sys.path:
     sys.path.insert(0, root_dir)
 
 try:
-    from scapy_dicom import (
+    from dicom import (
         DICOMSession,
         DICOM,
         A_ASSOCIATE_RQ,
@@ -50,8 +50,8 @@ try:
     )
 except ImportError as e:
     print(
-        f"ERROR: Could not import scapy_dicom. "
-        f"Ensure scapy_dicom.py is present. Details: {e}",
+        f"ERROR: Could not import dicom. "
+        f"Ensure dicom.py is present. Details: {e}",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -1380,7 +1380,7 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DICOM Protocol Fuzzer using scapy_dicom",
+        description="DICOM Protocol Fuzzer using scapy dicom",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
