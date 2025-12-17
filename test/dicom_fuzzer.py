@@ -17,7 +17,6 @@ Usage:
 """
 
 import argparse
-from io import BytesIO
 import logging
 import os
 import sys
@@ -26,8 +25,9 @@ import urllib.request
 
 # Ensure scapy_dicom is accessible
 script_dir = os.path.dirname(os.path.abspath(__file__))
-if script_dir not in sys.path:
-    sys.path.insert(0, script_dir)
+root_dir = os.path.dirname(script_dir)
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
 
 try:
     from scapy_dicom import (
