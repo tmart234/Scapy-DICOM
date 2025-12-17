@@ -26,7 +26,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          pytest test_dicom.py -v -k "not integration"
+          pytest test/test_dicom.py -v -k "not integration"
 
   # Integration tests against real DICOM servers
   integration-tests:
@@ -126,7 +126,7 @@ jobs:
           fi
           echo "Using timeout: $TIMEOUT seconds"
 
-          pytest test_dicom.py \
+          pytest test/test_dicom.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \

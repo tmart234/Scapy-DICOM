@@ -88,7 +88,7 @@ jobs:
           echo "  - Null bytes in UIDs"
           echo "  - Odd-length UIDs (protocol fuzzing)"
           echo ""
-          python dicom_fuzzer.py \
+          python test/dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -131,7 +131,7 @@ jobs:
           echo "  - Data PDV without command"
           echo "  - Incomplete fragmentation"
           echo ""
-          python dicom_fuzzer.py \
+          python test/dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -163,7 +163,7 @@ jobs:
         id: fuzz_all
         run: |
           echo "=== Running Complete Fuzzing Suite ==="
-          python dicom_fuzzer.py \
+          python test/dicom_fuzzer.py \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
