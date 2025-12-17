@@ -1074,31 +1074,3 @@ class DICOMSession:
         self.sock = None
         self.stream = None
         self.assoc_established = False
-
-
-if __name__ == "__main__":
-    # Simple test/example
-    import sys
-
-    if len(sys.argv) < 3:
-        print("Usage: python dicom.py <ip> <ae_title> [port]")
-        sys.exit(1)
-
-    target_ip = sys.argv[1]
-    target_ae = sys.argv[2]
-    target_port = int(sys.argv[3]) if len(sys.argv) > 3 else DICOM_PORT
-
-    print(f"Testing DICOM connection to {target_ip}:{target_port} (AE: {target_ae})")
-
-    session = DICOMSession(target_ip, target_port, target_ae)
-    if session.associate():
-        print("Association established successfully")
-        status = session.c_echo()
-        if status == 0:
-            print("C-ECHO successful (status=0)")
-        else:
-            print(f"C-ECHO returned status: {status}")
-        session.release()
-        print("Association released")
-    else:
-        print("Association failed")
