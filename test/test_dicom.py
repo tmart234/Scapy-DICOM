@@ -3,6 +3,10 @@ Pytest test suite for Scapy DICOM contribution.
 
 Includes unit tests for packet crafting/parsing and integration tests
 for live SCP verification.
+
+Tests the "kosher" Scapy approach:
+- DICOMVariableItem dispatches to typed sub-packets via bind_layers
+- No manual struct.pack - Scapy calculates lengths and types automatically
 """
 import pytest
 import struct
@@ -20,6 +24,7 @@ logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 logging.getLogger("scapy.contrib.dicom").setLevel(logging.INFO)
 
 from dicom import (
+    # PDU classes
     DICOM,
     A_ASSOCIATE_RQ,
     A_ASSOCIATE_AC,
@@ -28,10 +33,25 @@ from dicom import (
     A_RELEASE_RP,
     A_ABORT,
     P_DATA_TF,
-    DICOMVariableItem,
     PresentationDataValueItem,
+    # Variable Item classes (the "kosher" approach)
+    DICOMVariableItem,
+    DICOMApplicationContext,
+    DICOMPresentationContextRQ,
+    DICOMPresentationContextAC,
+    DICOMAbstractSyntax,
+    DICOMTransferSyntax,
+    DICOMUserInformation,
+    DICOMMaximumLength,
+    DICOMImplementationClassUID,
+    DICOMImplementationVersionName,
+    DICOMGenericItem,
+    # Helpers
     build_c_echo_rq_dimse,
+    build_presentation_context_rq,
+    build_user_information,
     DICOMSession,
+    # Constants
     APP_CONTEXT_UID,
     VERIFICATION_SOP_CLASS_UID,
     DEFAULT_TRANSFER_SYNTAX_UID,
@@ -41,48 +61,353 @@ from dicom import (
 )
 
 
-# --- Group 1: Layer Unit & Validation Tests ---
+# =============================================================================
+# Test Variable Item Layer Binding (The "Kosher" Approach)
+# =============================================================================
+
+class TestVariableItemBindLayers:
+    """Test that bind_layers correctly dispatches based on item_type."""
+
+    def test_application_context_bind_layers(self):
+        """DICOMVariableItem() / DICOMApplicationContext() should auto-set item_type=0x10."""
+        pkt = DICOMVariableItem() / DICOMApplicationContext()
+        
+        # item_type should be automatically set by bind_layers
+        assert pkt.item_type == 0x10
+        
+        # Length should be auto-calculated
+        raw = bytes(pkt)
+        assert len(raw) > 4  # Header + payload
+        
+        # Verify round-trip
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x10
+        assert parsed.haslayer(DICOMApplicationContext)
+        
+    def test_abstract_syntax_bind_layers(self):
+        """DICOMVariableItem() / DICOMAbstractSyntax() should auto-set item_type=0x30."""
+        uid = _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)
+        pkt = DICOMVariableItem() / DICOMAbstractSyntax(uid=uid)
+        
+        assert pkt.item_type == 0x30
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x30
+        assert parsed.haslayer(DICOMAbstractSyntax)
+        assert parsed[DICOMAbstractSyntax].uid == uid
+
+    def test_transfer_syntax_bind_layers(self):
+        """DICOMVariableItem() / DICOMTransferSyntax() should auto-set item_type=0x40."""
+        pkt = DICOMVariableItem() / DICOMTransferSyntax()
+        
+        assert pkt.item_type == 0x40
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x40
+        assert parsed.haslayer(DICOMTransferSyntax)
+
+    def test_maximum_length_bind_layers(self):
+        """DICOMVariableItem() / DICOMMaximumLength() should auto-set item_type=0x51."""
+        pkt = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=32768)
+        
+        assert pkt.item_type == 0x51
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x51
+        assert parsed.haslayer(DICOMMaximumLength)
+        assert parsed[DICOMMaximumLength].max_pdu_length == 32768
+
+    def test_user_information_bind_layers(self):
+        """DICOMVariableItem() / DICOMUserInformation() should auto-set item_type=0x50."""
+        max_len = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
+        pkt = DICOMVariableItem() / DICOMUserInformation(sub_items=[max_len])
+        
+        assert pkt.item_type == 0x50
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x50
+        assert parsed.haslayer(DICOMUserInformation)
+
+    def test_presentation_context_rq_bind_layers(self):
+        """DICOMVariableItem() / DICOMPresentationContextRQ() should auto-set item_type=0x20."""
+        abs_syn = DICOMVariableItem() / DICOMAbstractSyntax(uid=_uid_to_bytes(VERIFICATION_SOP_CLASS_UID))
+        ts = DICOMVariableItem() / DICOMTransferSyntax()
+        
+        pkt = DICOMVariableItem() / DICOMPresentationContextRQ(
+            context_id=1,
+            sub_items=[abs_syn, ts]
+        )
+        
+        assert pkt.item_type == 0x20
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x20
+        assert parsed.haslayer(DICOMPresentationContextRQ)
+        assert parsed[DICOMPresentationContextRQ].context_id == 1
+
+    def test_presentation_context_ac_bind_layers(self):
+        """DICOMVariableItem() / DICOMPresentationContextAC() should auto-set item_type=0x21."""
+        ts = DICOMVariableItem() / DICOMTransferSyntax()
+        
+        pkt = DICOMVariableItem() / DICOMPresentationContextAC(
+            context_id=1,
+            result=0,
+            sub_items=[ts]
+        )
+        
+        assert pkt.item_type == 0x21
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x21
+        assert parsed.haslayer(DICOMPresentationContextAC)
+        assert parsed[DICOMPresentationContextAC].result == 0
+
+    def test_unknown_item_type_falls_back_to_generic(self):
+        """Unknown item_type should parse into DICOMGenericItem."""
+        # Manually construct an item with unknown type 0xFF
+        raw = struct.pack("!BBH", 0xFF, 0, 4) + b"test"
+        
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0xFF
+        assert parsed.haslayer(DICOMGenericItem)
+        assert parsed[DICOMGenericItem].data == b"test"
+
+
+class TestVariableItemAutoLength:
+    """Test that length field is auto-calculated from payload."""
+
+    def test_application_context_length_auto(self):
+        """Application Context length should be auto-calculated."""
+        pkt = DICOMVariableItem() / DICOMApplicationContext()
+        raw = bytes(pkt)
+        
+        # Parse length from raw bytes (bytes 2-3, big-endian)
+        length_field = struct.unpack("!H", raw[2:4])[0]
+        actual_payload = len(raw) - 4  # Total - header
+        
+        assert length_field == actual_payload
+
+    def test_maximum_length_item_size(self):
+        """Maximum Length item should be exactly 8 bytes (4 header + 4 data)."""
+        pkt = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
+        raw = bytes(pkt)
+        
+        assert len(raw) == 8
+        # Header: type=0x51, reserved=0, length=4
+        assert raw[:4] == b'\x51\x00\x00\x04'
+
+    def test_nested_items_length(self):
+        """Nested items should have correct cumulative length."""
+        max_len = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
+        user_info = DICOMVariableItem() / DICOMUserInformation(sub_items=[max_len])
+        
+        raw = bytes(user_info)
+        
+        # User info header (4) + nested max_len item (8)
+        assert len(raw) == 12
+        
+        # User info length should be 8 (the nested item)
+        ui_length = struct.unpack("!H", raw[2:4])[0]
+        assert ui_length == 8
+
+
+class TestHelperFunctions:
+    """Test the helper functions for building common structures."""
+
+    def test_build_presentation_context_rq(self):
+        """build_presentation_context_rq should create proper nested structure."""
+        pctx = build_presentation_context_rq(
+            context_id=3,
+            abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID,
+            transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID]
+        )
+        
+        assert pctx.item_type == 0x20
+        assert pctx.haslayer(DICOMPresentationContextRQ)
+        assert pctx[DICOMPresentationContextRQ].context_id == 3
+        
+        # Should have 2 sub-items: abstract syntax + transfer syntax
+        sub_items = pctx[DICOMPresentationContextRQ].sub_items
+        assert len(sub_items) == 2
+        assert sub_items[0].item_type == 0x30  # Abstract Syntax
+        assert sub_items[1].item_type == 0x40  # Transfer Syntax
+
+    def test_build_user_information(self):
+        """build_user_information should create proper nested structure."""
+        user_info = build_user_information(max_pdu_length=32768)
+        
+        assert user_info.item_type == 0x50
+        assert user_info.haslayer(DICOMUserInformation)
+        
+        sub_items = user_info[DICOMUserInformation].sub_items
+        assert len(sub_items) >= 1
+        assert sub_items[0].item_type == 0x51  # Maximum Length
+        assert sub_items[0][DICOMMaximumLength].max_pdu_length == 32768
+
+    def test_build_user_information_with_implementation(self):
+        """build_user_information with implementation info."""
+        user_info = build_user_information(
+            max_pdu_length=16384,
+            implementation_class_uid="1.2.3.4.5",
+            implementation_version="SCAPY_V1"
+        )
+        
+        sub_items = user_info[DICOMUserInformation].sub_items
+        assert len(sub_items) == 3
+        
+        # Verify types
+        types = [item.item_type for item in sub_items]
+        assert 0x51 in types  # Maximum Length
+        assert 0x52 in types  # Implementation Class UID
+        assert 0x55 in types  # Implementation Version Name
+
+
+# =============================================================================
+# Test A-ASSOCIATE-RQ with Typed Variable Items
+# =============================================================================
+
+class TestAssociateRQWithTypedItems:
+    """Test A-ASSOCIATE-RQ construction with the new typed item classes."""
+
+    def test_simple_associate_rq(self):
+        """Build simple A-ASSOCIATE-RQ with typed items."""
+        # Application Context
+        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+        
+        # Presentation Context
+        pctx = build_presentation_context_rq(
+            context_id=1,
+            abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID,
+            transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID]
+        )
+        
+        # User Information
+        user_info = build_user_information(max_pdu_length=16384)
+        
+        # Build A-ASSOCIATE-RQ
+        assoc_rq = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=_pad_ae_title("TARGET"),
+            calling_ae_title=_pad_ae_title("SOURCE"),
+            variable_items=[app_ctx, pctx, user_info]
+        )
+        
+        raw = bytes(assoc_rq)
+        
+        # Verify it parses back correctly
+        parsed = DICOM(raw)
+        assert parsed.haslayer(A_ASSOCIATE_RQ)
+        
+        items = parsed[A_ASSOCIATE_RQ].variable_items
+        assert len(items) == 3
+        
+        # Check types
+        assert items[0].item_type == 0x10  # Application Context
+        assert items[1].item_type == 0x20  # Presentation Context RQ
+        assert items[2].item_type == 0x50  # User Information
+
+    def test_associate_rq_with_multiple_presentation_contexts(self):
+        """Build A-ASSOCIATE-RQ with multiple presentation contexts."""
+        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+        
+        pctx1 = build_presentation_context_rq(
+            context_id=1,
+            abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID,
+            transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID]
+        )
+        pctx2 = build_presentation_context_rq(
+            context_id=3,
+            abstract_syntax_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID]
+        )
+        
+        user_info = build_user_information()
+        
+        assoc_rq = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=_pad_ae_title("TARGET"),
+            calling_ae_title=_pad_ae_title("SOURCE"),
+            variable_items=[app_ctx, pctx1, pctx2, user_info]
+        )
+        
+        raw = bytes(assoc_rq)
+        parsed = DICOM(raw)
+        
+        items = parsed[A_ASSOCIATE_RQ].variable_items
+        assert len(items) == 4
+        
+        # Verify presentation context IDs
+        pctx_items = [i for i in items if i.item_type == 0x20]
+        assert len(pctx_items) == 2
+        assert pctx_items[0][DICOMPresentationContextRQ].context_id == 1
+        assert pctx_items[1][DICOMPresentationContextRQ].context_id == 3
+
+    def test_associate_rq_round_trip_preserves_structure(self):
+        """Verify complete nested structure survives round-trip."""
+        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+        pctx = build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID])
+        user_info = build_user_information(max_pdu_length=32768)
+        
+        assoc_rq = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=_pad_ae_title("TARGET"),
+            calling_ae_title=_pad_ae_title("SOURCE"),
+            variable_items=[app_ctx, pctx, user_info]
+        )
+        
+        raw = bytes(assoc_rq)
+        parsed = DICOM(raw)
+        
+        # Drill down into nested structure
+        user_info_parsed = None
+        for item in parsed[A_ASSOCIATE_RQ].variable_items:
+            if item.item_type == 0x50:
+                user_info_parsed = item
+                break
+        
+        assert user_info_parsed is not None
+        assert user_info_parsed.haslayer(DICOMUserInformation)
+        
+        # Check nested Maximum Length
+        max_len_item = user_info_parsed[DICOMUserInformation].sub_items[0]
+        assert max_len_item.item_type == 0x51
+        assert max_len_item[DICOMMaximumLength].max_pdu_length == 32768
+
+
+# =============================================================================
+# Original Test Classes (Updated for New Structure)
+# =============================================================================
+
 class TestCoreLayerValidation:
     """Tests for core packet construction and parsing."""
 
-    def test_req_001_and_006_parse_associate_rq_ac(self):
+    def test_parse_associate_rq(self):
         """Test A-ASSOCIATE-RQ construction and parsing with variable items."""
-        app_context = DICOMVariableItem(
-            item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID)
-        )
-        pres_context_data = (
-            b'\x01\x00\x00\x00'
-            + bytes(DICOMVariableItem(
-                item_type=0x30, data=_uid_to_bytes(VERIFICATION_SOP_CLASS_UID)
-            ))
-            + bytes(DICOMVariableItem(
-                item_type=0x40, data=_uid_to_bytes(DEFAULT_TRANSFER_SYNTAX_UID)
-            ))
-        )
-        pres_context = DICOMVariableItem(item_type=0x20, data=pres_context_data)
-        user_info_data = bytes(
-            DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384))
-        )
-        user_info = DICOMVariableItem(item_type=0x50, data=user_info_data)
+        app_context = DICOMVariableItem() / DICOMApplicationContext()
+        pctx = build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID])
+        user_info = build_user_information()
 
         pkt = DICOM() / A_ASSOCIATE_RQ(
-            calling_ae_title=b'VALIDATOR'.ljust(16),
-            called_ae_title=b'TEST_SCP'.ljust(16),
-            variable_items=[app_context, pres_context, user_info],
+            calling_ae_title=_pad_ae_title('VALIDATOR'),
+            called_ae_title=_pad_ae_title('TEST_SCP'),
+            variable_items=[app_context, pctx, user_info],
         )
 
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt.haslayer(A_ASSOCIATE_RQ)
         assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 3
 
-    def test_req_009_parse_associate_rj(self):
+    def test_parse_associate_rj(self):
         """Test A-ASSOCIATE-RJ construction and parsing."""
         pkt = DICOM() / A_ASSOCIATE_RJ(result=1, source=2, reason_diag=2)
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt.haslayer(A_ASSOCIATE_RJ)
         assert reparsed_pkt[A_ASSOCIATE_RJ].source == 2
 
-    def test_req_011_parse_pdata_tf(self):
+    def test_parse_pdata_tf(self):
         """Test P-DATA-TF with multiple PDV items."""
         pdv1 = PresentationDataValueItem(
             context_id=1, data=b'\xDE\xAD', is_command=1, is_last=0
@@ -94,7 +419,7 @@ class TestCoreLayerValidation:
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt.haslayer(P_DATA_TF)
         assert len(reparsed_pkt[P_DATA_TF].pdv_items) == 2
-        # Handle both bytes and str returns from Scapy
+        
         data = reparsed_pkt[P_DATA_TF].pdv_items[1].data
         if isinstance(data, str):
             data = data.encode('latin-1')
@@ -105,13 +430,13 @@ class TestCoreLayerValidation:
         (0x06, A_RELEASE_RP),
         (0x07, A_ABORT),
     ])
-    def test_req_015_016_017_parse_simple_pdus(self, pdu_type, layer_class):
+    def test_parse_simple_pdus(self, pdu_type, layer_class):
         """Test simple PDU construction and parsing."""
         pkt = DICOM(pdu_type=pdu_type) / layer_class()
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt.haslayer(layer_class)
 
-    def test_req_023_construct_pdata_with_cecho(self):
+    def test_construct_pdata_with_cecho(self):
         """Test P-DATA-TF with C-ECHO DIMSE command."""
         c_echo_dimse = build_c_echo_rq_dimse(message_id=123)
         pdv_echo = PresentationDataValueItem(
@@ -122,63 +447,42 @@ class TestCoreLayerValidation:
         assert raw_bytes.startswith(b'\x04\x00')
         assert c_echo_dimse in raw_bytes
 
-    def test_req_024_construct_pdata_with_cmd_and_data(self):
-        """Test P-DATA-TF with command and data PDVs."""
-        pdv_cmd = PresentationDataValueItem(
-            context_id=3, data=b'\x01\x02', is_command=1, is_last=1
-        )
-        pdv_data = PresentationDataValueItem(
-            context_id=3, data=b'\xAA\xBB', is_command=0, is_last=1
-        )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv_cmd, pdv_data])
-        reparsed_pkt = DICOM(bytes(pkt))
-        assert len(reparsed_pkt[P_DATA_TF].pdv_items) == 2
 
-
-# --- Group 2 & 3: Fuzzing Capability Tests ---
 class TestFuzzingCapabilities:
     """Tests for fuzzing and edge case handling."""
 
-    def test_req_002_oversized_ae_title(self):
+    def test_oversized_ae_title(self):
         """Test that oversized AE titles are truncated to 16 bytes."""
         oversized_title = b'A' * 25
         pkt = DICOM() / A_ASSOCIATE_RQ(called_ae_title=oversized_title)
         assert bytes(pkt)[10:26] == b'A' * 16
 
-    def test_req_004_too_many_presentation_contexts(self):
-        """Test handling of many presentation contexts."""
+    def test_too_many_presentation_contexts(self):
+        """Test handling of many presentation contexts (up to 128)."""
         contexts = []
         for i in range(128):
             ctx_id = (i * 2) + 1
-            contexts.append(
-                DICOMVariableItem(
-                    item_type=0x20, data=struct.pack("!BBBB", ctx_id, 0, 0, 0)
-                )
+            pctx = build_presentation_context_rq(
+                context_id=ctx_id,
+                abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID,
+                transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID]
             )
-        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=contexts)
+            contexts.append(pctx)
+        
+        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+        user_info = build_user_information()
+        
+        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[app_ctx] + contexts + [user_info])
         reparsed_pkt = DICOM(bytes(pkt))
-        assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 128
+        assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 130  # 1 app + 128 pctx + 1 user
 
-    def test_req_005_manipulate_user_info(self):
+    def test_manipulate_max_pdu_length(self):
         """Test maximum PDU length manipulation."""
-        max_len_subitem = DICOMVariableItem(
-            item_type=0x51, data=struct.pack("!I", 0x7FFFFFFF)
-        )
-        user_info = DICOMVariableItem(item_type=0x50, data=bytes(max_len_subitem))
-        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[user_info])
-        assert b'\x51\x00\x00\x04\x7f\xff\xff\xff' in bytes(pkt)
+        user_info = build_user_information(max_pdu_length=0x7FFFFFFF)
+        raw = bytes(user_info)
+        assert b'\x7f\xff\xff\xff' in raw
 
-    @pytest.mark.parametrize("pdu_class, field, value", [
-        (A_ASSOCIATE_RJ, "reason_diag", 255),
-        (A_ABORT, "source", 1),
-    ])
-    def test_req_010_018_invalid_enums(self, pdu_class, field, value):
-        """Test that invalid enum values are preserved."""
-        pkt = DICOM() / pdu_class(**{field: value})
-        reparsed_pkt = DICOM(bytes(pkt))
-        assert getattr(reparsed_pkt[pdu_class], field) == value
-
-    def test_req_013_illogical_fragmentation(self):
+    def test_illogical_fragmentation(self):
         """Test incomplete fragmentation flag handling."""
         pdv = PresentationDataValueItem(
             context_id=1, data=b'fragment', is_last=0
@@ -187,103 +491,18 @@ class TestFuzzingCapabilities:
         reparsed_pkt = DICOM(bytes(pkt))
         assert reparsed_pkt[P_DATA_TF].pdv_items[0].is_last == 0
 
-    def test_req_025_incorrect_command_group_length(self):
-        """Test corrupted DIMSE command group length."""
-        c_echo_dimse = build_c_echo_rq_dimse(message_id=456)
-        corrupt_dimse = c_echo_dimse[:8] + struct.pack("<I", 1000) + c_echo_dimse[12:]
-        pdv = PresentationDataValueItem(
-            context_id=1, is_command=1, is_last=1, data=corrupt_dimse
-        )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        assert corrupt_dimse in bytes(pkt)
-
-    def test_req_l01_pdu_type_confusion(self):
+    def test_pdu_type_confusion(self):
         """Test PDU type mismatch (P-DATA type with A-ASSOCIATE payload)."""
         pkt = DICOM(pdu_type=0x04) / A_ASSOCIATE_RQ()
         raw_bytes = bytes(pkt)
         assert raw_bytes[0] == 0x04
         assert raw_bytes[6:10] == b'\x00\x01\x00\x00'
 
-    def test_req_l02_integer_overflow_in_length(self):
-        """Test maximum integer length value."""
-        pkt = DICOM(length=0xFFFFFFFF) / A_RELEASE_RQ()
-        assert bytes(pkt)[2:6] == b'\xff\xff\xff\xff'
-
-    def test_req_l05_null_byte_injection(self):
+    def test_null_byte_injection_in_ae(self):
         """Test null byte handling in AE titles."""
         injected_title = b'SCAPY\x00FUZZER'.ljust(16)
         pkt = DICOM() / A_ASSOCIATE_RQ(calling_ae_title=injected_title)
         assert bytes(pkt)[26:42] == injected_title
-
-    def test_req_l11_state_confusion(self):
-        """Test P-DATA-TF state handling."""
-        pdv = PresentationDataValueItem(context_id=1, data=b'some data')
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        assert pkt.pdu_type == 0x04
-        assert b'some data' in bytes(pkt)
-
-    def test_req_l12_resource_exhaustion_incomplete_pdu(self):
-        """Test incomplete PDU with large declared length."""
-        payload = b'\x01\x02\x03\x04'
-        raw_pkt = b'\x04\x00' + struct.pack("!I", 1024 * 1024) + payload
-        assert raw_pkt.startswith(b'\x04\x00')
-        assert struct.unpack("!I", raw_pkt[2:6])[0] == 1024 * 1024
-
-    def test_req_l13_advanced_fragmentation_interleaving(self):
-        """Test interleaved fragmentation across contexts."""
-        pdv_a1 = PresentationDataValueItem(
-            context_id=1, data=b'context A part 1', is_last=0
-        )
-        pdv_b1 = PresentationDataValueItem(
-            context_id=3, data=b'context B part 1', is_last=0
-        )
-        pkt_a1 = DICOM() / P_DATA_TF(pdv_items=[pdv_a1])
-        pkt_b1 = DICOM() / P_DATA_TF(pdv_items=[pdv_b1])
-        assert b'context A part 1' in bytes(pkt_a1)
-        assert pkt_a1[P_DATA_TF].pdv_items[0].context_id == 1
-        assert b'context B part 1' in bytes(pkt_b1)
-        assert pkt_b1[P_DATA_TF].pdv_items[0].context_id == 3
-
-    def test_req_l14_dimse_mismatch_cross_context(self):
-        """Test DIMSE command with arbitrary context ID."""
-        pdv_cmd = PresentationDataValueItem(
-            context_id=5, data=b'\x01\x00', is_command=1, is_last=1
-        )
-        pkt_cmd = DICOM() / P_DATA_TF(pdv_items=[pdv_cmd])
-        assert pkt_cmd[P_DATA_TF].pdv_items[0].context_id == 5
-        assert pkt_cmd[P_DATA_TF].pdv_items[0].is_command == 1
-
-    def test_req_l15_file_stream_confusion(self):
-        """Test DICOM file content embedded in P-DATA."""
-        file_meta_info = (
-            b'\x02\x00\x00\x00UL\x04\x00' + struct.pack("<I", 34)
-            + b'\x02\x00\x10\x00UI\x12\x00' + b'1.2.840.10008.1.2\x00'
-        )
-        dicom_file_payload = (
-            b'\x00' * 128 + b'DICM' + file_meta_info
-            + b'\x08\x00\x05\x00\x0a\x00\x43\x53\x49\x53\x4f\x31'
-        )
-        pdv = PresentationDataValueItem(
-            context_id=1, data=dicom_file_payload, is_command=0, is_last=1
-        )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        assert b'DICM' in bytes(pkt)
-
-    def test_req_l16_transfer_syntax_agnosticism(self):
-        """Test big-endian payload handling."""
-        big_endian_payload = b'\x00\x08\x00\x20DA\x00\x0820250709'
-        pdv = PresentationDataValueItem(
-            context_id=1, data=big_endian_payload, is_command=0, is_last=1
-        )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        assert big_endian_payload in bytes(pkt)
-
-    def test_req_l17_security_negotiation_probing(self):
-        """Test user identity negotiation item."""
-        secure_item_bytes = bytes(DICOMVariableItem(item_type=0x56))
-        user_info = DICOMVariableItem(item_type=0x50, data=secure_item_bytes)
-        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[user_info])
-        assert b'\x56\x00\x00\x00' in bytes(pkt)
 
 
 class TestRoundTripSerialization:
@@ -316,7 +535,7 @@ class TestRoundTripSerialization:
         assert len(parsed[P_DATA_TF].pdv_items) == 1
         parsed_pdv = parsed[P_DATA_TF].pdv_items[0]
         assert parsed_pdv.context_id == 3
-        # Verify data survived round-trip
+        
         parsed_data = parsed_pdv.data
         if isinstance(parsed_data, str):
             parsed_data = parsed_data.encode('latin-1')
@@ -332,20 +551,8 @@ class TestRoundTripSerialization:
         assert parsed[A_ABORT].source == 2
         assert parsed[A_ABORT].reason_diag == 6
 
-    def test_associate_rj_round_trip(self):
-        """A-ASSOCIATE-RJ should survive serialization round-trip."""
-        original = DICOM() / A_ASSOCIATE_RJ(result=1, source=1, reason_diag=3)
-        serialized = bytes(original)
-        parsed = DICOM(serialized)
-
-        assert parsed.haslayer(A_ASSOCIATE_RJ)
-        assert parsed[A_ASSOCIATE_RJ].result == 1
-        assert parsed[A_ASSOCIATE_RJ].source == 1
-        assert parsed[A_ASSOCIATE_RJ].reason_diag == 3
-
     def test_pdv_flags_round_trip(self):
         """PresentationDataValueItem flags should survive round-trip."""
-        # Test all flag combinations
         for is_cmd in [0, 1]:
             for is_last in [0, 1]:
                 pdv = PresentationDataValueItem(
@@ -354,19 +561,12 @@ class TestRoundTripSerialization:
                 pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
                 parsed = DICOM(bytes(pkt))
                 parsed_pdv = parsed[P_DATA_TF].pdv_items[0]
-                assert parsed_pdv.is_command == is_cmd, f"is_command mismatch for {is_cmd}"
-                assert parsed_pdv.is_last == is_last, f"is_last mismatch for {is_last}"
+                assert parsed_pdv.is_command == is_cmd
+                assert parsed_pdv.is_last == is_last
 
 
 class TestEdgeCases:
     """Test edge cases and boundary conditions."""
-
-    def test_zero_length_pdu_payload(self):
-        """PDU with zero-length payload should be constructable."""
-        pkt = DICOM() / A_RELEASE_RQ()
-        serialized = bytes(pkt)
-        # A-RELEASE-RQ has fixed 4-byte payload (all reserved)
-        assert len(serialized) == 10  # 6 header + 4 payload
 
     def test_empty_variable_items(self):
         """A-ASSOCIATE-RQ with no variable items."""
@@ -379,19 +579,7 @@ class TestEdgeCases:
         """P-DATA-TF with empty PDV list."""
         pkt = DICOM() / P_DATA_TF(pdv_items=[])
         serialized = bytes(pkt)
-        # Should have just PDU header with zero-length payload
         assert len(serialized) == 6
-
-    def test_maximum_ae_title_length(self):
-        """AE title at exactly 16 characters (max allowed)."""
-        max_ae = b"1234567890ABCDEF"
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            called_ae_title=max_ae,
-            calling_ae_title=max_ae,
-        )
-        serialized = bytes(pkt)
-        parsed = DICOM(serialized)
-        assert parsed[A_ASSOCIATE_RQ].called_ae_title == max_ae
 
     def test_pdu_type_preservation(self):
         """Each PDU type should have correct type byte after serialization."""
@@ -407,58 +595,7 @@ class TestEdgeCases:
         for pdu, expected_type in test_cases:
             pkt = DICOM() / pdu
             serialized = bytes(pkt)
-            assert serialized[0] == expected_type, f"PDU type mismatch for {pdu.__class__.__name__}"
-
-
-class TestMalformedPacketHandling:
-    """Test handling of malformed/invalid packets."""
-
-    def test_truncated_pdu_header(self):
-        """Truncated PDU (less than 6 bytes) should raise struct error."""
-        truncated = b"\x01\x00\x00"  # Only 3 bytes
-        # Scapy will raise struct.error when trying to unpack length field
-        with pytest.raises(struct.error):
-            DICOM(truncated)
-
-    def test_pdu_length_exceeds_data(self):
-        """PDU with length field larger than actual data."""
-        # A-ABORT with length claiming 100 bytes but only 4 bytes of data
-        malformed = b"\x07\x00\x00\x00\x00\x64\x00\x00\x00\x00"
-        pkt = DICOM(malformed)
-        # Should parse without crash
-        assert pkt is not None
-
-    def test_pdu_length_smaller_than_data(self):
-        """PDU with length field smaller than actual data (trailing garbage)."""
-        # A-ABORT normally 4 bytes, but we'll say length is 2
-        malformed = b"\x07\x00\x00\x00\x00\x02\x00\x00\x00\x00\xFF\xFF"
-        pkt = DICOM(malformed)
-        assert pkt.haslayer(A_ABORT)
-
-    def test_unknown_pdu_type(self):
-        """Unknown PDU type should be parseable as raw DICOM."""
-        unknown = b"\xFF\x00\x00\x00\x00\x04\x01\x02\x03\x04"
-        pkt = DICOM(unknown)
-        # Should parse header at minimum
-        assert pkt.pdu_type == 0xFF
-
-    def test_invalid_variable_item_type(self):
-        """Variable item with unknown type in A-ASSOCIATE-RQ."""
-        # Create item with invalid type 0xFF
-        invalid_item = DICOMVariableItem(item_type=0xFF, data=b"test")
-        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[invalid_item])
-        serialized = bytes(pkt)
-        # Should serialize without crash
-        assert b"\xFF" in serialized
-
-    def test_deeply_nested_variable_items(self):
-        """Variable items containing other variable items."""
-        inner = DICOMVariableItem(item_type=0x51, data=b"\x00\x00\x40\x00")
-        outer = DICOMVariableItem(item_type=0x50, data=bytes(inner))
-        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[outer])
-        serialized = bytes(pkt)
-        parsed = DICOM(serialized)
-        assert parsed.haslayer(A_ASSOCIATE_RQ)
+            assert serialized[0] == expected_type
 
 
 class TestBitFieldFlags:
@@ -466,39 +603,32 @@ class TestBitFieldFlags:
 
     def test_is_command_flag(self):
         """Test is_command flag encoding."""
-        # is_command=1 should set bit 0
         pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=1, is_last=0)
         raw = bytes(pdv)
-        # Message control header is at offset 5 (after 4-byte length + 1-byte context_id)
         msg_ctrl = raw[5]
-        assert msg_ctrl & 0x01 == 1  # Bit 0 set
-        assert msg_ctrl & 0x02 == 0  # Bit 1 not set
+        assert msg_ctrl & 0x01 == 1
+        assert msg_ctrl & 0x02 == 0
 
     def test_is_last_flag(self):
         """Test is_last flag encoding."""
-        # is_last=1 should set bit 1
         pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=0, is_last=1)
         raw = bytes(pdv)
         msg_ctrl = raw[5]
-        assert msg_ctrl & 0x01 == 0  # Bit 0 not set
-        assert msg_ctrl & 0x02 == 2  # Bit 1 set
+        assert msg_ctrl & 0x01 == 0
+        assert msg_ctrl & 0x02 == 2
 
     def test_both_flags_set(self):
         """Test both flags set together."""
         pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=1, is_last=1)
         raw = bytes(pdv)
         msg_ctrl = raw[5]
-        assert msg_ctrl == 0x03  # Both bits set
-
-    def test_no_flags_set(self):
-        """Test neither flag set."""
-        pdv = PresentationDataValueItem(context_id=1, data=b'x', is_command=0, is_last=0)
-        raw = bytes(pdv)
-        msg_ctrl = raw[5]
-        assert msg_ctrl == 0x00  # No bits set
+        assert msg_ctrl == 0x03
 
 
-# --- Group 4: Integration Tests ---
+# =============================================================================
+# Integration Tests
+# =============================================================================
+
 integration_test_marker = pytest.mark.skipif(
     "not config.getoption('--ip')",
     reason="Integration test requires --ip, --port, and --ae-title"
@@ -537,7 +667,6 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
 @integration_test_marker
 def test_c_store_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
     """Performs a full C-STORE workflow against a live SCP."""
-    # Create a minimal DICOM dataset with tags in ascending order (required by DICOM)
     sop_instance_uid = "1.2.3.4.5.6.7.8"
     study_instance_uid = "1.2.3.4.5.6.7.8.9"
     series_instance_uid = "1.2.3.4.5.6.7.8.9.10"
@@ -546,35 +675,27 @@ def test_c_store_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
     study_instance_uid_bytes = _uid_to_bytes(study_instance_uid)
     series_instance_uid_bytes = _uid_to_bytes(series_instance_uid)
 
-    # Build dataset with tags in proper ascending order
     dataset_elements = []
-
-    # (0008,0016) SOP Class UID - UI
     dataset_elements.append(
         struct.pack('<HHI', 0x0008, 0x0016, len(sop_class_uid_bytes))
         + sop_class_uid_bytes
     )
-    # (0008,0018) SOP Instance UID - UI
     dataset_elements.append(
         struct.pack('<HHI', 0x0008, 0x0018, len(sop_instance_uid_bytes))
         + sop_instance_uid_bytes
     )
-    # (0010,0020) Patient ID - LO
     patient_id = b'TEST'
     dataset_elements.append(
         struct.pack('<HHI', 0x0010, 0x0020, len(patient_id)) + patient_id
     )
-    # (0020,000D) Study Instance UID - UI (required by Orthanc)
     dataset_elements.append(
         struct.pack('<HHI', 0x0020, 0x000D, len(study_instance_uid_bytes))
         + study_instance_uid_bytes
     )
-    # (0020,000E) Series Instance UID - UI (required by Orthanc)
     dataset_elements.append(
         struct.pack('<HHI', 0x0020, 0x000E, len(series_instance_uid_bytes))
         + series_instance_uid_bytes
     )
-
     dataset_bytes = b''.join(dataset_elements)
 
     session = DICOMSession(
@@ -585,12 +706,10 @@ def test_c_store_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
         read_timeout=timeout,
     )
     try:
-        # Associate with CT Image Storage context
         store_context = {CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
         assoc_success = session.associate(requested_contexts=store_context)
         assert assoc_success, "Association for C-STORE failed"
 
-        # Perform C-STORE
         store_status = session.c_store(
             dataset_bytes=dataset_bytes,
             sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,

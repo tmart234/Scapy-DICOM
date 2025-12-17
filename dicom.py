@@ -41,9 +41,8 @@ __all__ = [
     "DEFAULT_TRANSFER_SYNTAX_UID",
     "VERIFICATION_SOP_CLASS_UID",
     "CT_IMAGE_STORAGE_SOP_CLASS_UID",
-    # Packet classes
+    # PDU Packet classes
     "DICOM",
-    "DICOMVariableItem",
     "A_ASSOCIATE_RQ",
     "A_ASSOCIATE_AC",
     "A_ASSOCIATE_RJ",
@@ -52,6 +51,17 @@ __all__ = [
     "A_RELEASE_RQ",
     "A_RELEASE_RP",
     "A_ABORT",
+    # Variable Item classes
+    "DICOMVariableItem",
+    "DICOMApplicationContext",
+    "DICOMPresentationContextRQ",
+    "DICOMPresentationContextAC",
+    "DICOMAbstractSyntax",
+    "DICOMTransferSyntax",
+    "DICOMUserInformation",
+    "DICOMMaximumLength",
+    "DICOMImplementationClassUID",
+    "DICOMImplementationVersionName",
     # Session helper
     "DICOMSession",
     # DIMSE builders
@@ -65,6 +75,9 @@ __all__ = [
     "_uid_to_bytes_raw",
     "build_c_echo_rq_dimse_raw",
     "build_c_store_rq_dimse_raw",
+    # Builder helpers
+    "build_presentation_context_rq",
+    "build_user_information",
 ]
 
 log = logging.getLogger("scapy.contrib.dicom")
@@ -85,6 +98,20 @@ PDU_TYPES = {
     0x05: "A-RELEASE-RQ",
     0x06: "A-RELEASE-RP",
     0x07: "A-ABORT",
+}
+
+# Variable Item Type definitions
+ITEM_TYPES = {
+    0x10: "Application Context",
+    0x20: "Presentation Context RQ",
+    0x21: "Presentation Context AC",
+    0x30: "Abstract Syntax",
+    0x40: "Transfer Syntax",
+    0x50: "User Information",
+    0x51: "Maximum Length",
+    0x52: "Implementation Class UID",
+    0x55: "Implementation Version Name",
+    0x56: "User Identity",
 }
 
 
@@ -121,11 +148,6 @@ def _uid_to_bytes_raw(uid):
     Convert a UID string to bytes WITHOUT padding correction.
     
     Use this for fuzzing to send intentionally malformed odd-length UIDs.
-    The DICOM spec requires even-length UIDs, so odd-length UIDs will
-    trigger parsing errors on compliant servers.
-    
-    :param uid: UID as string or bytes
-    :return: Raw bytes without any padding correction
     """
     if isinstance(uid, bytes):
         return uid
@@ -138,17 +160,12 @@ def _uid_to_bytes_raw(uid):
 # --- DIMSE Message Builders ---
 
 def build_c_echo_rq_dimse(message_id=1):
-    """
-    Build a C-ECHO-RQ DIMSE command message.
-
-    :param message_id: Message ID for the request (default: 1)
-    :return: Bytes containing the encoded DIMSE command
-    """
+    """Build a C-ECHO-RQ DIMSE command message."""
     elements = [
-        (0x0000, 0x0002, _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)),  # Affected SOP Class
-        (0x0000, 0x0100, struct.pack("<H", 0x0030)),  # Command Field: C-ECHO-RQ
-        (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
-        (0x0000, 0x0800, struct.pack("<H", 0x0101)),  # Data Set Type: No dataset
+        (0x0000, 0x0002, _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)),
+        (0x0000, 0x0100, struct.pack("<H", 0x0030)),
+        (0x0000, 0x0110, struct.pack("<H", message_id)),
+        (0x0000, 0x0800, struct.pack("<H", 0x0101)),
     ]
     payload = b"".join(
         struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
@@ -163,16 +180,7 @@ def build_c_echo_rq_dimse(message_id=1):
 
 
 def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
-    """
-    Build a C-ECHO-RQ DIMSE command message WITHOUT auto-padding.
-    
-    Use this for fuzzing to send intentionally malformed commands.
-    
-    :param message_id: Message ID for the request (default: 1)
-    :param sop_class_uid: Optional custom SOP Class UID (default: Verification)
-                          Pass raw bytes to include odd-length or malformed UIDs.
-    :return: Bytes containing the encoded DIMSE command (no auto-correction)
-    """
+    """Build a C-ECHO-RQ DIMSE command WITHOUT auto-padding (for fuzzing)."""
     if sop_class_uid is None:
         sop_uid_bytes = _uid_to_bytes_raw(VERIFICATION_SOP_CLASS_UID)
     elif isinstance(sop_class_uid, bytes):
@@ -181,10 +189,10 @@ def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
         sop_uid_bytes = _uid_to_bytes_raw(sop_class_uid)
     
     elements = [
-        (0x0000, 0x0002, sop_uid_bytes),  # Affected SOP Class (raw)
-        (0x0000, 0x0100, struct.pack("<H", 0x0030)),  # Command Field: C-ECHO-RQ
-        (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
-        (0x0000, 0x0800, struct.pack("<H", 0x0101)),  # Data Set Type: No dataset
+        (0x0000, 0x0002, sop_uid_bytes),
+        (0x0000, 0x0100, struct.pack("<H", 0x0030)),
+        (0x0000, 0x0110, struct.pack("<H", message_id)),
+        (0x0000, 0x0800, struct.pack("<H", 0x0101)),
     ]
     payload = b"".join(
         struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
@@ -199,21 +207,14 @@ def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
 
 
 def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1):
-    """
-    Build a C-STORE-RQ DIMSE command message.
-
-    :param sop_class_uid: SOP Class UID of the object to store
-    :param sop_instance_uid: SOP Instance UID of the object to store
-    :param message_id: Message ID for the request (default: 1)
-    :return: Bytes containing the encoded DIMSE command
-    """
+    """Build a C-STORE-RQ DIMSE command message."""
     elements = [
-        (0x0000, 0x0002, _uid_to_bytes(sop_class_uid)),  # Affected SOP Class
-        (0x0000, 0x0100, struct.pack("<H", 0x0001)),  # Command Field: C-STORE-RQ
-        (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
-        (0x0000, 0x0700, struct.pack("<H", 0x0002)),  # Priority: MEDIUM
-        (0x0000, 0x0800, struct.pack("<H", 0x0000)),  # Data Set Type: Dataset present
-        (0x0000, 0x1000, _uid_to_bytes(sop_instance_uid)),  # Affected SOP Instance
+        (0x0000, 0x0002, _uid_to_bytes(sop_class_uid)),
+        (0x0000, 0x0100, struct.pack("<H", 0x0001)),
+        (0x0000, 0x0110, struct.pack("<H", message_id)),
+        (0x0000, 0x0700, struct.pack("<H", 0x0002)),
+        (0x0000, 0x0800, struct.pack("<H", 0x0000)),
+        (0x0000, 0x1000, _uid_to_bytes(sop_instance_uid)),
     ]
     payload = b"".join(
         struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
@@ -228,27 +229,17 @@ def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1):
 
 
 def build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, message_id=1):
-    """
-    Build a C-STORE-RQ DIMSE command message WITHOUT auto-padding.
-    
-    Use this for fuzzing to send intentionally malformed commands with
-    odd-length UIDs or other protocol violations.
-    
-    :param sop_class_uid: SOP Class UID (bytes or str, no auto-padding)
-    :param sop_instance_uid: SOP Instance UID (bytes or str, no auto-padding)
-    :param message_id: Message ID for the request (default: 1)
-    :return: Bytes containing the encoded DIMSE command (no auto-correction)
-    """
+    """Build a C-STORE-RQ DIMSE command WITHOUT auto-padding (for fuzzing)."""
     sop_class_bytes = sop_class_uid if isinstance(sop_class_uid, bytes) else _uid_to_bytes_raw(sop_class_uid)
     sop_inst_bytes = sop_instance_uid if isinstance(sop_instance_uid, bytes) else _uid_to_bytes_raw(sop_instance_uid)
     
     elements = [
-        (0x0000, 0x0002, sop_class_bytes),  # Affected SOP Class (raw)
-        (0x0000, 0x0100, struct.pack("<H", 0x0001)),  # Command Field: C-STORE-RQ
-        (0x0000, 0x0110, struct.pack("<H", message_id)),  # Message ID
-        (0x0000, 0x0700, struct.pack("<H", 0x0002)),  # Priority: MEDIUM
-        (0x0000, 0x0800, struct.pack("<H", 0x0000)),  # Data Set Type: Dataset present
-        (0x0000, 0x1000, sop_inst_bytes),  # Affected SOP Instance (raw)
+        (0x0000, 0x0002, sop_class_bytes),
+        (0x0000, 0x0100, struct.pack("<H", 0x0001)),
+        (0x0000, 0x0110, struct.pack("<H", message_id)),
+        (0x0000, 0x0700, struct.pack("<H", 0x0002)),
+        (0x0000, 0x0800, struct.pack("<H", 0x0000)),
+        (0x0000, 0x1000, sop_inst_bytes),
     ]
     payload = b"".join(
         struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
@@ -263,12 +254,7 @@ def build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, message_id=1):
 
 
 def parse_dimse_status(dimse_bytes):
-    """
-    Parse the Status field from a DIMSE response message.
-
-    :param dimse_bytes: Raw bytes of the DIMSE message
-    :return: Status code (int) or None if parsing fails
-    """
+    """Parse the Status field from a DIMSE response message."""
     try:
         if len(dimse_bytes) < 12:
             return None
@@ -286,7 +272,340 @@ def parse_dimse_status(dimse_bytes):
     return None
 
 
-# --- Scapy Packet Definitions ---
+# =============================================================================
+# DICOM Variable Item Classes (The "Kosher" Approach)
+# =============================================================================
+# These replace the generic "blob" container with proper typed packets.
+# bind_layers dispatches based on item_type, so:
+#   DICOMVariableItem() / DICOMApplicationContext(uid="1.2.3...")
+# automatically sets item_type=0x10 and calculates length.
+# =============================================================================
+
+class DICOMVariableItem(Packet):
+    """
+    DICOM Variable Item Header - Dispatcher packet.
+    
+    This is the base header for all variable items in A-ASSOCIATE PDUs.
+    Use bind_layers to automatically dispatch to the correct sub-type
+    based on item_type.
+    
+    Item Types:
+        0x10: Application Context
+        0x20: Presentation Context (in RQ)
+        0x21: Presentation Context (in AC)
+        0x30: Abstract Syntax (nested in Pres. Context)
+        0x40: Transfer Syntax (nested in Pres. Context)
+        0x50: User Information
+        0x51: Maximum Length Sub-Item
+        0x52: Implementation Class UID
+        0x55: Implementation Version Name
+    """
+    name = "DICOM Variable Item"
+    fields_desc = [
+        ByteEnumField("item_type", 0x10, ITEM_TYPES),
+        ByteField("reserved", 0),
+        ShortField("length", None),
+    ]
+
+    def post_build(self, pkt, pay):
+        """Auto-calculate length field from payload."""
+        if self.length is None:
+            length = len(pay)
+            pkt = pkt[:2] + struct.pack("!H", length) + pkt[4:]
+        return pkt + pay
+
+    def extract_padding(self, s):
+        """Extract padding for PacketListField parsing.
+        
+        Returns (payload_for_this_item, remaining_for_next_item).
+        Uses the length field to determine how much data belongs to this item's payload.
+        """
+        if self.length is not None:
+            return s[:self.length], s[self.length:]
+        return s, b""
+    
+    def guess_payload_class(self, payload):
+        """Dispatch to the correct sub-packet based on item_type."""
+        type_to_class = {
+            0x10: DICOMApplicationContext,
+            0x20: DICOMPresentationContextRQ,
+            0x21: DICOMPresentationContextAC,
+            0x30: DICOMAbstractSyntax,
+            0x40: DICOMTransferSyntax,
+            0x50: DICOMUserInformation,
+            0x51: DICOMMaximumLength,
+            0x52: DICOMImplementationClassUID,
+            0x55: DICOMImplementationVersionName,
+        }
+        return type_to_class.get(self.item_type, DICOMGenericItem)
+
+
+class DICOMApplicationContext(Packet):
+    """
+    Application Context Item payload (Type 0x10).
+    
+    Contains the Application Context UID, typically "1.2.840.10008.3.1.1.1".
+    
+    Usage:
+        pkt = DICOMVariableItem() / DICOMApplicationContext()
+        # item_type automatically set to 0x10, length auto-calculated
+    """
+    name = "DICOM Application Context"
+    fields_desc = [
+        StrLenField("uid", _uid_to_bytes(APP_CONTEXT_UID),
+                    length_from=lambda pkt: (pkt.underlayer.length
+                                             if pkt.underlayer and pkt.underlayer.length
+                                             else len(pkt.uid))),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMAbstractSyntax(Packet):
+    """
+    Abstract Syntax Sub-Item payload (Type 0x30).
+    
+    Nested inside Presentation Context items. Contains the SOP Class UID
+    (e.g., Verification, CT Image Storage).
+    
+    Usage:
+        pkt = DICOMVariableItem() / DICOMAbstractSyntax(uid="1.2.840.10008.1.1")
+    """
+    name = "DICOM Abstract Syntax"
+    fields_desc = [
+        StrLenField("uid", b"",
+                    length_from=lambda pkt: (pkt.underlayer.length
+                                             if pkt.underlayer and pkt.underlayer.length
+                                             else len(pkt.uid))),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMTransferSyntax(Packet):
+    """
+    Transfer Syntax Sub-Item payload (Type 0x40).
+    
+    Nested inside Presentation Context items. Specifies encoding
+    (e.g., Implicit VR Little Endian).
+    
+    Usage:
+        pkt = DICOMVariableItem() / DICOMTransferSyntax(uid="1.2.840.10008.1.2")
+    """
+    name = "DICOM Transfer Syntax"
+    fields_desc = [
+        StrLenField("uid", _uid_to_bytes(DEFAULT_TRANSFER_SYNTAX_UID),
+                    length_from=lambda pkt: (pkt.underlayer.length
+                                             if pkt.underlayer and pkt.underlayer.length
+                                             else len(pkt.uid))),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMPresentationContextRQ(Packet):
+    """
+    Presentation Context Item payload for A-ASSOCIATE-RQ (Type 0x20).
+    
+    Contains:
+        - context_id: Odd number 1-255 identifying this context
+        - Nested items: One Abstract Syntax + one or more Transfer Syntaxes
+    
+    Usage:
+        abs_syn = DICOMVariableItem() / DICOMAbstractSyntax(uid="1.2.840.10008.1.1")
+        ts = DICOMVariableItem() / DICOMTransferSyntax()
+        pctx = DICOMVariableItem() / DICOMPresentationContextRQ(
+            context_id=1,
+            sub_items=[abs_syn, ts]
+        )
+    """
+    name = "DICOM Presentation Context RQ"
+    fields_desc = [
+        ByteField("context_id", 1),
+        ByteField("reserved1", 0),
+        ByteField("reserved2", 0),
+        ByteField("reserved3", 0),
+        PacketListField("sub_items", [],
+                        DICOMVariableItem,
+                        max_count=64,
+                        length_from=lambda pkt: (pkt.underlayer.length - 4
+                                                  if pkt.underlayer and pkt.underlayer.length
+                                                  else 0)),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMPresentationContextAC(Packet):
+    """
+    Presentation Context Item payload for A-ASSOCIATE-AC (Type 0x21).
+    
+    Contains:
+        - context_id: Matches the RQ context_id
+        - result: 0=accepted, 1=user-rejection, 2=no-reason, 3=abstract-syntax-not-supported, 4=transfer-syntaxes-not-supported
+        - Nested: One Transfer Syntax (the accepted one)
+    
+    Usage:
+        ts = DICOMVariableItem() / DICOMTransferSyntax()
+        pctx_ac = DICOMVariableItem() / DICOMPresentationContextAC(
+            context_id=1,
+            result=0,
+            sub_items=[ts]
+        )
+    """
+    name = "DICOM Presentation Context AC"
+    
+    RESULT_CODES = {
+        0: "acceptance",
+        1: "user-rejection",
+        2: "no-reason",
+        3: "abstract-syntax-not-supported",
+        4: "transfer-syntaxes-not-supported",
+    }
+    
+    fields_desc = [
+        ByteField("context_id", 1),
+        ByteField("reserved1", 0),
+        ByteEnumField("result", 0, RESULT_CODES),
+        ByteField("reserved2", 0),
+        PacketListField("sub_items", [],
+                        DICOMVariableItem,
+                        max_count=8,
+                        length_from=lambda pkt: (pkt.underlayer.length - 4
+                                                  if pkt.underlayer and pkt.underlayer.length
+                                                  else 0)),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMMaximumLength(Packet):
+    """
+    Maximum Length Sub-Item payload (Type 0x51).
+    
+    Nested inside User Information. Specifies the maximum PDU size
+    that can be received.
+    
+    Usage:
+        max_len = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
+    """
+    name = "DICOM Maximum Length"
+    fields_desc = [
+        IntField("max_pdu_length", 16384),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMImplementationClassUID(Packet):
+    """
+    Implementation Class UID Sub-Item payload (Type 0x52).
+    
+    Nested inside User Information. Identifies the implementation.
+    
+    Usage:
+        impl = DICOMVariableItem() / DICOMImplementationClassUID(uid="1.2.3.4")
+    """
+    name = "DICOM Implementation Class UID"
+    fields_desc = [
+        StrLenField("uid", b"",
+                    length_from=lambda pkt: (pkt.underlayer.length
+                                             if pkt.underlayer and pkt.underlayer.length
+                                             else len(pkt.uid))),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMImplementationVersionName(Packet):
+    """
+    Implementation Version Name Sub-Item payload (Type 0x55).
+    
+    Nested inside User Information. Version string for the implementation.
+    
+    Usage:
+        ver = DICOMVariableItem() / DICOMImplementationVersionName(name=b"SCAPY_DICOM")
+    """
+    name = "DICOM Implementation Version Name"
+    fields_desc = [
+        StrLenField("name", b"",
+                    length_from=lambda pkt: (pkt.underlayer.length
+                                             if pkt.underlayer and pkt.underlayer.length
+                                             else len(pkt.name))),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMUserInformation(Packet):
+    """
+    User Information Item payload (Type 0x50).
+    
+    Contains nested sub-items like Maximum Length, Implementation Class UID, etc.
+    
+    Usage:
+        max_len = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
+        user_info = DICOMVariableItem() / DICOMUserInformation(sub_items=[max_len])
+    """
+    name = "DICOM User Information"
+    fields_desc = [
+        PacketListField("sub_items", [],
+                        DICOMVariableItem,
+                        max_count=32,
+                        length_from=lambda pkt: (pkt.underlayer.length
+                                                  if pkt.underlayer and pkt.underlayer.length
+                                                  else 0)),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMGenericItem(Packet):
+    """
+    Generic/Unknown Item payload for unrecognized item types.
+    
+    Used as fallback when item_type doesn't match a known type.
+    Allows parsing unknown item types without failing.
+    """
+    name = "DICOM Generic Item"
+    fields_desc = [
+        StrLenField("data", b"",
+                    length_from=lambda pkt: (pkt.underlayer.length
+                                             if pkt.underlayer and pkt.underlayer.length
+                                             else len(pkt.data))),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+# --- Variable Item Layer Bindings ---
+# These bind the item_type field to the appropriate payload class
+bind_layers(DICOMVariableItem, DICOMApplicationContext, item_type=0x10)
+bind_layers(DICOMVariableItem, DICOMPresentationContextRQ, item_type=0x20)
+bind_layers(DICOMVariableItem, DICOMPresentationContextAC, item_type=0x21)
+bind_layers(DICOMVariableItem, DICOMAbstractSyntax, item_type=0x30)
+bind_layers(DICOMVariableItem, DICOMTransferSyntax, item_type=0x40)
+bind_layers(DICOMVariableItem, DICOMUserInformation, item_type=0x50)
+bind_layers(DICOMVariableItem, DICOMMaximumLength, item_type=0x51)
+bind_layers(DICOMVariableItem, DICOMImplementationClassUID, item_type=0x52)
+bind_layers(DICOMVariableItem, DICOMImplementationVersionName, item_type=0x55)
+# Fallback for unknown types
+bind_layers(DICOMVariableItem, DICOMGenericItem)
+
+
+# =============================================================================
+# DICOM PDU Classes
+# =============================================================================
 
 class DICOM(Packet):
     """
@@ -308,37 +627,6 @@ class DICOM(Packet):
         return pkt + pay
 
 
-class DICOMVariableItem(Packet):
-    """
-    DICOM Variable Item used in A-ASSOCIATE PDUs.
-
-    Used for Application Context, Presentation Context, and User Information items.
-    
-    Item Types:
-        0x10: Application Context
-        0x20: Presentation Context (in RQ)
-        0x21: Presentation Context (in AC)
-        0x30: Abstract Syntax
-        0x40: Transfer Syntax
-        0x50: User Information
-        0x51: Maximum Length Sub-Item
-        0x52: Implementation Class UID
-        0x55: Implementation Version Name
-        0x56: User Identity Negotiation
-    """
-    name = "DICOM Variable Item"
-    fields_desc = [
-        ByteField("item_type", 0x10),
-        ByteField("reserved", 0),
-        FieldLenField("length", None, length_of="data", fmt="!H"),
-        StrLenField("data", b"", length_from=lambda pkt: pkt.length or 0),
-    ]
-
-    def extract_padding(self, s):
-        """Return remaining data for next packet in list."""
-        return b"", s
-
-
 class PresentationDataValueItem(Packet):
     """
     Presentation Data Value Item within a P-DATA-TF PDU.
@@ -351,11 +639,9 @@ class PresentationDataValueItem(Packet):
     """
     name = "PresentationDataValueItem"
     fields_desc = [
-        # Length field: includes context_id (1) + control header (1) + data
         FieldLenField("length", None, length_of="data", fmt="!I",
                       adjust=lambda pkt, x: x + 2),
         ByteField("context_id", 1),
-        # Message control header as bit fields (MSB to LSB)
         BitField("reserved_bits", 0, 6),
         BitField("is_last", 0, 1),
         BitField("is_command", 0, 1),
@@ -364,7 +650,6 @@ class PresentationDataValueItem(Packet):
     ]
 
     def extract_padding(self, s):
-        """Return remaining data for next packet in list."""
         return b"", s
 
 
@@ -381,8 +666,6 @@ class A_ASSOCIATE_RQ(Packet):
         StrFixedLenField("called_ae_title", b"", 16),
         StrFixedLenField("calling_ae_title", b"", 16),
         StrFixedLenField("reserved2", b"\x00" * 32, 32),
-        # DICOM allows up to 128 presentation contexts, plus app context and user info
-        # Use max_count=256 to allow for all standard items plus some headroom
         PacketListField("variable_items", [],
                         DICOMVariableItem,
                         max_count=256,
@@ -405,7 +688,6 @@ class A_ASSOCIATE_AC(Packet):
         StrFixedLenField("called_ae_title", b"", 16),
         StrFixedLenField("calling_ae_title", b"", 16),
         StrFixedLenField("reserved2", b"\x00" * 32, 32),
-        # DICOM allows up to 128 presentation contexts, plus app context and user info
         PacketListField("variable_items", [],
                         DICOMVariableItem,
                         max_count=256,
@@ -416,11 +698,7 @@ class A_ASSOCIATE_AC(Packet):
 
 
 class A_ASSOCIATE_RJ(Packet):
-    """
-    A-ASSOCIATE-RJ PDU for rejecting an association.
-
-    Contains result, source, and reason/diagnostic fields.
-    """
+    """A-ASSOCIATE-RJ PDU for rejecting an association."""
     name = "A-ASSOCIATE-RJ"
     fields_desc = [
         ByteField("reserved1", 0),
@@ -438,7 +716,6 @@ class P_DATA_TF(Packet):
     """
     name = "P-DATA-TF"
     fields_desc = [
-        # Usually only a few PDV items per P-DATA-TF, but allow headroom
         PacketListField("pdv_items", [],
                         PresentationDataValueItem,
                         max_count=256,
@@ -471,7 +748,7 @@ class A_ABORT(Packet):
     ]
 
 
-# --- Layer Bindings ---
+# --- PDU Layer Bindings ---
 bind_layers(TCP, DICOM, dport=DICOM_PORT)
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
 bind_layers(DICOM, A_ASSOCIATE_RQ, pdu_type=0x01)
@@ -483,7 +760,65 @@ bind_layers(DICOM, A_RELEASE_RP, pdu_type=0x06)
 bind_layers(DICOM, A_ABORT, pdu_type=0x07)
 
 
-# --- DICOM Session Helper Class ---
+# =============================================================================
+# Helper Functions for Building Packets
+# =============================================================================
+
+def build_presentation_context_rq(context_id, abstract_syntax_uid, transfer_syntax_uids):
+    """
+    Build a Presentation Context RQ item using proper Scapy packets.
+    
+    :param context_id: Odd number 1-255
+    :param abstract_syntax_uid: SOP Class UID (string or bytes)
+    :param transfer_syntax_uids: List of Transfer Syntax UIDs
+    :return: DICOMVariableItem / DICOMPresentationContextRQ packet
+    """
+    # Build Abstract Syntax sub-item
+    abs_syn = DICOMVariableItem() / DICOMAbstractSyntax(uid=_uid_to_bytes(abstract_syntax_uid))
+    
+    # Build Transfer Syntax sub-items
+    sub_items = [abs_syn]
+    for ts_uid in transfer_syntax_uids:
+        ts = DICOMVariableItem() / DICOMTransferSyntax(uid=_uid_to_bytes(ts_uid))
+        sub_items.append(ts)
+    
+    # Build Presentation Context
+    return DICOMVariableItem() / DICOMPresentationContextRQ(
+        context_id=context_id,
+        sub_items=sub_items,
+    )
+
+
+def build_user_information(max_pdu_length=16384, implementation_class_uid=None, implementation_version=None):
+    """
+    Build a User Information item using proper Scapy packets.
+    
+    :param max_pdu_length: Maximum PDU size to negotiate
+    :param implementation_class_uid: Optional implementation class UID
+    :param implementation_version: Optional implementation version name
+    :return: DICOMVariableItem / DICOMUserInformation packet
+    """
+    sub_items = [
+        DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=max_pdu_length)
+    ]
+    
+    if implementation_class_uid:
+        sub_items.append(
+            DICOMVariableItem() / DICOMImplementationClassUID(uid=_uid_to_bytes(implementation_class_uid))
+        )
+    
+    if implementation_version:
+        ver_bytes = implementation_version if isinstance(implementation_version, bytes) else implementation_version.encode('ascii')
+        sub_items.append(
+            DICOMVariableItem() / DICOMImplementationVersionName(name=ver_bytes)
+        )
+    
+    return DICOMVariableItem() / DICOMUserInformation(sub_items=sub_items)
+
+
+# =============================================================================
+# DICOM Session Helper Class
+# =============================================================================
 
 class DICOMSession:
     """
@@ -499,10 +834,6 @@ class DICOMSession:
             status = session.c_echo()
             print(f"C-ECHO status: {status}")
             session.release()
-    
-    For protocol fuzzing, use raw_mode=True to disable auto-corrections::
-    
-        session = DICOMSession("192.168.1.100", 104, "TARGET_AE", raw_mode=True)
     """
 
     def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", 
@@ -528,18 +859,12 @@ class DICOMSession:
         self.read_timeout = read_timeout
         self._current_message_id_counter = int(time.time()) % 50000
         self._proposed_max_pdu = 16384
-        self.max_pdu_length = 16384  # Will be updated during association
+        self.max_pdu_length = 16384
         self.raw_mode = raw_mode
-        
-        # Track the mapping of context ID -> abstract syntax as we propose them
         self._proposed_context_map = {}
 
     def connect(self):
-        """
-        Establish TCP connection to the DICOM server.
-
-        :return: True if connection successful, False otherwise
-        """
+        """Establish TCP connection to the DICOM server."""
         try:
             self.sock = socket.create_connection(
                 (self.dst_ip, self.dst_port),
@@ -552,16 +877,8 @@ class DICOMSession:
             return False
 
     def _recv_pdu(self):
-        """
-        Receive a complete DICOM PDU from the socket.
-
-        Reads the 6-byte PDU header first to get the length,
-        then reads the complete PDU payload.
-
-        :return: Complete PDU bytes or None on error/timeout
-        """
+        """Receive a complete DICOM PDU from the socket."""
         try:
-            # Read PDU header (6 bytes: type, reserved, length)
             header = b""
             while len(header) < 6:
                 chunk = self.sock.recv(6 - len(header))
@@ -569,10 +886,8 @@ class DICOMSession:
                     return None
                 header += chunk
 
-            # Parse length from header (bytes 2-6, big-endian)
             pdu_length = struct.unpack("!I", header[2:6])[0]
 
-            # Read PDU payload
             payload = b""
             while len(payload) < pdu_length:
                 chunk = self.sock.recv(pdu_length - len(payload))
@@ -592,14 +907,7 @@ class DICOMSession:
         self.sock.sendall(bytes(pkt))
     
     def send_raw_bytes(self, raw_bytes):
-        """
-        Send raw bytes directly to the socket without any processing.
-        
-        Use this for fuzzing to send completely malformed PDUs that
-        bypass Scapy's packet construction.
-        
-        :param raw_bytes: Raw bytes to send
-        """
+        """Send raw bytes directly to the socket (for fuzzing)."""
         self.sock.sendall(raw_bytes)
 
     def associate(self, requested_contexts=None):
@@ -619,40 +927,27 @@ class DICOMSession:
                 VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]
             }
 
-        # Clear previous mapping
         self._proposed_context_map = {}
 
-        # Build variable items
+        # Build variable items using proper Scapy packets (no more struct.pack!)
         variable_items = [
-            DICOMVariableItem(item_type=0x10, data=_uid_to_bytes(APP_CONTEXT_UID))
+            # Application Context - just stack the layers
+            DICOMVariableItem() / DICOMApplicationContext()
         ]
 
-        # Build presentation contexts and track the mapping
+        # Build presentation contexts
         ctx_id = 1
         for abs_syntax, trn_syntaxes in requested_contexts.items():
-            # Store the mapping BEFORE we increment ctx_id
             self._proposed_context_map[ctx_id] = abs_syntax
             
-            sub_items_data = bytes(
-                DICOMVariableItem(item_type=0x30, data=_uid_to_bytes(abs_syntax))
-            )
-            for ts in trn_syntaxes:
-                sub_items_data += bytes(
-                    DICOMVariableItem(item_type=0x40, data=_uid_to_bytes(ts))
-                )
-            variable_items.append(
-                DICOMVariableItem(
-                    item_type=0x20,
-                    data=struct.pack("!BBBB", ctx_id, 0, 0, 0) + sub_items_data,
-                )
-            )
+            # Use helper function to build presentation context
+            pctx = build_presentation_context_rq(ctx_id, abs_syntax, trn_syntaxes)
+            variable_items.append(pctx)
             ctx_id += 2
 
-        # User information item with max PDU length
-        user_info_data = bytes(
-            DICOMVariableItem(item_type=0x51, data=struct.pack("!I", 16384))
-        )
-        variable_items.append(DICOMVariableItem(item_type=0x50, data=user_info_data))
+        # User Information with Max PDU Length
+        user_info = build_user_information(max_pdu_length=self._proposed_max_pdu)
+        variable_items.append(user_info)
 
         # Build and send A-ASSOCIATE-RQ
         assoc_rq = DICOM() / A_ASSOCIATE_RQ(
@@ -687,75 +982,52 @@ class DICOMSession:
         """Parse max PDU length from A-ASSOCIATE-AC User Information."""
         try:
             for item in response[A_ASSOCIATE_AC].variable_items:
-                # User Information item (0x50)
-                if item.item_type == 0x50:
-                    user_data = item.data
-                    if isinstance(user_data, str):
-                        user_data = user_data.encode("latin-1")
-                    # Parse sub-items within User Information
-                    offset = 0
-                    while offset < len(user_data) - 4:
-                        sub_type = user_data[offset]
-                        sub_len = struct.unpack("!H", user_data[offset + 2:offset + 4])[0]
-                        # Max PDU Length sub-item (0x51)
-                        if sub_type == 0x51 and sub_len == 4:
-                            server_max = struct.unpack(
-                                "!I", user_data[offset + 4:offset + 8]
-                            )[0]
-                            # Use minimum of what we proposed and server accepts
+                # Check if this is a User Information item
+                if item.item_type == 0x50 and item.haslayer(DICOMUserInformation):
+                    user_info = item[DICOMUserInformation]
+                    for sub_item in user_info.sub_items:
+                        if sub_item.item_type == 0x51 and sub_item.haslayer(DICOMMaximumLength):
+                            server_max = sub_item[DICOMMaximumLength].max_pdu_length
                             self.max_pdu_length = min(self._proposed_max_pdu, server_max)
                             log.debug("Negotiated max PDU length: %d", self.max_pdu_length)
                             return
-                        offset += 4 + sub_len
         except Exception as e:
             log.debug("Could not parse max PDU length: %s", e)
-        # Keep default if parsing fails
         self.max_pdu_length = self._proposed_max_pdu
 
     def _parse_accepted_contexts(self, response):
-        """
-        Parse accepted presentation contexts from A-ASSOCIATE-AC.
-        
-        Uses the stored _proposed_context_map to correctly map
-        context IDs to abstract syntaxes.
-        """
+        """Parse accepted presentation contexts from A-ASSOCIATE-AC."""
         for item in response[A_ASSOCIATE_AC].variable_items:
-            # Presentation Context Accept item (0x21)
-            if item.item_type == 0x21:
-                item_data = item.data
-                if isinstance(item_data, str):
-                    item_data = item_data.encode("latin-1")
-                if len(item_data) < 4:
-                    continue
-                ctx_id = item_data[0]
-                result = item_data[2]
+            # Check if this is a Presentation Context AC item
+            if item.item_type == 0x21 and item.haslayer(DICOMPresentationContextAC):
+                pctx = item[DICOMPresentationContextAC]
+                ctx_id = pctx.context_id
+                result = pctx.result
+                
                 if result != 0:  # Not accepted
                     log.debug("Presentation context %d rejected (result=%d)", ctx_id, result)
                     continue
                 
-                # Look up the abstract syntax from our stored mapping
                 abs_syntax = self._proposed_context_map.get(ctx_id)
                 if abs_syntax is None:
                     log.warning(
-                        "Server accepted context ID %d which we didn't propose! "
-                        "This may indicate a server bug or a protocol attack.",
+                        "Server accepted context ID %d which we didn't propose!",
                         ctx_id
                     )
                     continue
                 
-                # Parse transfer syntax from sub-item
-                ts_item_data = item_data[4:]
-                if len(ts_item_data) > 4:
-                    ts_item = DICOMVariableItem(ts_item_data)
-                    ts_data = ts_item.data
-                    if isinstance(ts_data, str):
-                        ts_data = ts_data.encode("latin-1")
-                    ts_uid = ts_data.rstrip(b"\x00").decode("ascii")
-                    self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
-                    log.debug(
-                        "Accepted context %d: %s with transfer syntax %s",
-                        ctx_id, abs_syntax, ts_uid
-                    )
+                # Get the accepted transfer syntax from sub-items
+                for sub_item in pctx.sub_items:
+                    if sub_item.item_type == 0x40 and sub_item.haslayer(DICOMTransferSyntax):
+                        ts_uid = sub_item[DICOMTransferSyntax].uid
+                        if isinstance(ts_uid, bytes):
+                            ts_uid = ts_uid.rstrip(b"\x00").decode("ascii")
+                        self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
+                        log.debug(
+                            "Accepted context %d: %s with transfer syntax %s",
+                            ctx_id, abs_syntax, ts_uid
+                        )
+                        break
 
     def _get_next_message_id(self):
         """Get the next message ID for DIMSE commands."""
@@ -763,13 +1035,7 @@ class DICOMSession:
         return self._current_message_id_counter & 0xFFFF
 
     def _find_accepted_context_id(self, sop_class_uid, transfer_syntax_uid=None):
-        """
-        Find an accepted presentation context ID for the given SOP Class.
-
-        :param sop_class_uid: SOP Class UID to find
-        :param transfer_syntax_uid: Optional specific Transfer Syntax UID
-        :return: Context ID if found, None otherwise
-        """
+        """Find an accepted presentation context ID for the given SOP Class."""
         for ctx_id, (abs_syntax, ts_syntax) in self.accepted_contexts.items():
             if abs_syntax == sop_class_uid:
                 if transfer_syntax_uid is None or transfer_syntax_uid == ts_syntax:
@@ -845,13 +1111,11 @@ class DICOMSession:
 
         msg_id = self._get_next_message_id()
         
-        # Use raw builder in raw_mode to allow malformed UIDs
         if self.raw_mode:
             dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
         else:
             dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
 
-        # Command PDV (is_last=1 means last fragment of command)
         cmd_pdv = PresentationDataValueItem(
             context_id=store_ctx_id,
             data=dimse_rq,
@@ -861,13 +1125,9 @@ class DICOMSession:
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
         self._send_pdu(pdata_cmd)
 
-        # Fragment data if it exceeds max PDV size
-        # Max PDV data = max_pdu_length - 6 (PDV item header: 4 len + 1 ctx + 1 flags)
-        # Use conservative margin for safety
-        max_pdv_data = self.max_pdu_length - 12  # Extra margin for safety
+        max_pdv_data = self.max_pdu_length - 12
 
         if len(dataset_bytes) <= max_pdv_data:
-            # Data fits in single PDU
             data_pdv = PresentationDataValueItem(
                 context_id=store_ctx_id,
                 data=dataset_bytes,
@@ -877,7 +1137,6 @@ class DICOMSession:
             pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
             self._send_pdu(pdata_data)
         else:
-            # Fragment data across multiple PDUs
             offset = 0
             while offset < len(dataset_bytes):
                 chunk = dataset_bytes[offset:offset + max_pdv_data]
@@ -913,35 +1172,18 @@ class DICOMSession:
     
     def c_store_raw(self, dataset_bytes, sop_class_uid, sop_instance_uid,
                     context_id, skip_padding=True):
-        """
-        Send a raw C-STORE request for fuzzing purposes.
-        
-        This method allows full control over the PDV construction,
-        enabling fuzzing of:
-        - Arbitrary context IDs (including non-negotiated ones)
-        - Odd-length UIDs
-        - Malformed dataset payloads
-        
-        :param dataset_bytes: Raw bytes of the DICOM dataset (no auto-correction)
-        :param sop_class_uid: SOP Class UID (bytes or str, no auto-padding if skip_padding)
-        :param sop_instance_uid: SOP Instance UID (bytes or str, no auto-padding if skip_padding)
-        :param context_id: Explicit context ID to use (can be any value for fuzzing)
-        :param skip_padding: If True, don't auto-pad UIDs to even length
-        :return: Status code or None
-        """
+        """Send a raw C-STORE request for fuzzing purposes."""
         if not self.assoc_established:
             log.error("Association not established")
             return None
 
         msg_id = self._get_next_message_id()
         
-        # Build command with optional padding skip
         if skip_padding:
             dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
         else:
             dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
 
-        # Command PDV with explicit context ID
         cmd_pdv = PresentationDataValueItem(
             context_id=context_id,
             data=dimse_rq,
@@ -951,7 +1193,6 @@ class DICOMSession:
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
         self._send_pdu(pdata_cmd)
 
-        # Data PDV - send as single chunk for fuzzing (no fragmentation logic)
         data_pdv = PresentationDataValueItem(
             context_id=context_id,
             data=dataset_bytes,
@@ -979,11 +1220,7 @@ class DICOMSession:
         return None
 
     def release(self):
-        """
-        Request graceful release of the association.
-
-        :return: True if release confirmed, False otherwise
-        """
+        """Request graceful release of the association."""
         if not self.assoc_established:
             return True
 
