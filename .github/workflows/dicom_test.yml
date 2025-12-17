@@ -25,6 +25,8 @@ jobs:
           pip install scapy pytest
 
       - name: Run unit tests
+        env:
+          PYTHONPATH: .
         run: |
           pytest test/test_dicom.py -v -k "not integration"
 
@@ -119,6 +121,8 @@ jobs:
       - name: Run Integration Tests
         id: test_script
         continue-on-error: true
+        env:
+          PYTHONPATH: .
         run: |
           TIMEOUT=30
           if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
