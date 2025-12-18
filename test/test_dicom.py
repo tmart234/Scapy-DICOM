@@ -56,7 +56,6 @@ from dicom import (
     C_STORE_RSP,
     C_FIND_RQ,
     # Helpers
-    build_c_echo_rq_dimse,
     build_presentation_context_rq,
     build_user_information,
     DICOMSession,
@@ -170,12 +169,6 @@ class TestDIMSEPacketBaseClass:
         group_len = struct.unpack('<I', raw[8:12])[0]
         remaining_bytes = len(raw) - 12
         assert group_len == remaining_bytes
-
-    def test_legacy_builder_matches_packet_class(self):
-        """Legacy builder should produce identical output to packet class."""
-        legacy = build_c_echo_rq_dimse(message_id=42)
-        kosher = bytes(C_ECHO_RQ(message_id=42))
-        assert legacy == kosher
 
 
 # =============================================================================
@@ -555,7 +548,7 @@ class TestCoreLayerValidation:
 
     def test_construct_pdata_with_cecho(self):
         """Test P-DATA-TF with C-ECHO DIMSE command."""
-        c_echo_dimse = build_c_echo_rq_dimse(message_id=123)
+        c_echo_dimse = bytes(C_ECHO_RQ(message_id=123))
         pdv_echo = PresentationDataValueItem(
             context_id=1, data=c_echo_dimse, is_command=1, is_last=1
         )
@@ -712,13 +705,6 @@ class TestDIMSEPacketClasses:
         # Find the tag and check the value
         assert b'\x10\x01' in raw  # Tag element 0x0110
         assert struct.pack("<H", 12345) in raw
-
-    def test_c_echo_rq_matches_legacy_builder(self):
-        """C_ECHO_RQ packet should produce same bytes as legacy build function."""
-        legacy = build_c_echo_rq_dimse(message_id=42)
-        kosher = bytes(C_ECHO_RQ(message_id=42))
-        
-        assert legacy == kosher
 
     def test_c_echo_rsp_creation(self):
         """C_ECHO_RSP packet should be creatable."""

@@ -79,14 +79,12 @@ __all__ = [
     "C_FIND_RQ",
     # Session helper
     "DICOMSession",
-    # Legacy DIMSE builders (deprecated - use packet classes)
-    "build_c_echo_rq_dimse",
-    "build_c_store_rq_dimse",
+    # DIMSE utilities
     "parse_dimse_status",
     # Utility functions
     "_pad_ae_title",
     "_uid_to_bytes",
-    # Raw/Fuzzing utilities (no auto-correction)
+    # Raw/Fuzzing utilities (no auto-correction, bypass UID padding)
     "_uid_to_bytes_raw",
     "build_c_echo_rq_dimse_raw",
     "build_c_store_rq_dimse_raw",
@@ -548,22 +546,11 @@ class C_FIND_RQ(DIMSEPacket):
 
 
 # =============================================================================
-# Legacy DIMSE Message Builders (kept for backward compatibility)
+# Raw DIMSE Builders (for fuzzing - bypass auto-padding)
 # =============================================================================
-# These functions are deprecated. Use the packet classes above instead:
-#   OLD: build_c_echo_rq_dimse(message_id=1)
-#   NEW: bytes(C_ECHO_RQ(message_id=1))
+# These functions bypass the auto-padding that packet classes do,
+# allowing you to send intentionally malformed odd-length UIDs.
 # =============================================================================
-
-def build_c_echo_rq_dimse(message_id=1):
-    """
-    Build a C-ECHO-RQ DIMSE command message.
-    
-    DEPRECATED: Use C_ECHO_RQ packet class instead:
-        bytes(C_ECHO_RQ(message_id=1))
-    """
-    return bytes(C_ECHO_RQ(message_id=message_id))
-
 
 def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
     """Build a C-ECHO-RQ DIMSE command WITHOUT auto-padding (for fuzzing)."""
@@ -590,24 +577,6 @@ def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
         + struct.pack("<I", group_len)
         + payload
     )
-
-
-def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1):
-    """
-    Build a C-STORE-RQ DIMSE command message.
-    
-    DEPRECATED: Use C_STORE_RQ packet class instead:
-        bytes(C_STORE_RQ(
-            affected_sop_class_uid=sop_class_uid,
-            affected_sop_instance_uid=sop_instance_uid,
-            message_id=message_id
-        ))
-    """
-    return bytes(C_STORE_RQ(
-        affected_sop_class_uid=sop_class_uid,
-        affected_sop_instance_uid=sop_instance_uid,
-        message_id=message_id,
-    ))
 
 
 def build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, message_id=1):
