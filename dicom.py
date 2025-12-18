@@ -62,9 +62,21 @@ __all__ = [
     "DICOMMaximumLength",
     "DICOMImplementationClassUID",
     "DICOMImplementationVersionName",
+    # DIMSE Custom Fields
+    "DICOMElementField",
+    "DICOMUIDField",
+    "DICOMUIDFieldRaw",
+    "DICOMUSField",
+    "DICOMULField",
+    # DIMSE Command Packets
+    "C_ECHO_RQ",
+    "C_ECHO_RSP",
+    "C_STORE_RQ",
+    "C_STORE_RSP",
+    "C_FIND_RQ",
     # Session helper
     "DICOMSession",
-    # DIMSE builders
+    # Legacy DIMSE builders (deprecated - use packet classes)
     "build_c_echo_rq_dimse",
     "build_c_store_rq_dimse",
     "parse_dimse_status",
@@ -157,26 +169,377 @@ def _uid_to_bytes_raw(uid):
         return b""
 
 
-# --- DIMSE Message Builders ---
+# =============================================================================
+# DIMSE Custom Fields
+# =============================================================================
+# These fields handle DICOM's TLV (Tag-Length-Value) structure with
+# Implicit VR Little Endian encoding used in command sets.
+# =============================================================================
+
+from scapy.fields import Field
+
+
+class DICOMElementField(Field):
+    """
+    Base field for DICOM data elements (Tag-Length-Value structure).
+    
+    Each element is encoded as:
+        - Tag Group: 2 bytes (little-endian)
+        - Tag Element: 2 bytes (little-endian)
+        - Value Length: 4 bytes (little-endian)
+        - Value: variable bytes
+    
+    The tag is fixed at field definition time.
+    """
+    __slots__ = ["tag_group", "tag_elem"]
+    
+    def __init__(self, name, default, tag_group, tag_elem):
+        self.tag_group = tag_group
+        self.tag_elem = tag_elem
+        Field.__init__(self, name, default)
+    
+    def addfield(self, pkt, s, val):
+        """Serialize the field to bytes."""
+        if val is None:
+            val = b""
+        if isinstance(val, str):
+            val = val.encode("ascii")
+        return s + struct.pack("<HHI", self.tag_group, self.tag_elem, len(val)) + val
+    
+    def getfield(self, pkt, s):
+        """Parse the field from bytes."""
+        if len(s) < 8:
+            return s, b""
+        tag_g, tag_e, length = struct.unpack("<HHI", s[:8])
+        # Verify tag matches (optional - for strict parsing)
+        value = s[8:8 + length]
+        return s[8 + length:], value
+    
+    def i2repr(self, pkt, val):
+        """Human-readable representation."""
+        if isinstance(val, bytes):
+            try:
+                return val.decode("ascii").rstrip("\x00")
+            except UnicodeDecodeError:
+                return val.hex()
+        return repr(val)
+
+
+class DICOMUIDField(DICOMElementField):
+    """
+    DICOM UID element field - auto-pads to even length per DICOM spec.
+    
+    Usage:
+        DICOMUIDField("affected_sop_class_uid", VERIFICATION_SOP_CLASS_UID, 0x0000, 0x0002)
+    """
+    
+    def addfield(self, pkt, s, val):
+        """Serialize UID with even-length padding."""
+        val = _uid_to_bytes(val)
+        return super().addfield(pkt, s, val)
+    
+    def i2repr(self, pkt, val):
+        """Display UID as string."""
+        if isinstance(val, bytes):
+            return val.decode("ascii").rstrip("\x00")
+        return str(val)
+
+
+class DICOMUIDFieldRaw(DICOMElementField):
+    """
+    DICOM UID element field WITHOUT auto-padding (for fuzzing).
+    
+    Use this to send intentionally malformed odd-length UIDs.
+    """
+    
+    def addfield(self, pkt, s, val):
+        """Serialize UID without padding correction."""
+        val = _uid_to_bytes_raw(val)
+        return super().addfield(pkt, s, val)
+
+
+class DICOMUSField(DICOMElementField):
+    """
+    DICOM US (Unsigned Short) element field.
+    
+    Value is a 16-bit unsigned integer.
+    
+    Usage:
+        DICOMUSField("command_field", 0x0030, 0x0000, 0x0100)
+    """
+    
+    def addfield(self, pkt, s, val):
+        """Serialize unsigned short."""
+        val_bytes = struct.pack("<H", val)
+        return super().addfield(pkt, s, val_bytes)
+    
+    def getfield(self, pkt, s):
+        """Parse unsigned short."""
+        remain, val_bytes = super().getfield(pkt, s)
+        if len(val_bytes) >= 2:
+            return remain, struct.unpack("<H", val_bytes[:2])[0]
+        return remain, 0
+    
+    def i2repr(self, pkt, val):
+        """Display as hex."""
+        return f"0x{val:04X}"
+
+
+class DICOMULField(DICOMElementField):
+    """
+    DICOM UL (Unsigned Long) element field.
+    
+    Value is a 32-bit unsigned integer.
+    
+    Usage:
+        DICOMULField("command_group_length", None, 0x0000, 0x0000)
+    """
+    
+    def addfield(self, pkt, s, val):
+        """Serialize unsigned long."""
+        val_bytes = struct.pack("<I", val)
+        return super().addfield(pkt, s, val_bytes)
+    
+    def getfield(self, pkt, s):
+        """Parse unsigned long."""
+        remain, val_bytes = super().getfield(pkt, s)
+        if len(val_bytes) >= 4:
+            return remain, struct.unpack("<I", val_bytes[:4])[0]
+        return remain, 0
+
+
+# =============================================================================
+# DIMSE Command Packet Classes
+# =============================================================================
+# These replace the build_*_dimse functions with proper Scapy packets.
+# Now you can easily fuzz specific fields like message_id!
+# =============================================================================
+
+# Command Field values (0000,0100)
+DIMSE_COMMAND_FIELDS = {
+    0x0001: "C-STORE-RQ",
+    0x8001: "C-STORE-RSP",
+    0x0020: "C-FIND-RQ",
+    0x8020: "C-FIND-RSP",
+    0x0010: "C-GET-RQ",
+    0x8010: "C-GET-RSP",
+    0x0021: "C-MOVE-RQ",
+    0x8021: "C-MOVE-RSP",
+    0x0030: "C-ECHO-RQ",
+    0x8030: "C-ECHO-RSP",
+    0x0FFF: "C-CANCEL-RQ",
+    0x0100: "N-EVENT-REPORT-RQ",
+    0x8100: "N-EVENT-REPORT-RSP",
+    0x0110: "N-GET-RQ",
+    0x8110: "N-GET-RSP",
+    0x0120: "N-SET-RQ",
+    0x8120: "N-SET-RSP",
+    0x0130: "N-ACTION-RQ",
+    0x8130: "N-ACTION-RSP",
+    0x0140: "N-CREATE-RQ",
+    0x8140: "N-CREATE-RSP",
+    0x0150: "N-DELETE-RQ",
+    0x8150: "N-DELETE-RSP",
+}
+
+# Data Set Type values (0000,0800)
+DATA_SET_TYPES = {
+    0x0000: "Data Set Present",
+    0x0001: "Data Set Present",  # Also valid
+    0x0101: "No Data Set",
+}
+
+# Priority values (0000,0700)
+PRIORITY_VALUES = {
+    0x0000: "MEDIUM",
+    0x0001: "HIGH",
+    0x0002: "LOW",
+}
+
+
+class C_ECHO_RQ(Packet):
+    """
+    C-ECHO-RQ DIMSE Command (DICOM Ping).
+    
+    This replaces build_c_echo_rq_dimse() with a proper Scapy packet.
+    
+    Usage:
+        # Simple creation
+        pkt = C_ECHO_RQ(message_id=42)
+        
+        # Fuzzing - easy to modify specific fields
+        pkt = C_ECHO_RQ(message_id=0xFFFF)  # Test max message ID
+        pkt = C_ECHO_RQ(affected_sop_class_uid="1.2.3.INVALID")  # Bad UID
+        
+        # Get raw bytes for P-DATA-TF
+        pdv = PresentationDataValueItem(context_id=1, data=bytes(pkt), is_command=1, is_last=1)
+    """
+    name = "C-ECHO-RQ"
+    fields_desc = [
+        # (0000,0002) Affected SOP Class UID - Verification SOP Class
+        DICOMUIDField("affected_sop_class_uid", VERIFICATION_SOP_CLASS_UID, 0x0000, 0x0002),
+        # (0000,0100) Command Field - C-ECHO-RQ = 0x0030
+        DICOMUSField("command_field", 0x0030, 0x0000, 0x0100),
+        # (0000,0110) Message ID
+        DICOMUSField("message_id", 1, 0x0000, 0x0110),
+        # (0000,0800) Command Data Set Type - No Data Set = 0x0101
+        DICOMUSField("data_set_type", 0x0101, 0x0000, 0x0800),
+    ]
+    
+    def post_build(self, pkt, pay):
+        """Prepend CommandGroupLength (0000,0000) element."""
+        # CommandGroupLength = length of all elements after it
+        group_len = len(pkt)
+        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
+        return header + pkt + pay
+
+
+class C_ECHO_RSP(Packet):
+    """
+    C-ECHO-RSP DIMSE Response.
+    
+    Usage:
+        pkt = C_ECHO_RSP(message_id_responded=42, status=0x0000)
+    """
+    name = "C-ECHO-RSP"
+    fields_desc = [
+        # (0000,0002) Affected SOP Class UID
+        DICOMUIDField("affected_sop_class_uid", VERIFICATION_SOP_CLASS_UID, 0x0000, 0x0002),
+        # (0000,0100) Command Field - C-ECHO-RSP = 0x8030
+        DICOMUSField("command_field", 0x8030, 0x0000, 0x0100),
+        # (0000,0120) Message ID Being Responded To
+        DICOMUSField("message_id_responded", 1, 0x0000, 0x0120),
+        # (0000,0800) Command Data Set Type
+        DICOMUSField("data_set_type", 0x0101, 0x0000, 0x0800),
+        # (0000,0900) Status
+        DICOMUSField("status", 0x0000, 0x0000, 0x0900),
+    ]
+    
+    def post_build(self, pkt, pay):
+        """Prepend CommandGroupLength (0000,0000) element."""
+        group_len = len(pkt)
+        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
+        return header + pkt + pay
+
+
+class C_STORE_RQ(Packet):
+    """
+    C-STORE-RQ DIMSE Command for storing DICOM objects.
+    
+    This replaces build_c_store_rq_dimse() with a proper Scapy packet.
+    
+    Usage:
+        pkt = C_STORE_RQ(
+            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            affected_sop_instance_uid="1.2.3.4.5.6.7.8",
+            message_id=1,
+            priority=0x0002,  # LOW
+        )
+        
+        # Fuzzing examples
+        pkt = C_STORE_RQ(priority=0xFFFF)  # Invalid priority
+        pkt = C_STORE_RQ(message_id=0)     # Zero message ID
+    """
+    name = "C-STORE-RQ"
+    fields_desc = [
+        # (0000,0002) Affected SOP Class UID
+        DICOMUIDField("affected_sop_class_uid", CT_IMAGE_STORAGE_SOP_CLASS_UID, 0x0000, 0x0002),
+        # (0000,0100) Command Field - C-STORE-RQ = 0x0001
+        DICOMUSField("command_field", 0x0001, 0x0000, 0x0100),
+        # (0000,0110) Message ID
+        DICOMUSField("message_id", 1, 0x0000, 0x0110),
+        # (0000,0700) Priority
+        DICOMUSField("priority", 0x0002, 0x0000, 0x0700),
+        # (0000,0800) Command Data Set Type - Data Set Present = 0x0000
+        DICOMUSField("data_set_type", 0x0000, 0x0000, 0x0800),
+        # (0000,1000) Affected SOP Instance UID
+        DICOMUIDField("affected_sop_instance_uid", "1.2.3.4.5.6.7.8.9", 0x0000, 0x1000),
+    ]
+    
+    def post_build(self, pkt, pay):
+        """Prepend CommandGroupLength (0000,0000) element."""
+        group_len = len(pkt)
+        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
+        return header + pkt + pay
+
+
+class C_STORE_RSP(Packet):
+    """
+    C-STORE-RSP DIMSE Response.
+    
+    Usage:
+        pkt = C_STORE_RSP(message_id_responded=1, status=0x0000)
+    """
+    name = "C-STORE-RSP"
+    fields_desc = [
+        # (0000,0002) Affected SOP Class UID
+        DICOMUIDField("affected_sop_class_uid", CT_IMAGE_STORAGE_SOP_CLASS_UID, 0x0000, 0x0002),
+        # (0000,0100) Command Field - C-STORE-RSP = 0x8001
+        DICOMUSField("command_field", 0x8001, 0x0000, 0x0100),
+        # (0000,0120) Message ID Being Responded To
+        DICOMUSField("message_id_responded", 1, 0x0000, 0x0120),
+        # (0000,0800) Command Data Set Type
+        DICOMUSField("data_set_type", 0x0101, 0x0000, 0x0800),
+        # (0000,0900) Status
+        DICOMUSField("status", 0x0000, 0x0000, 0x0900),
+        # (0000,1000) Affected SOP Instance UID
+        DICOMUIDField("affected_sop_instance_uid", "1.2.3.4.5.6.7.8.9", 0x0000, 0x1000),
+    ]
+    
+    def post_build(self, pkt, pay):
+        """Prepend CommandGroupLength (0000,0000) element."""
+        group_len = len(pkt)
+        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
+        return header + pkt + pay
+
+
+class C_FIND_RQ(Packet):
+    """
+    C-FIND-RQ DIMSE Command for querying DICOM objects.
+    
+    Usage:
+        pkt = C_FIND_RQ(
+            affected_sop_class_uid="1.2.840.10008.5.1.4.1.2.1.1",  # Patient Root Query
+            message_id=1,
+        )
+    """
+    name = "C-FIND-RQ"
+    fields_desc = [
+        # (0000,0002) Affected SOP Class UID
+        DICOMUIDField("affected_sop_class_uid", "1.2.840.10008.5.1.4.1.2.1.1", 0x0000, 0x0002),
+        # (0000,0100) Command Field - C-FIND-RQ = 0x0020
+        DICOMUSField("command_field", 0x0020, 0x0000, 0x0100),
+        # (0000,0110) Message ID
+        DICOMUSField("message_id", 1, 0x0000, 0x0110),
+        # (0000,0700) Priority
+        DICOMUSField("priority", 0x0002, 0x0000, 0x0700),
+        # (0000,0800) Command Data Set Type - Data Set Present = 0x0000
+        DICOMUSField("data_set_type", 0x0000, 0x0000, 0x0800),
+    ]
+    
+    def post_build(self, pkt, pay):
+        """Prepend CommandGroupLength (0000,0000) element."""
+        group_len = len(pkt)
+        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
+        return header + pkt + pay
+
+
+# =============================================================================
+# Legacy DIMSE Message Builders (kept for backward compatibility)
+# =============================================================================
+# These functions are deprecated. Use the packet classes above instead:
+#   OLD: build_c_echo_rq_dimse(message_id=1)
+#   NEW: bytes(C_ECHO_RQ(message_id=1))
+# =============================================================================
 
 def build_c_echo_rq_dimse(message_id=1):
-    """Build a C-ECHO-RQ DIMSE command message."""
-    elements = [
-        (0x0000, 0x0002, _uid_to_bytes(VERIFICATION_SOP_CLASS_UID)),
-        (0x0000, 0x0100, struct.pack("<H", 0x0030)),
-        (0x0000, 0x0110, struct.pack("<H", message_id)),
-        (0x0000, 0x0800, struct.pack("<H", 0x0101)),
-    ]
-    payload = b"".join(
-        struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
-        for g, e, v in elements
-    )
-    group_len = len(payload)
-    return (
-        struct.pack("<HHI", 0x0000, 0x0000, 4)
-        + struct.pack("<I", group_len)
-        + payload
-    )
+    """
+    Build a C-ECHO-RQ DIMSE command message.
+    
+    DEPRECATED: Use C_ECHO_RQ packet class instead:
+        bytes(C_ECHO_RQ(message_id=1))
+    """
+    return bytes(C_ECHO_RQ(message_id=message_id))
 
 
 def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
@@ -207,25 +570,21 @@ def build_c_echo_rq_dimse_raw(message_id=1, sop_class_uid=None):
 
 
 def build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, message_id=1):
-    """Build a C-STORE-RQ DIMSE command message."""
-    elements = [
-        (0x0000, 0x0002, _uid_to_bytes(sop_class_uid)),
-        (0x0000, 0x0100, struct.pack("<H", 0x0001)),
-        (0x0000, 0x0110, struct.pack("<H", message_id)),
-        (0x0000, 0x0700, struct.pack("<H", 0x0002)),
-        (0x0000, 0x0800, struct.pack("<H", 0x0000)),
-        (0x0000, 0x1000, _uid_to_bytes(sop_instance_uid)),
-    ]
-    payload = b"".join(
-        struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
-        for g, e, v in elements
-    )
-    group_len = len(payload)
-    return (
-        struct.pack("<HHI", 0x0000, 0x0000, 4)
-        + struct.pack("<I", group_len)
-        + payload
-    )
+    """
+    Build a C-STORE-RQ DIMSE command message.
+    
+    DEPRECATED: Use C_STORE_RQ packet class instead:
+        bytes(C_STORE_RQ(
+            affected_sop_class_uid=sop_class_uid,
+            affected_sop_instance_uid=sop_instance_uid,
+            message_id=message_id
+        ))
+    """
+    return bytes(C_STORE_RQ(
+        affected_sop_class_uid=sop_class_uid,
+        affected_sop_instance_uid=sop_instance_uid,
+        message_id=message_id,
+    ))
 
 
 def build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, message_id=1):
@@ -612,6 +971,9 @@ class DICOM(Packet):
     DICOM Upper Layer PDU header.
 
     This is the main PDU wrapper containing type, reserved byte, and length.
+    
+    The extract_padding() method enables proper framing with StreamSocket,
+    so Scapy can automatically handle PDU boundaries in TCP streams.
     """
     name = "DICOM UL"
     fields_desc = [
@@ -625,6 +987,17 @@ class DICOM(Packet):
             length = len(pay)
             pkt = pkt[:2] + struct.pack("!I", length) + pkt[6:]
         return pkt + pay
+
+    def extract_padding(self, s):
+        """
+        Extract padding for proper StreamSocket framing.
+        
+        Returns (payload_for_this_pdu, remaining_data_for_next_pdu).
+        Uses the length field to determine PDU boundaries.
+        """
+        if self.length is not None:
+            return s[:self.length], s[self.length:]
+        return s, b""
 
 
 class PresentationDataValueItem(Packet):
@@ -826,6 +1199,9 @@ class DICOMSession:
 
     Provides methods for association establishment, C-ECHO, C-STORE,
     and graceful release.
+    
+    Uses Scapy's StreamSocket for automatic PDU framing - no manual
+    socket recv loops needed!
 
     Example usage::
 
@@ -870,41 +1246,56 @@ class DICOMSession:
                 (self.dst_ip, self.dst_port),
                 timeout=self.read_timeout,
             )
+            # StreamSocket handles framing automatically using DICOM.extract_padding()
             self.stream = StreamSocket(self.sock, basecls=DICOM)
             return True
         except Exception as e:
             log.error("Connection failed: %s", e)
             return False
 
-    def _recv_pdu(self):
-        """Receive a complete DICOM PDU from the socket."""
+    def send(self, pkt):
+        """
+        Send a DICOM PDU using StreamSocket.
+        
+        :param pkt: DICOM packet to send
+        """
+        self.stream.send(pkt)
+    
+    def recv(self):
+        """
+        Receive a DICOM PDU using StreamSocket.
+        
+        StreamSocket handles PDU framing automatically by reading the
+        6-byte header, extracting the length, and reading the full payload.
+        
+        :return: Parsed DICOM packet or None on timeout/error
+        """
         try:
-            header = b""
-            while len(header) < 6:
-                chunk = self.sock.recv(6 - len(header))
-                if not chunk:
-                    return None
-                header += chunk
-
-            pdu_length = struct.unpack("!I", header[2:6])[0]
-
-            payload = b""
-            while len(payload) < pdu_length:
-                chunk = self.sock.recv(pdu_length - len(payload))
-                if not chunk:
-                    return None
-                payload += chunk
-
-            return header + payload
+            # StreamSocket.recv() returns a parsed packet
+            return self.stream.recv()
         except socket.timeout:
             return None
         except Exception as e:
             log.error("Error receiving PDU: %s", e)
             return None
-
-    def _send_pdu(self, pkt):
-        """Send a DICOM PDU packet."""
-        self.sock.sendall(bytes(pkt))
+    
+    def sr1(self, pkt):
+        """
+        Send a PDU and receive the response (Send-Receive 1).
+        
+        This is the kosher Scapy pattern for request-response protocols.
+        
+        :param pkt: DICOM packet to send
+        :return: Parsed response DICOM packet or None
+        """
+        try:
+            # sr1 sends packet and waits for exactly one response
+            return self.stream.sr1(pkt, timeout=self.read_timeout)
+        except socket.timeout:
+            return None
+        except Exception as e:
+            log.error("Error in sr1: %s", e)
+            return None
     
     def send_raw_bytes(self, raw_bytes):
         """Send raw bytes directly to the socket (for fuzzing)."""
@@ -949,18 +1340,17 @@ class DICOMSession:
         user_info = build_user_information(max_pdu_length=self._proposed_max_pdu)
         variable_items.append(user_info)
 
-        # Build and send A-ASSOCIATE-RQ
+        # Build A-ASSOCIATE-RQ
         assoc_rq = DICOM() / A_ASSOCIATE_RQ(
             called_ae_title=self.dst_ae,
             calling_ae_title=self.src_ae,
             variable_items=variable_items,
         )
 
-        self._send_pdu(assoc_rq)
-        response_data = self._recv_pdu()
+        # Use sr1() - the kosher Scapy pattern for send-and-receive
+        response = self.sr1(assoc_rq)
 
-        if response_data:
-            response = DICOM(response_data)
+        if response:
             if response.haslayer(A_ASSOCIATE_AC):
                 self.assoc_established = True
                 self._parse_accepted_contexts(response)
@@ -1058,7 +1448,10 @@ class DICOMSession:
             return None
 
         msg_id = self._get_next_message_id()
-        dimse_rq = build_c_echo_rq_dimse(msg_id)
+        
+        # Use the new DIMSE packet class instead of the builder function
+        dimse_rq = bytes(C_ECHO_RQ(message_id=msg_id))
+        
         pdv_rq = PresentationDataValueItem(
             context_id=echo_ctx_id,
             data=dimse_rq,
@@ -1067,19 +1460,17 @@ class DICOMSession:
         )
         pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
 
-        self._send_pdu(pdata_rq)
-        response_data = self._recv_pdu()
+        # Use sr1() - send and receive in one call
+        response = self.sr1(pdata_rq)
 
-        if response_data:
-            response = DICOM(response_data)
-            if response.haslayer(P_DATA_TF):
-                pdv_items = response[P_DATA_TF].pdv_items
-                if pdv_items:
-                    pdv_rsp = pdv_items[0]
-                    data = pdv_rsp.data
-                    if isinstance(data, str):
-                        data = data.encode("latin-1")
-                    return parse_dimse_status(data)
+        if response and response.haslayer(P_DATA_TF):
+            pdv_items = response[P_DATA_TF].pdv_items
+            if pdv_items:
+                pdv_rsp = pdv_items[0]
+                data = pdv_rsp.data
+                if isinstance(data, str):
+                    data = data.encode("latin-1")
+                return parse_dimse_status(data)
         return None
 
     def c_store(self, dataset_bytes, sop_class_uid, sop_instance_uid,
@@ -1111,10 +1502,15 @@ class DICOMSession:
 
         msg_id = self._get_next_message_id()
         
+        # Use DIMSE packet class
         if self.raw_mode:
             dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
         else:
-            dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
+            dimse_rq = bytes(C_STORE_RQ(
+                affected_sop_class_uid=sop_class_uid,
+                affected_sop_instance_uid=sop_instance_uid,
+                message_id=msg_id,
+            ))
 
         cmd_pdv = PresentationDataValueItem(
             context_id=store_ctx_id,
@@ -1123,7 +1519,7 @@ class DICOMSession:
             is_last=1,
         )
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
-        self._send_pdu(pdata_cmd)
+        self.send(pdata_cmd)
 
         max_pdv_data = self.max_pdu_length - 12
 
@@ -1135,7 +1531,7 @@ class DICOMSession:
                 is_last=1,
             )
             pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
-            self._send_pdu(pdata_data)
+            self.send(pdata_data)
         else:
             offset = 0
             while offset < len(dataset_bytes):
@@ -1148,7 +1544,7 @@ class DICOMSession:
                     is_last=is_last,
                 )
                 pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
-                self._send_pdu(pdata_data)
+                self.send(pdata_data)
                 offset += len(chunk)
             log.debug(
                 "Fragmented %d bytes into %d PDUs",
@@ -1156,18 +1552,17 @@ class DICOMSession:
                 (len(dataset_bytes) + max_pdv_data - 1) // max_pdv_data,
             )
 
-        response_data = self._recv_pdu()
+        # Receive the response
+        response = self.recv()
 
-        if response_data:
-            response = DICOM(response_data)
-            if response.haslayer(P_DATA_TF):
-                pdv_items = response[P_DATA_TF].pdv_items
-                if pdv_items:
-                    pdv_rsp = pdv_items[0]
-                    data = pdv_rsp.data
-                    if isinstance(data, str):
-                        data = data.encode("latin-1")
-                    return parse_dimse_status(data)
+        if response and response.haslayer(P_DATA_TF):
+            pdv_items = response[P_DATA_TF].pdv_items
+            if pdv_items:
+                pdv_rsp = pdv_items[0]
+                data = pdv_rsp.data
+                if isinstance(data, str):
+                    data = data.encode("latin-1")
+                return parse_dimse_status(data)
         return None
     
     def c_store_raw(self, dataset_bytes, sop_class_uid, sop_instance_uid,
@@ -1182,7 +1577,11 @@ class DICOMSession:
         if skip_padding:
             dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
         else:
-            dimse_rq = build_c_store_rq_dimse(sop_class_uid, sop_instance_uid, msg_id)
+            dimse_rq = bytes(C_STORE_RQ(
+                affected_sop_class_uid=sop_class_uid,
+                affected_sop_instance_uid=sop_instance_uid,
+                message_id=msg_id,
+            ))
 
         cmd_pdv = PresentationDataValueItem(
             context_id=context_id,
@@ -1191,7 +1590,7 @@ class DICOMSession:
             is_last=1,
         )
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
-        self._send_pdu(pdata_cmd)
+        self.send(pdata_cmd)
 
         data_pdv = PresentationDataValueItem(
             context_id=context_id,
@@ -1200,12 +1599,11 @@ class DICOMSession:
             is_last=1,
         )
         pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
-        self._send_pdu(pdata_data)
+        self.send(pdata_data)
 
-        response_data = self._recv_pdu()
+        response = self.recv()
 
-        if response_data:
-            response = DICOM(response_data)
+        if response:
             if response.haslayer(P_DATA_TF):
                 pdv_items = response[P_DATA_TF].pdv_items
                 if pdv_items:
@@ -1225,12 +1623,12 @@ class DICOMSession:
             return True
 
         release_rq = DICOM() / A_RELEASE_RQ()
-        self._send_pdu(release_rq)
-        response_data = self._recv_pdu()
+        
+        # Use sr1() for the release handshake
+        response = self.sr1(release_rq)
         self.close()
 
-        if response_data:
-            response = DICOM(response_data)
+        if response:
             return response.haslayer(A_RELEASE_RP)
         return False
 
