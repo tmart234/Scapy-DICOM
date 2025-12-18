@@ -680,6 +680,8 @@ class DICOMVariableItem(Packet):
         Uses the length field to determine how much data belongs to this item's payload.
         """
         if self.length is not None:
+            if len(s) < self.length:
+                raise Exception("PDU payload incomplete - waiting for more data")
             return s[:self.length], s[self.length:]
         return s, b""
     
