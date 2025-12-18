@@ -27,6 +27,7 @@ from scapy.fields import (
     BitField,
     ByteEnumField,
     ByteField,
+    ConditionalField,
     Field,
     FieldLenField,
     IntField,
@@ -66,7 +67,11 @@ __all__ = [
     "DICOMUserInformation",
     "DICOMMaximumLength",
     "DICOMImplementationClassUID",
+    "DICOMAsyncOperationsWindow",
+    "DICOMSCPSCURoleSelection",
     "DICOMImplementationVersionName",
+    "DICOMUserIdentity",
+    "DICOMUserIdentityResponse",
     # DIMSE Custom Fields
     "DICOMElementField",
     "DICOMUIDField",
@@ -126,8 +131,11 @@ ITEM_TYPES = {
     0x50: "User Information",
     0x51: "Maximum Length",
     0x52: "Implementation Class UID",
+    0x53: "Asynchronous Operations Window",
+    0x54: "SCP/SCU Role Selection",
     0x55: "Implementation Version Name",
-    0x56: "User Identity",
+    0x58: "User Identity",
+    0x59: "User Identity Server Response",
 }
 
 
@@ -690,7 +698,11 @@ class DICOMVariableItem(Packet):
             0x50: DICOMUserInformation,
             0x51: DICOMMaximumLength,
             0x52: DICOMImplementationClassUID,
+            0x53: DICOMAsyncOperationsWindow,
+            0x54: DICOMSCPSCURoleSelection,
             0x55: DICOMImplementationVersionName,
+            0x58: DICOMUserIdentity,
+            0x59: DICOMUserIdentityResponse,
         }
         return type_to_class.get(self.item_type, DICOMGenericItem)
 
@@ -900,6 +912,156 @@ class DICOMImplementationVersionName(Packet):
         return b"", s
 
 
+class DICOMAsyncOperationsWindow(Packet):
+    """
+    Asynchronous Operations Window Sub-Item payload (Type 0x53).
+    
+    Negotiates how many operations can be invoked/performed simultaneously.
+    Default is (1, 1) meaning synchronous operation only.
+    
+    See DICOM PS3.7 D.3.3.3.
+    
+    Usage:
+        async_ops = DICOMVariableItem() / DICOMAsyncOperationsWindow(
+            max_ops_invoked=8, max_ops_performed=8
+        )
+    """
+    name = "DICOM Async Operations Window"
+    fields_desc = [
+        ShortField("max_ops_invoked", 1),
+        ShortField("max_ops_performed", 1),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+# SCP/SCU Role Selection type values
+ROLE_SELECTION_TYPES = {
+    0: "SCU",
+    1: "SCP",
+}
+
+
+class DICOMSCPSCURoleSelection(Packet):
+    """
+    SCP/SCU Role Selection Sub-Item payload (Type 0x54).
+    
+    Allows negotiation of roles (SCU/SCP) for a specific SOP Class.
+    Used when an AE wants to reverse roles or support both.
+    
+    See DICOM PS3.7 D.3.3.4.
+    
+    Usage:
+        role = DICOMVariableItem() / DICOMSCPSCURoleSelection(
+            sop_class_uid=b"1.2.840.10008.5.1.4.1.1.2",
+            scu_role=1,
+            scp_role=0
+        )
+    """
+    name = "DICOM SCP/SCU Role Selection"
+    fields_desc = [
+        FieldLenField("uid_length", None, length_of="sop_class_uid", fmt="!H"),
+        StrLenField("sop_class_uid", b"",
+                    length_from=lambda pkt: pkt.uid_length),
+        ByteField("scu_role", 0),  # 0=non-support, 1=support
+        ByteField("scp_role", 0),  # 0=non-support, 1=support
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+# User Identity type values
+USER_IDENTITY_TYPES = {
+    1: "Username",
+    2: "Username and Passcode",
+    3: "Kerberos Service Ticket",
+    4: "SAML Assertion",
+    5: "JSON Web Token (JWT)",
+}
+
+
+class DICOMUserIdentity(Packet):
+    """
+    User Identity Negotiation Sub-Item payload (Type 0x58).
+    
+    Used to send Username, Username+Passcode, Kerberos tickets, SAML, or JWT.
+    Critical for security testing and authentication fuzzing.
+    
+    See DICOM PS3.7 D.3.3.7.
+    
+    Usage:
+        # Username only
+        user_id = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=1,
+            primary_field=b"admin"
+        )
+        
+        # Username + Password
+        user_id = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=2,
+            primary_field=b"admin",
+            secondary_field=b"password123"
+        )
+        
+        # Kerberos ticket
+        user_id = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=3,
+            primary_field=kerberos_ticket_bytes
+        )
+    """
+    name = "DICOM User Identity"
+    fields_desc = [
+        ByteEnumField("user_identity_type", 1, USER_IDENTITY_TYPES),
+        ByteField("positive_response_requested", 0),  # 0=No, 1=Yes
+        
+        # Primary Field (Username or Ticket)
+        FieldLenField("primary_field_length", None, length_of="primary_field", fmt="!H"),
+        StrLenField("primary_field", b"",
+                    length_from=lambda pkt: pkt.primary_field_length),
+        
+        # Secondary Field (Passcode) - Only present if Type == 2
+        ConditionalField(
+            FieldLenField("secondary_field_length", None, length_of="secondary_field", fmt="!H"),
+            lambda pkt: pkt.user_identity_type == 2
+        ),
+        ConditionalField(
+            StrLenField("secondary_field", b"",
+                        length_from=lambda pkt: pkt.secondary_field_length),
+            lambda pkt: pkt.user_identity_type == 2
+        ),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
+class DICOMUserIdentityResponse(Packet):
+    """
+    User Identity Server Response Sub-Item payload (Type 0x59).
+    
+    Server response to User Identity negotiation. Only present in A-ASSOCIATE-AC
+    if positive_response_requested was 1 and server supports user identity.
+    
+    See DICOM PS3.7 D.3.3.7.2.
+    
+    Usage:
+        response = DICOMVariableItem() / DICOMUserIdentityResponse(
+            server_response=b"authentication_token"
+        )
+    """
+    name = "DICOM User Identity Response"
+    fields_desc = [
+        FieldLenField("response_length", None, length_of="server_response", fmt="!H"),
+        StrLenField("server_response", b"",
+                    length_from=lambda pkt: pkt.response_length),
+    ]
+
+    def extract_padding(self, s):
+        return b"", s
+
+
 class DICOMUserInformation(Packet):
     """
     User Information Item payload (Type 0x50).
@@ -953,7 +1115,11 @@ bind_layers(DICOMVariableItem, DICOMTransferSyntax, item_type=0x40)
 bind_layers(DICOMVariableItem, DICOMUserInformation, item_type=0x50)
 bind_layers(DICOMVariableItem, DICOMMaximumLength, item_type=0x51)
 bind_layers(DICOMVariableItem, DICOMImplementationClassUID, item_type=0x52)
+bind_layers(DICOMVariableItem, DICOMAsyncOperationsWindow, item_type=0x53)
+bind_layers(DICOMVariableItem, DICOMSCPSCURoleSelection, item_type=0x54)
 bind_layers(DICOMVariableItem, DICOMImplementationVersionName, item_type=0x55)
+bind_layers(DICOMVariableItem, DICOMUserIdentity, item_type=0x58)
+bind_layers(DICOMVariableItem, DICOMUserIdentityResponse, item_type=0x59)
 # Fallback for unknown types
 bind_layers(DICOMVariableItem, DICOMGenericItem)
 

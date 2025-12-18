@@ -46,7 +46,11 @@ from dicom import (
     DICOMUserInformation,
     DICOMMaximumLength,
     DICOMImplementationClassUID,
+    DICOMAsyncOperationsWindow,
+    DICOMSCPSCURoleSelection,
     DICOMImplementationVersionName,
+    DICOMUserIdentity,
+    DICOMUserIdentityResponse,
     DICOMGenericItem,
     # DIMSE Packet classes (the kosher approach with DIMSEPacket base)
     DIMSEPacket,
@@ -325,6 +329,251 @@ class TestVariableItemBindLayers:
         assert parsed.item_type == 0xFF
         assert parsed.haslayer(DICOMGenericItem)
         assert parsed[DICOMGenericItem].data == b"test"
+
+
+class TestUserIdentityNegotiation:
+    """Tests for User Identity Negotiation (critical for security testing)."""
+
+    def test_user_identity_username_only(self):
+        """DICOMUserIdentity with username only (type 1)."""
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=1,
+            positive_response_requested=0,
+            primary_field=b"admin"
+        )
+        
+        assert pkt.item_type == 0x58
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x58
+        assert parsed.haslayer(DICOMUserIdentity)
+        assert parsed[DICOMUserIdentity].user_identity_type == 1
+        assert parsed[DICOMUserIdentity].primary_field == b"admin"
+        # Secondary field is a ConditionalField - not present for type != 2
+        # So it will be None or the field won't be serialized
+        secondary = getattr(parsed[DICOMUserIdentity], 'secondary_field', None)
+        assert secondary is None or secondary == b""
+
+    def test_user_identity_username_password(self):
+        """DICOMUserIdentity with username+password (type 2)."""
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=2,
+            positive_response_requested=1,
+            primary_field=b"admin",
+            secondary_field=b"password123"
+        )
+        
+        assert pkt.item_type == 0x58
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.haslayer(DICOMUserIdentity)
+        assert parsed[DICOMUserIdentity].user_identity_type == 2
+        assert parsed[DICOMUserIdentity].positive_response_requested == 1
+        assert parsed[DICOMUserIdentity].primary_field == b"admin"
+        assert parsed[DICOMUserIdentity].secondary_field == b"password123"
+
+    def test_user_identity_kerberos(self):
+        """DICOMUserIdentity with Kerberos ticket (type 3)."""
+        kerberos_ticket = b"\x60\x82\x01\x00" + b"MOCK_KERBEROS_TICKET"
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=3,
+            positive_response_requested=1,
+            primary_field=kerberos_ticket
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMUserIdentity].user_identity_type == 3
+        assert parsed[DICOMUserIdentity].primary_field == kerberos_ticket
+
+    def test_user_identity_saml(self):
+        """DICOMUserIdentity with SAML assertion (type 4)."""
+        saml_assertion = b"<saml:Assertion>...</saml:Assertion>"
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=4,
+            primary_field=saml_assertion
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMUserIdentity].user_identity_type == 4
+        assert parsed[DICOMUserIdentity].primary_field == saml_assertion
+
+    def test_user_identity_jwt(self):
+        """DICOMUserIdentity with JWT (type 5)."""
+        jwt_token = b"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=5,
+            primary_field=jwt_token
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMUserIdentity].user_identity_type == 5
+        assert parsed[DICOMUserIdentity].primary_field == jwt_token
+
+    def test_user_identity_response(self):
+        """DICOMUserIdentityResponse parsing."""
+        pkt = DICOMVariableItem() / DICOMUserIdentityResponse(
+            server_response=b"auth_token_12345"
+        )
+        
+        assert pkt.item_type == 0x59
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.item_type == 0x59
+        assert parsed.haslayer(DICOMUserIdentityResponse)
+        assert parsed[DICOMUserIdentityResponse].server_response == b"auth_token_12345"
+
+
+class TestAsyncOperationsWindow:
+    """Tests for Asynchronous Operations Window negotiation."""
+
+    def test_async_ops_default(self):
+        """DICOMAsyncOperationsWindow with default values (synchronous)."""
+        pkt = DICOMVariableItem() / DICOMAsyncOperationsWindow()
+        
+        assert pkt.item_type == 0x53
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.haslayer(DICOMAsyncOperationsWindow)
+        assert parsed[DICOMAsyncOperationsWindow].max_ops_invoked == 1
+        assert parsed[DICOMAsyncOperationsWindow].max_ops_performed == 1
+
+    def test_async_ops_custom(self):
+        """DICOMAsyncOperationsWindow with custom values."""
+        pkt = DICOMVariableItem() / DICOMAsyncOperationsWindow(
+            max_ops_invoked=8,
+            max_ops_performed=4
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMAsyncOperationsWindow].max_ops_invoked == 8
+        assert parsed[DICOMAsyncOperationsWindow].max_ops_performed == 4
+
+    def test_async_ops_unlimited(self):
+        """DICOMAsyncOperationsWindow with unlimited (0) ops."""
+        pkt = DICOMVariableItem() / DICOMAsyncOperationsWindow(
+            max_ops_invoked=0,  # 0 = unlimited
+            max_ops_performed=0
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMAsyncOperationsWindow].max_ops_invoked == 0
+        assert parsed[DICOMAsyncOperationsWindow].max_ops_performed == 0
+
+
+class TestSCPSCURoleSelection:
+    """Tests for SCP/SCU Role Selection negotiation."""
+
+    def test_role_selection_default_scu(self):
+        """DICOMSCPSCURoleSelection default (SCU only)."""
+        pkt = DICOMVariableItem() / DICOMSCPSCURoleSelection(
+            sop_class_uid=b"1.2.840.10008.5.1.4.1.1.2",  # CT Image Storage
+            scu_role=1,
+            scp_role=0
+        )
+        
+        assert pkt.item_type == 0x54
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed.haslayer(DICOMSCPSCURoleSelection)
+        assert parsed[DICOMSCPSCURoleSelection].sop_class_uid == b"1.2.840.10008.5.1.4.1.1.2"
+        assert parsed[DICOMSCPSCURoleSelection].scu_role == 1
+        assert parsed[DICOMSCPSCURoleSelection].scp_role == 0
+
+    def test_role_selection_both_roles(self):
+        """DICOMSCPSCURoleSelection with both roles."""
+        pkt = DICOMVariableItem() / DICOMSCPSCURoleSelection(
+            sop_class_uid=b"1.2.840.10008.5.1.4.1.2.2.1",  # Patient Root Q/R Find
+            scu_role=1,
+            scp_role=1
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMSCPSCURoleSelection].scu_role == 1
+        assert parsed[DICOMSCPSCURoleSelection].scp_role == 1
+
+    def test_role_selection_scp_only(self):
+        """DICOMSCPSCURoleSelection with SCP role only."""
+        pkt = DICOMVariableItem() / DICOMSCPSCURoleSelection(
+            sop_class_uid=b"1.2.840.10008.1.1",  # Verification
+            scu_role=0,
+            scp_role=1
+        )
+        
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMSCPSCURoleSelection].scu_role == 0
+        assert parsed[DICOMSCPSCURoleSelection].scp_role == 1
+
+
+class TestUserIdentityFuzzing:
+    """Security-focused fuzzing tests for User Identity."""
+
+    def test_fuzz_empty_username(self):
+        """Fuzz with empty username."""
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=1,
+            primary_field=b""
+        )
+        raw = bytes(pkt)
+        # Should serialize without error
+        assert len(raw) > 4
+
+    def test_fuzz_very_long_password(self):
+        """Fuzz with very long password."""
+        long_password = b"A" * 10000
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=2,
+            primary_field=b"admin",
+            secondary_field=long_password
+        )
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMUserIdentity].secondary_field == long_password
+
+    def test_fuzz_special_characters_in_username(self):
+        """Fuzz with special characters in username."""
+        special_username = b"admin'; DROP TABLE users;--"
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=1,
+            primary_field=special_username
+        )
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMUserIdentity].primary_field == special_username
+
+    def test_fuzz_null_bytes_in_credential(self):
+        """Fuzz with null bytes in credentials."""
+        null_credential = b"admin\x00\x00password"
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=2,
+            primary_field=b"admin\x00user",
+            secondary_field=b"pass\x00word"
+        )
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert b"\x00" in parsed[DICOMUserIdentity].primary_field
+        assert b"\x00" in parsed[DICOMUserIdentity].secondary_field
+
+    def test_fuzz_invalid_identity_type(self):
+        """Fuzz with invalid identity type."""
+        pkt = DICOMVariableItem() / DICOMUserIdentity(
+            user_identity_type=99,  # Invalid type
+            primary_field=b"test"
+        )
+        raw = bytes(pkt)
+        parsed = DICOMVariableItem(raw)
+        assert parsed[DICOMUserIdentity].user_identity_type == 99
 
 
 class TestHelperFunctions:
