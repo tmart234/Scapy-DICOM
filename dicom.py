@@ -3,6 +3,9 @@
 # See https://scapy.net/ for more information
 # Copyright (C) Tyler M
 
+# scapy.contrib.description = DICOM (Digital Imaging and Communications in Medicine)
+# scapy.contrib.status = loads
+
 """
 DICOM (Digital Imaging and Communications in Medicine) Protocol
 
