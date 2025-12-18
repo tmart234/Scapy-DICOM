@@ -16,6 +16,7 @@ import logging
 import sys
 import os
 import warnings
+import time
 
 warnings.filterwarnings("ignore")
 
@@ -1188,6 +1189,7 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
     finally:
         if session and session.stream:
             if session.assoc_established:
+                time.sleep(0.5)
                 release_success = session.release()
                 assert release_success, "Failed to cleanly release the association"
             else:
