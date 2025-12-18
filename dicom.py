@@ -1071,6 +1071,8 @@ class A_ASSOCIATE_AC(Packet):
                                                   else 0)),
     ]
 
+    def answers(self, other):
+        return isinstance(other, A_ASSOCIATE_RQ)
 
 class A_ASSOCIATE_RJ(Packet):
     """A-ASSOCIATE-RJ PDU for rejecting an association."""
@@ -1081,7 +1083,9 @@ class A_ASSOCIATE_RJ(Packet):
         ByteField("source", 1),
         ByteField("reason_diag", 1),
     ]
-
+    
+    def answers(self, other):
+        return isinstance(other, A_ASSOCIATE_RQ)
 
 class P_DATA_TF(Packet):
     """
@@ -1111,6 +1115,8 @@ class A_RELEASE_RP(Packet):
     name = "A-RELEASE-RP"
     fields_desc = [IntField("reserved1", 0)]
 
+    def answers(self, other):
+            return isinstance(other, A_RELEASE_RQ)
 
 class A_ABORT(Packet):
     """A-ABORT PDU for aborting an association."""
