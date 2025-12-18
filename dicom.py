@@ -24,8 +24,10 @@ from scapy.fields import (
     BitField,
     ByteEnumField,
     ByteField,
+    Field,
     FieldLenField,
     IntField,
+    LenField,
     PacketListField,
     ShortField,
     StrFixedLenField,
@@ -69,6 +71,7 @@ __all__ = [
     "DICOMUSField",
     "DICOMULField",
     # DIMSE Command Packets
+    "DIMSEPacket",
     "C_ECHO_RQ",
     "C_ECHO_RSP",
     "C_STORE_RQ",
@@ -175,8 +178,6 @@ def _uid_to_bytes_raw(uid):
 # These fields handle DICOM's TLV (Tag-Length-Value) structure with
 # Implicit VR Little Endian encoding used in command sets.
 # =============================================================================
-
-from scapy.fields import Field
 
 
 class DICOMElementField(Field):
@@ -309,6 +310,51 @@ class DICOMULField(DICOMElementField):
 
 
 # =============================================================================
+# DIMSE Packet Base Class
+# =============================================================================
+# This base class handles the unique DIMSE requirement where the first element
+# (CommandGroupLength at tag 0000,0000) contains the length of all subsequent
+# elements in the same packet. Standard LenField calculates payload length,
+# but DIMSE needs intra-packet length calculation.
+# =============================================================================
+
+class DIMSEPacket(Packet):
+    """
+    Base class for DIMSE command packets.
+    
+    DIMSE packets have a unique structure: the first element (0000,0000) 
+    CommandGroupLength contains the byte count of all elements that follow.
+    This is an intra-packet dependency that standard fields can't model,
+    so we handle it in post_build.
+    
+    Subclasses should define fields_desc WITHOUT the CommandGroupLength -
+    this base class prepends it automatically.
+    """
+    
+    # GROUP_LENGTH_ELEMENT_SIZE = 12 bytes:
+    # Tag Group (2) + Tag Element (2) + Value Length (4) + Value (4)
+    GROUP_LENGTH_ELEMENT_SIZE = 12
+    
+    def post_build(self, pkt, pay):
+        """
+        Prepend CommandGroupLength (0000,0000) element.
+        
+        The CommandGroupLength value = length of all elements after it.
+        This is the one valid use of post_build for DIMSE because standard
+        fields cannot calculate "length of myself minus header".
+        """
+        # Calculate group_len = size of all fields in pkt (excluding the
+        # CommandGroupLength element we're about to prepend)
+        group_len = len(pkt)
+        
+        # Build the CommandGroupLength element:
+        # Tag (0000,0000), Length (4 bytes), Value (group_len as uint32)
+        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
+        
+        return header + pkt + pay
+
+
+# =============================================================================
 # DIMSE Command Packet Classes
 # =============================================================================
 # These replace the build_*_dimse functions with proper Scapy packets.
@@ -357,11 +403,12 @@ PRIORITY_VALUES = {
 }
 
 
-class C_ECHO_RQ(Packet):
+class C_ECHO_RQ(DIMSEPacket):
     """
     C-ECHO-RQ DIMSE Command (DICOM Ping).
     
     This replaces build_c_echo_rq_dimse() with a proper Scapy packet.
+    Inherits from DIMSEPacket which handles CommandGroupLength automatically.
     
     Usage:
         # Simple creation
@@ -385,18 +432,13 @@ class C_ECHO_RQ(Packet):
         # (0000,0800) Command Data Set Type - No Data Set = 0x0101
         DICOMUSField("data_set_type", 0x0101, 0x0000, 0x0800),
     ]
-    
-    def post_build(self, pkt, pay):
-        """Prepend CommandGroupLength (0000,0000) element."""
-        # CommandGroupLength = length of all elements after it
-        group_len = len(pkt)
-        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
-        return header + pkt + pay
 
 
-class C_ECHO_RSP(Packet):
+class C_ECHO_RSP(DIMSEPacket):
     """
     C-ECHO-RSP DIMSE Response.
+    
+    Inherits from DIMSEPacket which handles CommandGroupLength automatically.
     
     Usage:
         pkt = C_ECHO_RSP(message_id_responded=42, status=0x0000)
@@ -414,19 +456,14 @@ class C_ECHO_RSP(Packet):
         # (0000,0900) Status
         DICOMUSField("status", 0x0000, 0x0000, 0x0900),
     ]
-    
-    def post_build(self, pkt, pay):
-        """Prepend CommandGroupLength (0000,0000) element."""
-        group_len = len(pkt)
-        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
-        return header + pkt + pay
 
 
-class C_STORE_RQ(Packet):
+class C_STORE_RQ(DIMSEPacket):
     """
     C-STORE-RQ DIMSE Command for storing DICOM objects.
     
     This replaces build_c_store_rq_dimse() with a proper Scapy packet.
+    Inherits from DIMSEPacket which handles CommandGroupLength automatically.
     
     Usage:
         pkt = C_STORE_RQ(
@@ -455,17 +492,13 @@ class C_STORE_RQ(Packet):
         # (0000,1000) Affected SOP Instance UID
         DICOMUIDField("affected_sop_instance_uid", "1.2.3.4.5.6.7.8.9", 0x0000, 0x1000),
     ]
-    
-    def post_build(self, pkt, pay):
-        """Prepend CommandGroupLength (0000,0000) element."""
-        group_len = len(pkt)
-        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
-        return header + pkt + pay
 
 
-class C_STORE_RSP(Packet):
+class C_STORE_RSP(DIMSEPacket):
     """
     C-STORE-RSP DIMSE Response.
+    
+    Inherits from DIMSEPacket which handles CommandGroupLength automatically.
     
     Usage:
         pkt = C_STORE_RSP(message_id_responded=1, status=0x0000)
@@ -485,17 +518,13 @@ class C_STORE_RSP(Packet):
         # (0000,1000) Affected SOP Instance UID
         DICOMUIDField("affected_sop_instance_uid", "1.2.3.4.5.6.7.8.9", 0x0000, 0x1000),
     ]
-    
-    def post_build(self, pkt, pay):
-        """Prepend CommandGroupLength (0000,0000) element."""
-        group_len = len(pkt)
-        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
-        return header + pkt + pay
 
 
-class C_FIND_RQ(Packet):
+class C_FIND_RQ(DIMSEPacket):
     """
     C-FIND-RQ DIMSE Command for querying DICOM objects.
+    
+    Inherits from DIMSEPacket which handles CommandGroupLength automatically.
     
     Usage:
         pkt = C_FIND_RQ(
@@ -516,12 +545,6 @@ class C_FIND_RQ(Packet):
         # (0000,0800) Command Data Set Type - Data Set Present = 0x0000
         DICOMUSField("data_set_type", 0x0000, 0x0000, 0x0800),
     ]
-    
-    def post_build(self, pkt, pay):
-        """Prepend CommandGroupLength (0000,0000) element."""
-        group_len = len(pkt)
-        header = struct.pack("<HHI", 0x0000, 0x0000, 4) + struct.pack("<I", group_len)
-        return header + pkt + pay
 
 
 # =============================================================================
@@ -638,6 +661,9 @@ def parse_dimse_status(dimse_bytes):
 # bind_layers dispatches based on item_type, so:
 #   DICOMVariableItem() / DICOMApplicationContext(uid="1.2.3...")
 # automatically sets item_type=0x10 and calculates length.
+#
+# KEY FIX: Using LenField instead of ShortField + manual post_build.
+# LenField automatically calculates the payload length.
 # =============================================================================
 
 class DICOMVariableItem(Packet):
@@ -658,20 +684,16 @@ class DICOMVariableItem(Packet):
         0x51: Maximum Length Sub-Item
         0x52: Implementation Class UID
         0x55: Implementation Version Name
+    
+    KEY FIX: Using LenField for automatic payload length calculation.
     """
     name = "DICOM Variable Item"
     fields_desc = [
         ByteEnumField("item_type", 0x10, ITEM_TYPES),
         ByteField("reserved", 0),
-        ShortField("length", None),
+        # LenField automatically calculates payload length when set to None
+        LenField("length", None, fmt="!H"),
     ]
-
-    def post_build(self, pkt, pay):
-        """Auto-calculate length field from payload."""
-        if self.length is None:
-            length = len(pay)
-            pkt = pkt[:2] + struct.pack("!H", length) + pkt[4:]
-        return pkt + pay
 
     def extract_padding(self, s):
         """Extract padding for PacketListField parsing.
@@ -967,6 +989,9 @@ bind_layers(DICOMVariableItem, DICOMGenericItem)
 # =============================================================================
 # DICOM PDU Classes
 # =============================================================================
+# KEY FIX: Using LenField instead of IntField + manual post_build.
+# LenField automatically calculates the payload length when set to None.
+# =============================================================================
 
 class DICOM(Packet):
     """
@@ -976,19 +1001,17 @@ class DICOM(Packet):
     
     The extract_padding() method enables proper framing with StreamSocket,
     so Scapy can automatically handle PDU boundaries in TCP streams.
+    
+    KEY FIX: Using LenField for automatic payload length calculation.
+    No more manual post_build with struct.pack!
     """
     name = "DICOM UL"
     fields_desc = [
         ByteEnumField("pdu_type", 0x01, PDU_TYPES),
         ByteField("reserved1", 0),
-        IntField("length", None),
+        # LenField automatically calculates payload length when set to None
+        LenField("length", None, fmt="!I"),
     ]
-
-    def post_build(self, pkt, pay):
-        if self.length is None:
-            length = len(pay)
-            pkt = pkt[:2] + struct.pack("!I", length) + pkt[6:]
-        return pkt + pay
 
     def extract_padding(self, s):
         """
@@ -1011,9 +1034,13 @@ class PresentationDataValueItem(Packet):
     Message Control Header bits:
         Bit 0 (is_command): 1 = Command message, 0 = Data message
         Bit 1 (is_last): 1 = Last fragment, 0 = More fragments follow
+    
+    KEY FIX: Using FieldLenField to link length and data fields.
+    When you update `data`, Scapy automatically updates `length`.
     """
     name = "PresentationDataValueItem"
     fields_desc = [
+        # FieldLenField links to the 'data' field and adds 2 for context_id + control byte
         FieldLenField("length", None, length_of="data", fmt="!I",
                       adjust=lambda pkt, x: x + 2),
         ByteField("context_id", 1),
@@ -1200,6 +1227,10 @@ def build_user_information(max_pdu_length=16384, implementation_class_uid=None, 
 # =============================================================================
 # DICOM Session Helper Class
 # =============================================================================
+# KEY FIX: Removed all manual struct.pack calls for PDU serialization.
+# The session now relies entirely on Packet objects to serialize themselves
+# using the proper LenField and FieldLenField mechanisms.
+# =============================================================================
 
 class DICOMSession:
     """
@@ -1348,7 +1379,7 @@ class DICOMSession:
         user_info = build_user_information(max_pdu_length=self._proposed_max_pdu)
         variable_items.append(user_info)
 
-        # Build A-ASSOCIATE-RQ
+        # Build A-ASSOCIATE-RQ - LenField handles length automatically!
         assoc_rq = DICOM() / A_ASSOCIATE_RQ(
             called_ae_title=self.dst_ae,
             calling_ae_title=self.src_ae,
@@ -1457,15 +1488,17 @@ class DICOMSession:
 
         msg_id = self._get_next_message_id()
         
-        # Use the new DIMSE packet class instead of the builder function
+        # Use the DIMSE packet class - DIMSEPacket.post_build handles CommandGroupLength
         dimse_rq = bytes(C_ECHO_RQ(message_id=msg_id))
         
+        # Build PDV and P-DATA-TF - FieldLenField handles PDV length automatically
         pdv_rq = PresentationDataValueItem(
             context_id=echo_ctx_id,
             data=dimse_rq,
             is_command=1,
             is_last=1,
         )
+        # LenField in DICOM handles PDU length automatically
         pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
 
         # Use sr1() - send and receive in one call
@@ -1510,7 +1543,7 @@ class DICOMSession:
 
         msg_id = self._get_next_message_id()
         
-        # Use DIMSE packet class
+        # Use DIMSE packet class - DIMSEPacket.post_build handles CommandGroupLength
         if self.raw_mode:
             dimse_rq = build_c_store_rq_dimse_raw(sop_class_uid, sop_instance_uid, msg_id)
         else:
@@ -1520,12 +1553,14 @@ class DICOMSession:
                 message_id=msg_id,
             ))
 
+        # Build command PDV - FieldLenField handles length automatically
         cmd_pdv = PresentationDataValueItem(
             context_id=store_ctx_id,
             data=dimse_rq,
             is_command=1,
             is_last=1,
         )
+        # LenField in DICOM handles PDU length automatically
         pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
         self.send(pdata_cmd)
 

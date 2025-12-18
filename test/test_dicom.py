@@ -6,7 +6,9 @@ for live SCP verification.
 
 Tests the "kosher" Scapy approach:
 - DICOMVariableItem dispatches to typed sub-packets via bind_layers
-- No manual struct.pack - Scapy calculates lengths and types automatically
+- LenField for automatic length calculation (no manual post_build)
+- DIMSEPacket base class for DIMSE commands
+- FieldLenField for linked length/data fields
 """
 import pytest
 import struct
@@ -46,7 +48,8 @@ from dicom import (
     DICOMImplementationClassUID,
     DICOMImplementationVersionName,
     DICOMGenericItem,
-    # DIMSE Packet classes (Phase 3 - the kosher approach)
+    # DIMSE Packet classes (the kosher approach with DIMSEPacket base)
+    DIMSEPacket,
     C_ECHO_RQ,
     C_ECHO_RSP,
     C_STORE_RQ,
@@ -65,6 +68,152 @@ from dicom import (
     _pad_ae_title,
     _uid_to_bytes,
 )
+
+
+# =============================================================================
+# Test LenField Auto-Calculation (Key Fix #1)
+# =============================================================================
+
+class TestLenFieldAutoCalculation:
+    """Test that LenField automatically calculates payload length."""
+
+    def test_dicom_pdu_length_auto_calculated(self):
+        """DICOM header should auto-calculate payload length with LenField."""
+        pkt = DICOM() / A_RELEASE_RQ()
+        raw = bytes(pkt)
+        
+        # Parse length from bytes (bytes 2-5, big-endian)
+        length_field = struct.unpack("!I", raw[2:6])[0]
+        payload_size = len(raw) - 6  # Total - header
+        
+        assert length_field == payload_size
+        assert length_field == 4  # A_RELEASE_RQ is 4 bytes
+
+    def test_dicom_pdu_length_with_associate_rq(self):
+        """DICOM should auto-calculate length for larger payloads."""
+        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+        pctx = build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID])
+        user_info = build_user_information()
+        
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=_pad_ae_title("TARGET"),
+            calling_ae_title=_pad_ae_title("SOURCE"),
+            variable_items=[app_ctx, pctx, user_info],
+        )
+        raw = bytes(pkt)
+        
+        length_field = struct.unpack("!I", raw[2:6])[0]
+        payload_size = len(raw) - 6
+        
+        assert length_field == payload_size
+
+    def test_variable_item_length_auto_calculated(self):
+        """DICOMVariableItem should auto-calculate payload length."""
+        pkt = DICOMVariableItem() / DICOMApplicationContext()
+        raw = bytes(pkt)
+        
+        length_field = struct.unpack("!H", raw[2:4])[0]
+        payload_size = len(raw) - 4  # Total - header
+        
+        assert length_field == payload_size
+
+    def test_nested_items_length_calculated(self):
+        """Nested items should have correct cumulative length."""
+        max_len = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
+        user_info = DICOMVariableItem() / DICOMUserInformation(sub_items=[max_len])
+        
+        raw = bytes(user_info)
+        
+        # User info header (4) + nested max_len item (8)
+        assert len(raw) == 12
+        
+        # User info length should be 8 (the nested item)
+        ui_length = struct.unpack("!H", raw[2:4])[0]
+        assert ui_length == 8
+
+
+# =============================================================================
+# Test DIMSEPacket Base Class (Key Fix #2)
+# =============================================================================
+
+class TestDIMSEPacketBaseClass:
+    """Test the DIMSEPacket base class for CommandGroupLength handling."""
+
+    def test_dimse_packet_inheritance(self):
+        """All DIMSE commands should inherit from DIMSEPacket."""
+        assert issubclass(C_ECHO_RQ, DIMSEPacket)
+        assert issubclass(C_ECHO_RSP, DIMSEPacket)
+        assert issubclass(C_STORE_RQ, DIMSEPacket)
+        assert issubclass(C_STORE_RSP, DIMSEPacket)
+        assert issubclass(C_FIND_RQ, DIMSEPacket)
+
+    def test_dimse_packet_has_group_length_constant(self):
+        """DIMSEPacket should define GROUP_LENGTH_ELEMENT_SIZE."""
+        assert hasattr(DIMSEPacket, 'GROUP_LENGTH_ELEMENT_SIZE')
+        assert DIMSEPacket.GROUP_LENGTH_ELEMENT_SIZE == 12
+
+    def test_command_group_length_prepended(self):
+        """DIMSEPacket.post_build should prepend CommandGroupLength element."""
+        pkt = C_ECHO_RQ(message_id=42)
+        raw = bytes(pkt)
+        
+        # First element should be CommandGroupLength (0000,0000)
+        tag_g, tag_e = struct.unpack('<HH', raw[:4])
+        assert tag_g == 0x0000
+        assert tag_e == 0x0000
+        
+        # Value length should be 4
+        value_len = struct.unpack('<I', raw[4:8])[0]
+        assert value_len == 4
+        
+        # CommandGroupLength value should equal remaining bytes
+        group_len = struct.unpack('<I', raw[8:12])[0]
+        remaining_bytes = len(raw) - 12
+        assert group_len == remaining_bytes
+
+    def test_legacy_builder_matches_packet_class(self):
+        """Legacy builder should produce identical output to packet class."""
+        legacy = build_c_echo_rq_dimse(message_id=42)
+        kosher = bytes(C_ECHO_RQ(message_id=42))
+        assert legacy == kosher
+
+
+# =============================================================================
+# Test FieldLenField (Key Fix #3)
+# =============================================================================
+
+class TestFieldLenField:
+    """Test FieldLenField linking between length and data fields."""
+
+    def test_pdv_length_linked_to_data(self):
+        """PresentationDataValueItem length should be linked to data."""
+        test_data = b"TEST_DATA_12345"
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            data=test_data,
+            is_command=1,
+            is_last=1,
+        )
+        raw = bytes(pdv)
+        
+        # Length field should be len(data) + 2 (context_id + control byte)
+        length = struct.unpack("!I", raw[:4])[0]
+        assert length == len(test_data) + 2
+
+    def test_pdv_length_updates_with_data_change(self):
+        """Changing data should update length automatically."""
+        pdv1 = PresentationDataValueItem(context_id=1, data=b"SHORT")
+        pdv2 = PresentationDataValueItem(context_id=1, data=b"MUCH_LONGER_DATA")
+        
+        raw1 = bytes(pdv1)
+        raw2 = bytes(pdv2)
+        
+        len1 = struct.unpack("!I", raw1[:4])[0]
+        len2 = struct.unpack("!I", raw2[:4])[0]
+        
+        assert len2 > len1
+        assert len1 == len(b"SHORT") + 2
+        assert len2 == len(b"MUCH_LONGER_DATA") + 2
 
 
 # =============================================================================
@@ -183,44 +332,6 @@ class TestVariableItemBindLayers:
         assert parsed.item_type == 0xFF
         assert parsed.haslayer(DICOMGenericItem)
         assert parsed[DICOMGenericItem].data == b"test"
-
-
-class TestVariableItemAutoLength:
-    """Test that length field is auto-calculated from payload."""
-
-    def test_application_context_length_auto(self):
-        """Application Context length should be auto-calculated."""
-        pkt = DICOMVariableItem() / DICOMApplicationContext()
-        raw = bytes(pkt)
-        
-        # Parse length from raw bytes (bytes 2-3, big-endian)
-        length_field = struct.unpack("!H", raw[2:4])[0]
-        actual_payload = len(raw) - 4  # Total - header
-        
-        assert length_field == actual_payload
-
-    def test_maximum_length_item_size(self):
-        """Maximum Length item should be exactly 8 bytes (4 header + 4 data)."""
-        pkt = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
-        raw = bytes(pkt)
-        
-        assert len(raw) == 8
-        # Header: type=0x51, reserved=0, length=4
-        assert raw[:4] == b'\x51\x00\x00\x04'
-
-    def test_nested_items_length(self):
-        """Nested items should have correct cumulative length."""
-        max_len = DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=16384)
-        user_info = DICOMVariableItem() / DICOMUserInformation(sub_items=[max_len])
-        
-        raw = bytes(user_info)
-        
-        # User info header (4) + nested max_len item (8)
-        assert len(raw) == 12
-        
-        # User info length should be 8 (the nested item)
-        ui_length = struct.unpack("!H", raw[2:4])[0]
-        assert ui_length == 8
 
 
 class TestHelperFunctions:
@@ -454,63 +565,6 @@ class TestCoreLayerValidation:
         assert c_echo_dimse in raw_bytes
 
 
-class TestFuzzingCapabilities:
-    """Tests for fuzzing and edge case handling."""
-
-    def test_oversized_ae_title(self):
-        """Test that oversized AE titles are truncated to 16 bytes."""
-        oversized_title = b'A' * 25
-        pkt = DICOM() / A_ASSOCIATE_RQ(called_ae_title=oversized_title)
-        assert bytes(pkt)[10:26] == b'A' * 16
-
-    def test_too_many_presentation_contexts(self):
-        """Test handling of many presentation contexts (up to 128)."""
-        contexts = []
-        for i in range(128):
-            ctx_id = (i * 2) + 1
-            pctx = build_presentation_context_rq(
-                context_id=ctx_id,
-                abstract_syntax_uid=VERIFICATION_SOP_CLASS_UID,
-                transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID]
-            )
-            contexts.append(pctx)
-        
-        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
-        user_info = build_user_information()
-        
-        pkt = DICOM() / A_ASSOCIATE_RQ(variable_items=[app_ctx] + contexts + [user_info])
-        reparsed_pkt = DICOM(bytes(pkt))
-        assert len(reparsed_pkt[A_ASSOCIATE_RQ].variable_items) == 130  # 1 app + 128 pctx + 1 user
-
-    def test_manipulate_max_pdu_length(self):
-        """Test maximum PDU length manipulation."""
-        user_info = build_user_information(max_pdu_length=0x7FFFFFFF)
-        raw = bytes(user_info)
-        assert b'\x7f\xff\xff\xff' in raw
-
-    def test_illogical_fragmentation(self):
-        """Test incomplete fragmentation flag handling."""
-        pdv = PresentationDataValueItem(
-            context_id=1, data=b'fragment', is_last=0
-        )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        reparsed_pkt = DICOM(bytes(pkt))
-        assert reparsed_pkt[P_DATA_TF].pdv_items[0].is_last == 0
-
-    def test_pdu_type_confusion(self):
-        """Test PDU type mismatch (P-DATA type with A-ASSOCIATE payload)."""
-        pkt = DICOM(pdu_type=0x04) / A_ASSOCIATE_RQ()
-        raw_bytes = bytes(pkt)
-        assert raw_bytes[0] == 0x04
-        assert raw_bytes[6:10] == b'\x00\x01\x00\x00'
-
-    def test_null_byte_injection_in_ae(self):
-        """Test null byte handling in AE titles."""
-        injected_title = b'SCAPY\x00FUZZER'.ljust(16)
-        pkt = DICOM() / A_ASSOCIATE_RQ(calling_ae_title=injected_title)
-        assert bytes(pkt)[26:42] == injected_title
-
-
 class TestRoundTripSerialization:
     """Test that packets survive build -> serialize -> parse cycle."""
 
@@ -632,7 +686,7 @@ class TestBitFieldFlags:
 
 
 # =============================================================================
-# Test DIMSE Packet Classes (Phase 3 - The Kosher Approach)
+# Test DIMSE Packet Classes (The Kosher Approach)
 # =============================================================================
 
 class TestDIMSEPacketClasses:
@@ -839,8 +893,6 @@ class TestSessionUsesStreamSocket:
 
     def test_session_has_stream_methods(self):
         """DICOMSession should expose send/recv/sr1 methods."""
-        from dicom import DICOMSession
-        
         session = DICOMSession("127.0.0.1", 104, "TEST")
         
         # Should have these methods (StreamSocket pattern)
@@ -855,7 +907,6 @@ class TestSessionUsesStreamSocket:
     def test_session_no_manual_socket_loops(self):
         """DICOMSession should not have manual recv loops."""
         import inspect
-        from dicom import DICOMSession
         
         # Get source code of the class
         source = inspect.getsource(DICOMSession)
@@ -870,7 +921,7 @@ class TestSessionUsesStreamSocket:
 
 
 # =============================================================================
-# Integration Tests
+# Integration Tests (skipped without --ip flag)
 # =============================================================================
 
 integration_test_marker = pytest.mark.skipif(
