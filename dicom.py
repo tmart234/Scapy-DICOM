@@ -45,6 +45,7 @@ import struct
 import time
 
 from scapy.packet import Packet, bind_layers
+from scapy.error import Scapy_Exception
 from scapy.fields import (
     BitField,
     ByteEnumField,
@@ -587,7 +588,7 @@ class DICOMVariableItem(Packet):
     def extract_padding(self, s):
         if self.length is not None:
             if len(s) < self.length:
-                raise Exception("PDU payload incomplete")
+                raise Scapy_Exception("PDU payload incomplete")
             return s[:self.length], s[self.length:]
         return s, b""
     
