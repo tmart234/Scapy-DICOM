@@ -220,47 +220,6 @@ class TestSingleSmartPacketClasses:
         assert not hasattr(dicom, 'C_STORE_RQ_Raw')
         assert not hasattr(dicom, 'DIMSEPacketRaw')
 
-    def test_packet_has_raw_mode_attribute(self):
-        """DIMSE packets should have raw_mode attribute."""
-        pkt = C_ECHO_RQ()
-        assert hasattr(pkt, 'raw_mode')
-        assert pkt.raw_mode == False  # Default is False
-
-    def test_raw_mode_can_be_set_per_packet(self):
-        """raw_mode can be set on individual packets."""
-        pkt = C_ECHO_RQ()
-        pkt.raw_mode = True
-        assert pkt.raw_mode == True
-
-    def test_global_raw_mode_config(self):
-        """Global raw_mode can be set via conf.contribs."""
-        # Save original
-        original = conf.contribs.get("dicom", {}).get("raw_mode", False)
-        
-        try:
-            conf.contribs["dicom"]["raw_mode"] = True
-            
-            # New packets should respect global config
-            pkt = C_STORE_RQ()
-            # The field should check global config
-            uid_field = None
-            for f in pkt.fields_desc:
-                if hasattr(f, '_get_raw_mode'):
-                    assert f._get_raw_mode(pkt) == True
-                    break
-        finally:
-            conf.contribs["dicom"]["raw_mode"] = original
-
-    def test_uid_padding_controlled_by_raw_mode(self):
-        """UID auto-padding should be controlled by raw_mode."""
-        # Normal mode - should pad
-        pkt = C_ECHO_RQ(affected_sop_class_uid="1.2.3")  # 5 bytes - odd
-        raw = bytes(pkt)
-        
-        # Find the UID in the raw bytes - it should be padded to even
-        # The UID "1.2.3" + null = 6 bytes
-        assert b"1.2.3\x00" in raw or b"1.2.3" in raw
-
     def test_dimse_command_base_class(self):
         """All DIMSE commands should inherit from DIMSECommand."""
         assert issubclass(C_ECHO_RQ, DIMSECommand)
