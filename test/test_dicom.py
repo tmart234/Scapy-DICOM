@@ -921,18 +921,85 @@ integration_test_marker = pytest.mark.skipif(
 
 @integration_test_marker
 def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
-    """Performs a full C-ECHO workflow against a live SCP."""
-    with DICOMSocket(
-        dst_ip=scp_ip,
-        dst_port=scp_port,
-        dst_ae=scp_ae,
-        src_ae=my_ae,
-        read_timeout=timeout,
-    ) as session:
-        assoc_success = session.associate()
-        assert assoc_success, "Association failed"
+    """Performs a full C-ECHO workflow against a live SCP using send/recv."""
+    import socket
+    from scapy.supersocket import StreamSocket
 
-        echo_status = session.c_echo()
-        assert echo_status == 0x0000, f"C-ECHO failed: 0x{echo_status:04X}"
+    # Create raw socket connection
+    sock = socket.create_connection((scp_ip, scp_port), timeout=timeout)
+    stream = StreamSocket(sock, basecls=DICOM)
 
-        session.release()
+    try:
+        # Build A-ASSOCIATE-RQ
+        app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+        pctx = build_presentation_context_rq(
+            1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]
+        )
+        user_info = build_user_information(max_pdu_length=16384)
+
+        assoc_rq = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=scp_ae,
+            calling_ae_title=my_ae,
+            variable_items=[app_ctx, pctx, user_info],
+        )
+
+        # Send association request
+        stream.send(assoc_rq)
+
+        # Receive response (don't use sr1, use recv directly)
+        response = stream.recv()
+        assert response is not None, "No response received for A-ASSOCIATE-RQ"
+        assert response.haslayer(A_ASSOCIATE_AC), f"Expected A-ASSOCIATE-AC, got {response.summary()}"
+
+        # Find accepted context ID
+        ctx_id = None
+        for item in response[A_ASSOCIATE_AC].variable_items:
+            if item.item_type == 0x21 and item.haslayer(DICOMPresentationContextAC):
+                pctx_ac = item[DICOMPresentationContextAC]
+                if pctx_ac.result == 0:
+                    ctx_id = pctx_ac.context_id
+                    break
+
+        assert ctx_id is not None, "No accepted presentation context"
+
+        # Build and send C-ECHO-RQ
+        dimse_rq = C_ECHO_RQ(message_id=1)
+        pdv_rq = PresentationDataValueItem(
+            context_id=ctx_id,
+            data=bytes(dimse_rq),
+            is_command=1,
+            is_last=1,
+        )
+        pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
+        stream.send(pdata_rq)
+
+        # Receive C-ECHO-RSP
+        echo_response = stream.recv()
+        assert echo_response is not None, "No response received for C-ECHO-RQ"
+        assert echo_response.haslayer(P_DATA_TF), f"Expected P-DATA-TF, got {echo_response.summary()}"
+
+        # Parse status
+        pdv_items = echo_response[P_DATA_TF].pdv_items
+        assert len(pdv_items) > 0, "No PDV items in response"
+
+        pdv_data = pdv_items[0].data
+        if isinstance(pdv_data, str):
+            pdv_data = pdv_data.encode('latin-1')
+
+        status = parse_dimse_status(pdv_data)
+        assert status == 0x0000, f"C-ECHO failed with status: 0x{status:04X}"
+
+        # Send A-RELEASE-RQ
+        release_rq = DICOM() / A_RELEASE_RQ()
+        stream.send(release_rq)
+
+        # Receive A-RELEASE-RP
+        release_response = stream.recv()
+        assert release_response is not None, "No response received for A-RELEASE-RQ"
+        assert release_response.haslayer(A_RELEASE_RP), f"Expected A-RELEASE-RP, got {release_response.summary()}"
+
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass

@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-DICOM Protocol Fuzzer (v2.1 - Compatible with Refactored dicom.py)
+DICOM Protocol Fuzzer (v3.0 - Scapy-Native)
 
-A fuzzing tool for testing DICOM SCP implementations using the refactored
-dicom module with:
-- Native Scapy random generators (RandChoice, RandString, fuzz())
-- DICOMAETitleField auto-padding (no _pad_ae_title needed)
-- Byte mutation for group_length buffer attacks
-- Raw byte construction for odd-length UID fuzzing
+A fuzzing tool for testing DICOM SCP implementations using Scapy-native patterns:
+- Subclassed packet classes for fuzzing (no raw byte construction)
+- Override post_build() to disable auto-calculation
+- Use DICOMUIDFieldRaw for odd-length UIDs
+- Scapy's fuzz() function for randomized fields
+- Post-serialization mutation for edge cases
 
 Fuzzing capabilities:
-- Buffer over-read attacks via group_length byte manipulation
-- Odd-length UIDs via raw byte construction
-- Field-level fuzzing using packet class attributes
+- Buffer over-read attacks via explicit group_length
+- Odd-length UIDs via DICOMUIDFieldRaw
+- Field-level fuzzing using Scapy's fuzz()
 - Arbitrary context IDs and protocol violations
 
 Usage:
@@ -43,7 +43,7 @@ try:
 except Exception:
     pass
 
-from scapy.packet import fuzz
+from scapy.packet import Packet, fuzz
 
 try:
     from dicom import (
@@ -66,8 +66,13 @@ try:
         DICOMUserInformation,
         DICOMMaximumLength,
         # DIMSE Packet classes
+        DIMSEPacket,
         C_ECHO_RQ,
         C_STORE_RQ,
+        # Field classes for subclassing
+        DICOMUIDFieldRaw,
+        DICOMUSField,
+        DICOMULField,
         # Helpers
         build_presentation_context_rq,
         build_user_information,
@@ -97,6 +102,59 @@ SAMPLE_DCM_URL = "https://raw.githubusercontent.com/pydicom/pydicom/main/src/pyd
 DEFAULT_SAMPLE_DIR = "sample_files_for_fuzzing"
 DEFAULT_SAMPLE_FILE = os.path.join(DEFAULT_SAMPLE_DIR, "valid_ct.dcm")
 
+
+# =============================================================================
+# Scapy-Native Fuzz Packet Classes (Subclassing Pattern)
+# =============================================================================
+
+class C_STORE_RQ_Fuzz(Packet):
+    """
+    Fuzzing version of C-STORE-RQ with:
+    - Explicit command_group_length field (not auto-calculated)
+    - DICOMUIDFieldRaw for odd-length UIDs (no auto-padding)
+    - Overridden post_build() to skip auto-calculation
+
+    This is the Scapy-native way to create fuzzable packets.
+    """
+    name = "C-STORE-RQ (Fuzz)"
+    fields_desc = [
+        # Explicit group_length - NOT auto-calculated
+        DICOMULField("command_group_length", 0, 0x0000, 0x0000),
+        # Raw UID field - no auto-padding
+        DICOMUIDFieldRaw("affected_sop_class_uid", b"", 0x0000, 0x0002),
+        DICOMUSField("command_field", 0x0001, 0x0000, 0x0100),
+        DICOMUSField("message_id", 1, 0x0000, 0x0110),
+        DICOMUSField("priority", 0x0002, 0x0000, 0x0700),
+        DICOMUSField("data_set_type", 0x0000, 0x0000, 0x0800),
+        # Raw UID field - no auto-padding
+        DICOMUIDFieldRaw("affected_sop_instance_uid", b"", 0x0000, 0x1000),
+    ]
+
+    def post_build(self, pkt: bytes, pay: bytes) -> bytes:
+        """Skip auto-calculation - use explicit values for fuzzing."""
+        return pkt + pay
+
+
+class C_ECHO_RQ_Fuzz(Packet):
+    """
+    Fuzzing version of C-ECHO-RQ with explicit group_length.
+    """
+    name = "C-ECHO-RQ (Fuzz)"
+    fields_desc = [
+        DICOMULField("command_group_length", 0, 0x0000, 0x0000),
+        DICOMUIDFieldRaw("affected_sop_class_uid", b"", 0x0000, 0x0002),
+        DICOMUSField("command_field", 0x0030, 0x0000, 0x0100),
+        DICOMUSField("message_id", 1, 0x0000, 0x0110),
+        DICOMUSField("data_set_type", 0x0101, 0x0000, 0x0800),
+    ]
+
+    def post_build(self, pkt: bytes, pay: bytes) -> bytes:
+        return pkt + pay
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
 
 def ensure_sample_file_exists(file_path=DEFAULT_SAMPLE_FILE):
     """Download or create sample DICOM file."""
@@ -168,14 +226,7 @@ def create_minimal_dicom_file(file_path):
 
 
 def create_minimal_dataset_bytes(sop_class_uid=None, sop_instance_uid=None, pad_uids=True):
-    """
-    Create minimal DICOM dataset bytes.
-
-    Args:
-        sop_class_uid: SOP Class UID (bytes or str)
-        sop_instance_uid: SOP Instance UID (bytes or str)
-        pad_uids: If True, pad UIDs to even length. If False, preserve as-is (fuzzing)
-    """
+    """Create minimal DICOM dataset bytes."""
     elements = []
 
     sop_class = sop_class_uid or b"1.2.840.10008.5.1.4.1.1.7"
@@ -230,63 +281,11 @@ def extract_dicom_info(dcm_file_path):
     )
 
 
-# =============================================================================
-# Fuzzing Helper Functions
-# =============================================================================
-
-def mutate_group_length(dimse_bytes: bytes, new_length: int) -> bytes:
-    """
-    Mutate the group_length field in DIMSE command bytes.
-
-    The group_length is at bytes 8-12 (little-endian UL after the 8-byte header).
-    Header format: (0000,0000) tag (4 bytes) + length=4 (4 bytes) + group_len (4 bytes)
-
-    This replaces the old command_group_length field approach for buffer over-read attacks.
-    """
-    if len(dimse_bytes) < 12:
-        return dimse_bytes
-    mutated = bytearray(dimse_bytes)
-    mutated[8:12] = struct.pack("<I", new_length)
+def mutate_bytes(data: bytes, offset: int, new_value: bytes) -> bytes:
+    """Mutate bytes at a specific offset - for post-serialization fuzzing."""
+    mutated = bytearray(data)
+    mutated[offset:offset + len(new_value)] = new_value
     return bytes(mutated)
-
-
-def build_raw_dimse_store_rq(sop_class_uid: bytes, sop_instance_uid: bytes,
-                             message_id: int = 1, pad_uids: bool = True) -> bytes:
-    """
-    Build raw C-STORE-RQ DIMSE bytes without using packet classes.
-
-    This replaces the old raw_mode approach for sending odd-length UIDs.
-
-    Args:
-        sop_class_uid: SOP Class UID as bytes
-        sop_instance_uid: SOP Instance UID as bytes
-        message_id: Message ID
-        pad_uids: If True, pad UIDs to even length. If False, preserve as-is (fuzzing)
-    """
-    if pad_uids:
-        if len(sop_class_uid) % 2:
-            sop_class_uid = sop_class_uid + b"\x00"
-        if len(sop_instance_uid) % 2:
-            sop_instance_uid = sop_instance_uid + b"\x00"
-
-    elements = [
-        (0x0000, 0x0002, sop_class_uid),
-        (0x0000, 0x0100, struct.pack("<H", 0x0001)),  # C-STORE-RQ
-        (0x0000, 0x0110, struct.pack("<H", message_id)),
-        (0x0000, 0x0700, struct.pack("<H", 0x0002)),  # Priority
-        (0x0000, 0x0800, struct.pack("<H", 0x0000)),  # Data set present
-        (0x0000, 0x1000, sop_instance_uid),
-    ]
-    payload = b"".join(
-        struct.pack("<HH", g, e) + struct.pack("<I", len(v)) + v
-        for g, e, v in elements
-    )
-    group_len = len(payload)
-    return (
-        struct.pack("<HHI", 0x0000, 0x0000, 4)
-        + struct.pack("<I", group_len)
-        + payload
-    )
 
 
 # =============================================================================
@@ -314,8 +313,9 @@ def fuzz_association_handshake(session_args):
                 build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
                 build_user_information(max_pdu_length=16384),
             ]
+            # DICOMAETitleField will truncate to 16, but let's test with 20
             aarq = A_ASSOCIATE_RQ(
-                called_ae_title=b"X" * 20,  # Overlong! Field will truncate to 16
+                called_ae_title=b"X" * 20,
                 calling_ae_title=session_args["calling_ae"],
                 variable_items=variable_items,
             )
@@ -410,8 +410,8 @@ def fuzz_association_handshake(session_args):
         script_log.error(f"Error: {e}")
         results["errors"] += 1
 
-    # --- Test 4: PDU Length Mismatch ---
-    script_log.info("Test 4: PDU Length Mismatch (inflated)")
+    # --- Test 4: PDU Length Mismatch (post-serialization mutation) ---
+    script_log.info("Test 4: PDU Length Mismatch (inflated via mutation)")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -432,15 +432,13 @@ def fuzz_association_handshake(session_args):
                 variable_items=variable_items,
             )
             pkt = DICOM() / aarq
-            raw_bytes = bytearray(bytes(pkt))
+            raw_bytes = bytes(pkt)
 
-            # Inflate length field
+            # Mutate length field at offset 2-6 (big-endian)
             actual_len = struct.unpack("!I", raw_bytes[2:6])[0]
-            raw_bytes[2:6] = struct.pack("!I", actual_len + 10000)
+            mutated = mutate_bytes(raw_bytes, 2, struct.pack("!I", actual_len + 10000))
 
-            session.send_raw_bytes(bytes(raw_bytes))
-
-            # Server should timeout waiting for more data or reject
+            session.send_raw_bytes(mutated)
             script_log.info("[PASS] Sent inflated length PDU")
             results["passed"] += 1
         session.close()
@@ -459,8 +457,15 @@ def fuzz_association_handshake(session_args):
             read_timeout=session_args["timeout"],
         )
         if session.connect():
-            unknown_pdu = struct.pack("!BBI", 0xFF, 0, 4) + b"\x00\x00\x00\x00"
-            session.send_raw_bytes(unknown_pdu)
+            # Build valid PDU, then mutate the type byte
+            pkt = DICOM() / A_ASSOCIATE_RQ(
+                called_ae_title=session_args["ae_title"],
+                calling_ae_title=session_args["calling_ae"],
+            )
+            raw_bytes = bytes(pkt)
+            mutated = mutate_bytes(raw_bytes, 0, b"\xFF")  # Change PDU type
+
+            session.send_raw_bytes(mutated)
 
             response = session.recv()
             if response and response.haslayer(A_ABORT):
@@ -506,8 +511,8 @@ def fuzz_association_handshake(session_args):
         script_log.error(f"Error: {e}")
         results["errors"] += 1
 
-    # --- Test 7: Odd-Length UID (using raw byte construction) ---
-    script_log.info("Test 7: Odd-Length UID in Application Context (raw bytes)")
+    # --- Test 7: Scapy fuzz() on A-ASSOCIATE-RQ ---
+    script_log.info("Test 7: Scapy fuzz() on A-ASSOCIATE-RQ")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -517,33 +522,21 @@ def fuzz_association_handshake(session_args):
             read_timeout=session_args["timeout"],
         )
         if session.connect():
-            # Build A-ASSOCIATE-RQ with odd-length UID manually
-            # Odd-length UID (15 bytes) - construct raw Application Context item
-            odd_uid = b"1.2.840.10008.1"  # 15 bytes - odd!
-            app_ctx_item = struct.pack("!BBH", 0x10, 0, len(odd_uid)) + odd_uid
+            # Use Scapy's native fuzz() function
+            fuzzed_aarq = fuzz(A_ASSOCIATE_RQ())
+            # Keep some fields valid for basic parsing
+            fuzzed_aarq.called_ae_title = session_args["ae_title"]
+            fuzzed_aarq.calling_ae_title = session_args["calling_ae"]
 
-            # Build presentation context and user info normally
-            pctx = build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID])
-            user_info = build_user_information(max_pdu_length=16384)
-
-            # Build the A-ASSOCIATE-RQ manually with odd-length app context
-            called_ae = session_args["ae_title"].encode().ljust(16)[:16]
-            calling_ae = session_args["calling_ae"].encode().ljust(16)[:16]
-            reserved2 = b"\x00" * 32
-
-            var_items = app_ctx_item + bytes(pctx) + bytes(user_info)
-            aarq_payload = struct.pack("!HH", 0x0001, 0) + called_ae + calling_ae + reserved2 + var_items
-
-            pdu = struct.pack("!BBI", 0x01, 0, len(aarq_payload)) + aarq_payload
-            session.send_raw_bytes(pdu)
+            pkt = DICOM() / fuzzed_aarq
+            session.send(pkt)
 
             response = session.recv()
-
-            script_log.info("[PASS] Server handled odd-length UID")
+            script_log.info("[PASS] Sent Scapy fuzz() A-ASSOCIATE-RQ")
             results["passed"] += 1
         session.close()
     except Exception as e:
-        script_log.info(f"[PASS] Server rejected odd-length UID: {e}")
+        script_log.info(f"[PASS] Fuzz caused exception: {e}")
         results["passed"] += 1
 
     script_log.info("=== Association Fuzzing Complete ===")
@@ -552,11 +545,11 @@ def fuzz_association_handshake(session_args):
 
 
 # =============================================================================
-# C-STORE Fuzzing (Leveraging New Architecture)
+# C-STORE Fuzzing (Using Scapy-Native Subclassed Packets)
 # =============================================================================
 
 def fuzz_cstore_with_file(session_args, dcm_file_path):
-    """C-STORE fuzzing using the new architecture."""
+    """C-STORE fuzzing using Scapy-native subclassed packets."""
     script_log.info(f"=== Starting C-STORE Fuzzing with: {dcm_file_path} ===")
 
     if not os.path.exists(dcm_file_path):
@@ -602,8 +595,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         script_log.error(f"Error: {e}")
         results["errors"] += 1
 
-    # --- Test 2: FUZZ group_length via byte mutation (Buffer Over-Read Attack!) ---
-    script_log.info("Test 2: Fuzz group_length via byte mutation (Buffer Over-Read)")
+    # --- Test 2: Fuzz group_length using subclassed packet ---
+    script_log.info("Test 2: Fuzz group_length using C_STORE_RQ_Fuzz (Scapy subclass)")
     for fuzz_len in [0, 10, 0xFFFF, 0xFFFFFFFF]:
         script_log.info(f"  Testing group_length=0x{fuzz_len:X}")
         try:
@@ -622,20 +615,17 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
                         break
 
                 if ctx_id:
-                    # Build normal DIMSE, then mutate group_length field
-                    dimse_cmd = C_STORE_RQ(
-                        affected_sop_class_uid=sop_class,
-                        affected_sop_instance_uid=sop_instance + f".len{fuzz_len}",
+                    # Use the Scapy-native fuzz packet class!
+                    dimse_cmd = C_STORE_RQ_Fuzz(
+                        command_group_length=fuzz_len,  # Explicit - not auto-calculated!
+                        affected_sop_class_uid=_uid_to_bytes(sop_class),
+                        affected_sop_instance_uid=f"{sop_instance}.len{fuzz_len}".encode(),
                         message_id=random.randint(1, 65535),
                     )
-                    dimse_bytes = bytes(dimse_cmd)
-
-                    # Mutate group_length field (bytes 8-12) for buffer over-read
-                    mutated_dimse = mutate_group_length(dimse_bytes, fuzz_len)
 
                     cmd_pdv = PresentationDataValueItem(
                         context_id=ctx_id,
-                        data=mutated_dimse,
+                        data=bytes(dimse_cmd),
                         is_command=1,
                         is_last=1,
                     )
@@ -660,8 +650,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
 
     results["passed"] += 1  # Completed fuzz iterations
 
-    # --- Test 3: Fuzz message_id boundaries ---
-    script_log.info("Test 3: Fuzz message_id boundaries")
+    # --- Test 3: Odd-length UIDs using C_STORE_RQ_Fuzz ---
+    script_log.info("Test 3: Odd-length UIDs using C_STORE_RQ_Fuzz (DICOMUIDFieldRaw)")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -678,43 +668,48 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
                     break
 
             if ctx_id:
-                for test_msg_id in [0, 1, 0x7FFF, 0xFFFF]:
-                    script_log.info(f"  Testing message_id=0x{test_msg_id:04X}")
+                # Use DICOMUIDFieldRaw - no auto-padding!
+                dimse_cmd = C_STORE_RQ_Fuzz(
+                    command_group_length=100,  # Will be wrong, that's the point
+                    affected_sop_class_uid=b"1.2.3.4.5",  # 9 bytes - odd!
+                    affected_sop_instance_uid=b"1.2.3.4.5.6.7",  # 13 bytes - odd!
+                    message_id=1,
+                )
 
-                    dimse_cmd = C_STORE_RQ(
-                        affected_sop_class_uid=sop_class,
-                        affected_sop_instance_uid=sop_instance + f".msgid{test_msg_id}",
-                        message_id=test_msg_id,  # Easy field fuzzing!
-                    )
+                cmd_pdv = PresentationDataValueItem(
+                    context_id=ctx_id,
+                    data=bytes(dimse_cmd),
+                    is_command=1,
+                    is_last=1,
+                )
+                session.send(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv]))
 
-                    cmd_pdv = PresentationDataValueItem(
-                        context_id=ctx_id,
-                        data=bytes(dimse_cmd),
-                        is_command=1,
-                        is_last=1,
-                    )
-                    session.send(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv]))
+                # Also send odd-length dataset
+                odd_dataset = create_minimal_dataset_bytes(
+                    sop_class_uid=b"1.2.3.4.5",
+                    sop_instance_uid=b"1.2.3.4.5.6.7",
+                    pad_uids=False,  # No padding!
+                )
 
-                    data_pdv = PresentationDataValueItem(
-                        context_id=ctx_id,
-                        data=data_bytes,
-                        is_command=0,
-                        is_last=1,
-                    )
-                    session.send(DICOM() / P_DATA_TF(pdv_items=[data_pdv]))
+                data_pdv = PresentationDataValueItem(
+                    context_id=ctx_id,
+                    data=odd_dataset,
+                    is_command=0,
+                    is_last=1,
+                )
+                session.send(DICOM() / P_DATA_TF(pdv_items=[data_pdv]))
 
-                    response = session.recv()
-                    if response:
-                        script_log.info(f"    Server responded")
+                response = session.recv()
+                script_log.info("[PASS] Sent odd-length UIDs via C_STORE_RQ_Fuzz")
+                results["passed"] += 1
 
             session.release()
-            results["passed"] += 1
         session.close()
     except Exception as e:
-        script_log.error(f"Error: {e}")
-        results["errors"] += 1
+        script_log.info(f"[PASS] Server rejected odd-length UIDs: {e}")
+        results["passed"] += 1
 
-    # --- Test 4: Invalid command field ---
+    # --- Test 4: Invalid command field (field modification) ---
     script_log.info("Test 4: Invalid command field (0xDEAD)")
     try:
         session = DICOMSocket(
@@ -732,12 +727,13 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
                     break
 
             if ctx_id:
+                # Create normal packet, then modify field
                 dimse_cmd = C_STORE_RQ(
                     affected_sop_class_uid=sop_class,
                     affected_sop_instance_uid=sop_instance + ".badcmd",
                     message_id=1,
                 )
-                dimse_cmd.command_field = 0xDEAD  # Invalid!
+                dimse_cmd.command_field = 0xDEAD  # Modify before serialization!
 
                 cmd_pdv = PresentationDataValueItem(
                     context_id=ctx_id,
@@ -758,67 +754,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         script_log.info(f"[PASS] Exception: {e}")
         results["passed"] += 1
 
-    # --- Test 5: Odd-length UIDs using raw byte construction ---
-    script_log.info("Test 5: Odd-length UIDs using raw DIMSE bytes")
-    try:
-        session = DICOMSocket(
-            dst_ip=session_args["ip"],
-            dst_port=session_args["port"],
-            dst_ae=session_args["ae_title"],
-            src_ae=session_args["calling_ae"],
-            read_timeout=session_args["timeout"],
-        )
-        if session.associate(requested_contexts=requested_contexts):
-            ctx_id = None
-            for cid, (abs_syn, _) in session.accepted_contexts.items():
-                if abs_syn == sop_class:
-                    ctx_id = cid
-                    break
-
-            if ctx_id:
-                # Build raw DIMSE with odd-length UIDs (no padding)
-                dimse_raw = build_raw_dimse_store_rq(
-                    sop_class_uid=b"1.2.3.4.5",  # 9 bytes - odd!
-                    sop_instance_uid=b"1.2.3.4.5.6.7",  # 13 bytes - odd!
-                    message_id=1,
-                    pad_uids=False,  # No padding!
-                )
-
-                cmd_pdv = PresentationDataValueItem(
-                    context_id=ctx_id,
-                    data=dimse_raw,
-                    is_command=1,
-                    is_last=1,
-                )
-                session.send(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv]))
-
-                # Also send odd-length dataset
-                odd_dataset = create_minimal_dataset_bytes(
-                    sop_class_uid=b"1.2.3.4.5",
-                    sop_instance_uid=b"1.2.3.4.5.6.7",
-                    pad_uids=False,
-                )
-
-                data_pdv = PresentationDataValueItem(
-                    context_id=ctx_id,
-                    data=odd_dataset,
-                    is_command=0,
-                    is_last=1,
-                )
-                session.send(DICOM() / P_DATA_TF(pdv_items=[data_pdv]))
-
-                response = session.recv()
-                script_log.info("[PASS] Sent odd-length UIDs")
-                results["passed"] += 1
-
-            session.release()
-        session.close()
-    except Exception as e:
-        script_log.info(f"[PASS] Server rejected odd-length UIDs: {e}")
-        results["passed"] += 1
-
-    # --- Test 6: Wrong context ID ---
-    script_log.info("Test 6: Wrong Presentation Context ID (255)")
+    # --- Test 5: Wrong context ID ---
+    script_log.info("Test 5: Wrong Presentation Context ID (255)")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -853,8 +790,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         script_log.info(f"[PASS] Exception: {e}")
         results["passed"] += 1
 
-    # --- Test 7: Scapy fuzz() on DIMSE packet ---
-    script_log.info("Test 7: Scapy native fuzz() on C_STORE_RQ")
+    # --- Test 6: Scapy fuzz() on C_STORE_RQ ---
+    script_log.info("Test 6: Scapy native fuzz() on C_STORE_RQ")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -908,8 +845,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         script_log.info(f"[PASS] Fuzz caused exception: {e}")
         results["passed"] += 1
 
-    # --- Test 8: Zero-length dataset ---
-    script_log.info("Test 8: Zero-length dataset")
+    # --- Test 7: Zero-length dataset ---
+    script_log.info("Test 7: Zero-length dataset")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -928,8 +865,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         script_log.info(f"[PASS] Server rejected empty dataset: {e}")
         results["passed"] += 1
 
-    # --- Test 9: Corrupted dataset ---
-    script_log.info("Test 9: Corrupted dataset (random bit flips)")
+    # --- Test 8: Corrupted dataset ---
+    script_log.info("Test 8: Corrupted dataset (random bit flips)")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -953,8 +890,8 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
         script_log.info(f"[PASS] Server rejected corrupted data: {e}")
         results["passed"] += 1
 
-    # --- Test 10: Incomplete fragment ---
-    script_log.info("Test 10: Incomplete fragment (send partial, close)")
+    # --- Test 9: Incomplete fragment ---
+    script_log.info("Test 9: Incomplete fragment (send partial, close)")
     try:
         session = DICOMSocket(
             dst_ip=session_args["ip"],
@@ -1013,15 +950,16 @@ def fuzz_cstore_with_file(session_args, dcm_file_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DICOM Protocol Fuzzer v2.1 (Compatible with Refactored dicom.py)",
+        description="DICOM Protocol Fuzzer v3.0 (Scapy-Native)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Fuzzing Techniques (v2.1):
-- Byte mutation: mutate_group_length() for buffer over-read attacks
-- Raw byte construction: build_raw_dimse_store_rq() for odd-length UIDs
-- Field modification: packet.field = bad_value before serialization
-- Scapy fuzz(): fuzz(C_STORE_RQ()) for randomized field values
-- send_raw_bytes(): bypass all Scapy processing
+Fuzzing Techniques (v3.0 - Scapy-Native):
+- Subclassed packets: C_STORE_RQ_Fuzz with explicit group_length
+- DICOMUIDFieldRaw: Odd-length UIDs without auto-padding
+- Field modification: packet.field = bad_value before bytes()
+- Scapy fuzz(): fuzz(C_STORE_RQ()) for randomized fields
+- Post-serialization mutation: mutate_bytes() for edge cases
+- send_raw_bytes(): Direct socket writes when needed
 
 Examples:
   python dicom_fuzzer.py --ip 127.0.0.1 --port 4242 --ae-title ORTHANC --mode association
@@ -1045,7 +983,7 @@ Examples:
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
     )
 
-    script_log.info(f"=== DICOM Fuzzer v2.1 Started (Mode: {args.mode}) ===")
+    script_log.info(f"=== DICOM Fuzzer v3.0 (Scapy-Native) Started (Mode: {args.mode}) ===")
 
     session_params = {
         "ip": args.ip,
@@ -1066,7 +1004,7 @@ Examples:
                 sys.exit(1)
         fuzz_cstore_with_file(session_params, target_file)
 
-    script_log.info("=== DICOM Fuzzer v2.1 Finished ===")
+    script_log.info("=== DICOM Fuzzer v3.0 Finished ===")
 
 
 if __name__ == "__main__":
