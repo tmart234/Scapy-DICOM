@@ -43,7 +43,7 @@ try:
 except Exception:
     pass
 
-from scapy.volatile import fuzz
+from scapy.packet import fuzz
 
 try:
     from dicom import (
