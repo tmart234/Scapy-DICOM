@@ -1,2 +1,2 @@
-# Scapy DICOM
- crafting DICOM packets with Scapy
+# C-SCARE
+A Scapy-based DICOM fuzzer
