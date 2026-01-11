@@ -778,6 +778,27 @@ class TestHelperFunctions:
         status = parse_dimse_status(raw)
         assert status == 0x0000
 
+    def test_parse_dimse_status_multiple_values(self):
+        """parse_dimse_status should work with different status values."""
+        test_values = [0x0000, 0x0001, 0xFF00, 0xC000, 0xA700]
+
+        for val in test_values:
+            pkt = C_ECHO_RSP(message_id_responded=1, status=val)
+            raw = bytes(pkt)
+            status = parse_dimse_status(raw)
+            assert status == val, f"Expected status 0x{val:04X}, got 0x{status:04X}"
+
+    def test_parse_dimse_status_returns_none_for_invalid(self):
+        """parse_dimse_status should return None for invalid data."""
+        # Too short
+        assert parse_dimse_status(b"short") is None
+
+        # Empty
+        assert parse_dimse_status(b"") is None
+
+        # Random bytes
+        assert parse_dimse_status(b"\x00" * 100) is None
+
 
 # =============================================================================
 # Test Edge Cases
