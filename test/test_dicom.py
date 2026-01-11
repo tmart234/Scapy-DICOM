@@ -982,11 +982,25 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
         pdv_items = echo_response[P_DATA_TF].pdv_items
         assert len(pdv_items) > 0, "No PDV items in response"
 
+        # Get PDV data and ensure it's bytes
         pdv_data = pdv_items[0].data
         if isinstance(pdv_data, str):
             pdv_data = pdv_data.encode('latin-1')
+        elif not isinstance(pdv_data, bytes):
+            pdv_data = bytes(pdv_data)
+
+        # Debug: print the raw data to understand structure
+        print(f"\nDEBUG: PDV data length: {len(pdv_data)}")
+        print(f"DEBUG: First 64 bytes (hex): {pdv_data[:64].hex()}")
+        print(f"DEBUG: is_command flag: {pdv_items[0].is_command}")
+        print(f"DEBUG: is_last flag: {pdv_items[0].is_last}")
 
         status = parse_dimse_status(pdv_data)
+        assert status is not None, (
+            f"Failed to parse DIMSE status from response. "
+            f"PDV data length: {len(pdv_data)}, "
+            f"First 64 bytes (hex): {pdv_data[:64].hex()}"
+        )
         assert status == 0x0000, f"C-ECHO failed with status: 0x{status:04X}"
 
         # Send A-RELEASE-RQ
