@@ -41,6 +41,7 @@ from scapy.volatile import RandShort, RandInt, RandString
 
 __all__ = [
     "DICOM_PORT",
+    "DICOM_PORT_ALT",
     "APP_CONTEXT_UID",
     "DEFAULT_TRANSFER_SYNTAX_UID",
     "VERIFICATION_SOP_CLASS_UID",
@@ -72,6 +73,8 @@ __all__ = [
     "DICOMAsyncOperationsWindow",
     "DICOMSCPSCURoleSelection",
     "DICOMImplementationVersionName",
+    "DICOMSOPClassExtendedNegotiation",
+    "DICOMSOPClassCommonExtendedNegotiation",
     "DICOMUserIdentity",
     "DICOMUserIdentityResponse",
     "DICOMElementField",
@@ -103,6 +106,7 @@ __all__ = [
 log = logging.getLogger("scapy.contrib.dicom")
 
 DICOM_PORT = 104
+DICOM_PORT_ALT = 11112
 APP_CONTEXT_UID = "1.2.840.10008.3.1.1.1"
 DEFAULT_TRANSFER_SYNTAX_UID = "1.2.840.10008.1.2"
 VERIFICATION_SOP_CLASS_UID = "1.2.840.10008.1.1"
@@ -137,6 +141,8 @@ ITEM_TYPES = {
     0x53: "Asynchronous Operations Window",
     0x54: "SCP/SCU Role Selection",
     0x55: "Implementation Version Name",
+    0x56: "SOP Class Extended Negotiation",
+    0x57: "SOP Class Common Extended Negotiation",
     0x58: "User Identity",
     0x59: "User Identity Server Response",
 }
@@ -210,6 +216,12 @@ class DICOMElementField(Field[bytes, bytes]):
         if len(s) < 8:
             return s, b""
         tag_g, tag_e, length = struct.unpack("<HHI", s[:8])
+        # Ensure the buffer contains the full value as declared by the length
+        if len(s) < 8 + length:
+            raise Scapy_Exception(
+                "Not enough bytes to decode DICOM element value: "
+                f"expected {length} bytes, only {len(s) - 8} available"
+            )
         value = s[8:8 + length]
         return s[8 + length:], value
 
@@ -611,7 +623,14 @@ def parse_dimse_status(dimse_bytes: bytes) -> Optional[int]:
             value_len = struct.unpack(
                 "<I", dimse_bytes[offset + 4:offset + 8]
             )[0]
-            if tag_group == 0x0000 and tag_elem == 0x0900 and value_len == 2:
+            if (
+                tag_group == 0x0000
+                and tag_elem == 0x0900
+                and value_len == 2
+            ):
+                # Ensure there are at least 2 bytes available for the status
+                if offset + 10 > len(dimse_bytes) or offset + 10 > group_end_offset:
+                    break
                 return struct.unpack(
                     "<H", dimse_bytes[offset + 8:offset + 10]
                 )[0]
@@ -670,6 +689,8 @@ class DICOMVariableItem(Packet):
             0x53: DICOMAsyncOperationsWindow,
             0x54: DICOMSCPSCURoleSelection,
             0x55: DICOMImplementationVersionName,
+            0x56: DICOMSOPClassExtendedNegotiation,
+            0x57: DICOMSOPClassCommonExtendedNegotiation,
             0x58: DICOMUserIdentity,
             0x59: DICOMUserIdentityResponse,
         }
@@ -698,11 +719,7 @@ class DICOMApplicationContext(Packet):
         return b"", s
 
     def mysummary(self) -> str:
-        if isinstance(self.uid, bytes):
-            uid = self.uid.decode("ascii").rstrip("\x00")
-        else:
-            uid = self.uid
-        return "AppContext %s" % uid
+        return "AppContext %s" % self.uid.decode("ascii").rstrip("\x00")
 
 
 class DICOMAbstractSyntax(Packet):
@@ -724,11 +741,7 @@ class DICOMAbstractSyntax(Packet):
         return b"", s
 
     def mysummary(self) -> str:
-        if isinstance(self.uid, bytes):
-            uid = self.uid.decode("ascii").rstrip("\x00")
-        else:
-            uid = self.uid
-        return "AbstractSyntax %s" % uid
+        return "AbstractSyntax %s" % self.uid.decode("ascii").rstrip("\x00")
 
 
 class DICOMTransferSyntax(Packet):
@@ -750,11 +763,7 @@ class DICOMTransferSyntax(Packet):
         return b"", s
 
     def mysummary(self) -> str:
-        if isinstance(self.uid, bytes):
-            uid = self.uid.decode("ascii").rstrip("\x00")
-        else:
-            uid = self.uid
-        return "TransferSyntax %s" % uid
+        return "TransferSyntax %s" % self.uid.decode("ascii").rstrip("\x00")
 
 
 class DICOMPresentationContextRQ(Packet):
@@ -858,11 +867,7 @@ class DICOMImplementationClassUID(Packet):
         return b"", s
 
     def mysummary(self) -> str:
-        if isinstance(self.uid, bytes):
-            uid = self.uid.decode("ascii").rstrip("\x00")
-        else:
-            uid = self.uid
-        return "ImplClassUID %s" % uid
+        return "ImplClassUID %s" % self.uid.decode("ascii").rstrip("\x00")
 
 
 class DICOMImplementationVersionName(Packet):
@@ -884,11 +889,7 @@ class DICOMImplementationVersionName(Packet):
         return b"", s
 
     def mysummary(self) -> str:
-        if isinstance(self.name, bytes):
-            name = self.name.decode("ascii").rstrip("\x00")
-        else:
-            name = self.name
-        return "ImplVersion %s" % name
+        return "ImplVersion %s" % self.name.decode("ascii").rstrip("\x00")
 
 
 class DICOMAsyncOperationsWindow(Packet):
@@ -926,6 +927,57 @@ class DICOMSCPSCURoleSelection(Packet):
 
     def mysummary(self) -> str:
         return "RoleSelection SCU=%d SCP=%d" % (self.scu_role, self.scp_role)
+
+
+class DICOMSOPClassExtendedNegotiation(Packet):
+    """DICOM SOP Class Extended Negotiation sub-item (PS3.7 D.3.3.5)."""
+
+    name = "DICOM SOP Class Extended Negotiation"
+    fields_desc = [
+        FieldLenField("sop_class_uid_length", None,
+                      length_of="sop_class_uid", fmt="!H"),
+        StrLenField("sop_class_uid", b"",
+                    length_from=lambda pkt: pkt.sop_class_uid_length),
+        StrLenField("service_class_application_information", b"",
+                    length_from=lambda pkt: (
+                        pkt.underlayer.length - 2 - pkt.sop_class_uid_length
+                        if pkt.underlayer and pkt.underlayer.length
+                        else 0
+                    )),
+    ]
+
+    def extract_padding(self, s: bytes) -> Tuple[bytes, bytes]:
+        return b"", s
+
+    def mysummary(self) -> str:
+        return "SOPClassExtNeg %s" % self.sop_class_uid.decode("ascii").rstrip("\x00")
+
+
+class DICOMSOPClassCommonExtendedNegotiation(Packet):
+    """DICOM SOP Class Common Extended Negotiation sub-item (PS3.7 D.3.3.6)."""
+
+    name = "DICOM SOP Class Common Extended Negotiation"
+    fields_desc = [
+        FieldLenField("sop_class_uid_length", None,
+                      length_of="sop_class_uid", fmt="!H"),
+        StrLenField("sop_class_uid", b"",
+                    length_from=lambda pkt: pkt.sop_class_uid_length),
+        FieldLenField("service_class_uid_length", None,
+                      length_of="service_class_uid", fmt="!H"),
+        StrLenField("service_class_uid", b"",
+                    length_from=lambda pkt: pkt.service_class_uid_length),
+        FieldLenField("related_sop_class_uid_length", None,
+                      length_of="related_sop_class_uids", fmt="!H"),
+        StrLenField("related_sop_class_uids", b"",
+                    length_from=lambda pkt: pkt.related_sop_class_uid_length),
+    ]
+
+    def extract_padding(self, s: bytes) -> Tuple[bytes, bytes]:
+        return b"", s
+
+    def mysummary(self) -> str:
+        uid = self.sop_class_uid.decode("ascii").rstrip("\x00")
+        return "SOPClassCommonExtNeg %s" % uid
 
 
 USER_IDENTITY_TYPES = {
@@ -1020,6 +1072,8 @@ bind_layers(DICOMVariableItem, DICOMImplementationClassUID, item_type=0x52)
 bind_layers(DICOMVariableItem, DICOMAsyncOperationsWindow, item_type=0x53)
 bind_layers(DICOMVariableItem, DICOMSCPSCURoleSelection, item_type=0x54)
 bind_layers(DICOMVariableItem, DICOMImplementationVersionName, item_type=0x55)
+bind_layers(DICOMVariableItem, DICOMSOPClassExtendedNegotiation, item_type=0x56)
+bind_layers(DICOMVariableItem, DICOMSOPClassCommonExtendedNegotiation, item_type=0x57)
 bind_layers(DICOMVariableItem, DICOMUserIdentity, item_type=0x58)
 bind_layers(DICOMVariableItem, DICOMUserIdentityResponse, item_type=0x59)
 bind_layers(DICOMVariableItem, DICOMGenericItem)
@@ -1093,28 +1147,12 @@ class A_ASSOCIATE_RQ(Packet):
     ]
 
     def mysummary(self) -> str:
-        if isinstance(self.called_ae_title, bytes):
-            called = self.called_ae_title.strip()
-            called = called.decode("ascii", errors="replace")
-        else:
-            called = self.called_ae_title
-        if isinstance(self.calling_ae_title, bytes):
-            calling = self.calling_ae_title.strip()
-            calling = calling.decode("ascii", errors="replace")
-        else:
-            calling = self.calling_ae_title
+        called = self.called_ae_title.strip().decode("ascii", errors="replace")
+        calling = self.calling_ae_title.strip().decode("ascii", errors="replace")
         return "A-ASSOCIATE-RQ %s -> %s" % (calling, called)
 
     def hashret(self) -> bytes:
-        if isinstance(self.called_ae_title, bytes):
-            called = self.called_ae_title
-        else:
-            called = self.called_ae_title.encode()
-        if isinstance(self.calling_ae_title, bytes):
-            calling = self.calling_ae_title
-        else:
-            calling = self.calling_ae_title.encode()
-        return called + calling
+        return self.called_ae_title + self.calling_ae_title
 
 
 class A_ASSOCIATE_AC(Packet):
@@ -1140,28 +1178,12 @@ class A_ASSOCIATE_AC(Packet):
     ]
 
     def mysummary(self) -> str:
-        if isinstance(self.called_ae_title, bytes):
-            called = self.called_ae_title.strip()
-            called = called.decode("ascii", errors="replace")
-        else:
-            called = self.called_ae_title
-        if isinstance(self.calling_ae_title, bytes):
-            calling = self.calling_ae_title.strip()
-            calling = calling.decode("ascii", errors="replace")
-        else:
-            calling = self.calling_ae_title
+        called = self.called_ae_title.strip().decode("ascii", errors="replace")
+        calling = self.calling_ae_title.strip().decode("ascii", errors="replace")
         return "A-ASSOCIATE-AC %s <- %s" % (calling, called)
 
     def hashret(self) -> bytes:
-        if isinstance(self.called_ae_title, bytes):
-            called = self.called_ae_title
-        else:
-            called = self.called_ae_title.encode()
-        if isinstance(self.calling_ae_title, bytes):
-            calling = self.calling_ae_title
-        else:
-            calling = self.calling_ae_title.encode()
-        return called + calling
+        return self.called_ae_title + self.calling_ae_title
 
     def answers(self, other: Packet) -> bool:
         return isinstance(other, A_ASSOCIATE_RQ)
@@ -1264,6 +1286,8 @@ class A_ABORT(Packet):
 
 bind_layers(TCP, DICOM, dport=DICOM_PORT)
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
+bind_layers(TCP, DICOM, dport=DICOM_PORT_ALT)
+bind_layers(TCP, DICOM, sport=DICOM_PORT_ALT)
 bind_layers(DICOM, A_ASSOCIATE_RQ, pdu_type=0x01)
 bind_layers(DICOM, A_ASSOCIATE_AC, pdu_type=0x02)
 bind_layers(DICOM, A_ASSOCIATE_RJ, pdu_type=0x03)
@@ -1293,7 +1317,7 @@ def build_presentation_context_rq(context_id: int,
 
 def build_user_information(max_pdu_length: int = 16384,
                            implementation_class_uid: Optional[str] = None,
-                           implementation_version: Optional[str] = None
+                           implementation_version: Optional[Union[str, bytes]] = None
                            ) -> Packet:
     """Build a User Information item."""
     sub_items = [
@@ -1373,11 +1397,12 @@ class DICOMSocket:
             log.error("Error receiving PDU: %s", e)
             return None
 
-    def sr1(self, pkt: Packet) -> Optional[Packet]:
+    def sr1(self, *args, **kargs):
+        # type: (*Any, **Any) -> Optional[Packet]
+        """Send one packet and receive one answer."""
+        timeout = kargs.pop("timeout", self.read_timeout)
         try:
-            return self.stream.sr1(pkt, timeout=self.read_timeout)
-        except socket.timeout:
-            return None
+            return self.stream.sr1(*args, timeout=timeout, **kargs)
         except (socket.error, OSError) as e:
             log.error("Error in sr1: %s", e)
             return None
@@ -1483,9 +1508,7 @@ class DICOMSocket:
                 if not sub_item.haslayer(DICOMTransferSyntax):
                     continue
                 ts_uid = sub_item[DICOMTransferSyntax].uid
-                if isinstance(ts_uid, bytes):
-                    ts_uid = ts_uid.rstrip(b"\x00")
-                    ts_uid = ts_uid.decode("ascii")
+                ts_uid = ts_uid.rstrip(b"\x00").decode("ascii")
                 self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
                 break
 
@@ -1529,10 +1552,7 @@ class DICOMSocket:
             pdv_items = response[P_DATA_TF].pdv_items
             if pdv_items:
                 pdv_rsp = pdv_items[0]
-                data = pdv_rsp.data
-                if isinstance(data, str):
-                    data = data.encode("latin-1")
-                return parse_dimse_status(data)
+                return parse_dimse_status(pdv_rsp.data)
         return None
 
     def c_store(self, dataset_bytes: bytes, sop_class_uid: str,
@@ -1603,10 +1623,7 @@ class DICOMSocket:
             pdv_items = response[P_DATA_TF].pdv_items
             if pdv_items:
                 pdv_rsp = pdv_items[0]
-                data = pdv_rsp.data
-                if isinstance(data, str):
-                    data = data.encode("latin-1")
-                return parse_dimse_status(data)
+                return parse_dimse_status(pdv_rsp.data)
         return None
 
     def release(self) -> bool:
