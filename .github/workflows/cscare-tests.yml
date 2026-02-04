@@ -1,0 +1,350 @@
+name: C-Scare DICOM Security Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  test-attack-patterns:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        dicom_server:
+          - name: Orthanc
+            image: orthancteam/orthanc:24.3.2
+            aet: ORTHANC
+            port: 4242
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "scapy>=2.5.0" "pydicom>=2.4.0"
+          
+          # Install system tools for verification
+          for i in {1..3}; do 
+            sudo apt-get update && sudo apt-get install -y dcmtk netcat-openbsd tcpdump tshark && break || sleep 10
+          done
+
+      - name: Start DICOM SCP (${{ matrix.dicom_server.name }})
+        run: |
+          echo "Starting ${{ matrix.dicom_server.name }} container..."
+          docker run \
+            --detach \
+            --rm \
+            --name dicom-scp \
+            --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
+            -e "ORTHANC__REGISTERED_USERS={}" \
+            -e "ORTHANC__AUTHENTICATION_ENABLED=false" \
+            -e "ORTHANC__REMOTE_ACCESS_ALLOWED=true" \
+            -e "DICOM_AET=${{ matrix.dicom_server.aet }}" \
+            -e "DICOM_PORT=${{ matrix.dicom_server.port }}" \
+            ${{ matrix.dicom_server.image }} \
+            --verbose
+          
+          echo "Waiting for server to be ready..."
+          timeout 90 bash -c 'until nc -z -w 1 127.0.0.1 ${{ matrix.dicom_server.port }}; do echo -n "."; sleep 1; done'
+          echo " Ready!"
+          sleep 5
+
+      - name: Verify server baseline (pre-test)
+        run: |
+          echo "=== Pre-test server health check ==="
+          echoscu -v -aet BASELINE -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }}
+
+      - name: Start packet capture
+        id: pcap
+        run: |
+          sudo tcpdump port ${{ matrix.dicom_server.port }} -i any -s 0 -w cscare_capture.pcap &
+          echo "pcap_pid=$!" >> $GITHUB_OUTPUT
+          sleep 2
+
+      # ========================================
+      # Run C-Scare Attack Pattern Tests
+      # ========================================
+
+      - name: Test Parser Attacks (Dataset malformation)
+        id: test_parser
+        run: |
+          echo "=== Parser Attacks ==="
+          echo "Testing: invalid VR, length overflow/underflow, sequence bombs, duplicate tags, format strings, path traversal"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category parser
+        continue-on-error: true
+
+      - name: Test Protocol Attacks (PDU malformation)
+        id: test_protocol
+        run: |
+          echo "=== Protocol Attacks ==="
+          echo "Testing: bad protocol version, oversized PDU, invalid PDU type, truncated association, overlong AE, null AE"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category protocol \
+            --timeout 10
+        continue-on-error: true
+
+      - name: Health check (post-protocol)
+        run: |
+          if nc -z -w 5 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+            echo "✓ Server still responding"
+          else
+            echo "✗ SERVER MAY HAVE CRASHED"
+          fi
+
+      - name: Test Memory Attacks (Overflow/exhaustion)
+        id: test_memory
+        run: |
+          echo "=== Memory Attacks ==="
+          echo "Testing: pixel dimension overflow, fragment bomb, offset table bomb, oversized strings, OB/OW overflow, LUT overflow"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category memory
+        continue-on-error: true
+
+      - name: Test Logic Attacks (Semantic/SSRF)
+        id: test_logic
+        run: |
+          echo "=== Logic Attacks ==="
+          echo "Testing: transfer syntax mismatch, SOP class mismatch, private creator missing, SSRF URIs, file:// injection, UNC paths"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category logic
+        continue-on-error: true
+
+      - name: Test State Machine Attacks (Sta1-Sta13 violations)
+        id: test_state
+        run: |
+          echo "=== State Machine Attacks ==="
+          echo "Testing: P-DATA before association, release before association, double association, incomplete fragments"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category state_machine \
+            --timeout 10
+        continue-on-error: true
+
+      - name: Health check (post-state-machine)
+        run: |
+          if nc -z -w 5 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+            echo "✓ Server still responding"
+          else
+            echo "✗ SERVER MAY HAVE CRASHED"
+          fi
+
+      - name: Test CVE Attack Patterns
+        id: test_cve
+        run: |
+          echo "=== CVE Attack Patterns ==="
+          echo "Testing CVE reproductions:"
+          echo "  - CVE-2023-32135 (Use-After-Free DCM parsing)"
+          echo "  - CVE-2024-24793 (Use-After-Free Meta Info)"
+          echo "  - CVE-2024-24794 (Use-After-Free Sequences)"
+          echo "  - CVE-2019-11687 (PEDICOM/ELFDICOM polyglot)"
+          echo ""
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category cve
+        continue-on-error: true
+
+      - name: Test Fuzz Packet Variants (Scapy patterns)
+        id: test_fuzz_packets
+        run: |
+          echo "=== Fuzz Packet Tests ==="
+          echo "Testing: C_ECHO_RQ_Fuzz, C_STORE_RQ_Fuzz with explicit group_length, odd-length UIDs, Scapy fuzz()"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category fuzz_packet
+        continue-on-error: true
+
+      - name: Test Live Protocol Fuzzing (10 iterations)
+        id: test_live_fuzz
+        run: |
+          echo "=== Live Protocol Fuzzing ==="
+          echo "Running 10 fuzzed A-ASSOCIATE-RQ packets against server"
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --category live_fuzz \
+            --live-fuzz-count 10 \
+            --timeout 5
+        continue-on-error: true
+
+      # ========================================
+      # Run Complete Test Suite
+      # ========================================
+
+      - name: Run Complete Test Suite (All Categories)
+        id: test_all
+        run: |
+          echo "=== Complete Test Suite ==="
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --live-fuzz-count 5 \
+            --timeout 10
+        continue-on-error: true
+
+      # ========================================
+      # Generate Corpus for AFL/libFuzzer
+      # ========================================
+
+      - name: Generate Fuzzing Corpus
+        run: |
+          echo "=== Generating Fuzzing Corpus ==="
+          mkdir -p corpus
+          python -m c_scare.test_runner \
+            --ip 127.0.0.1 \
+            --port ${{ matrix.dicom_server.port }} \
+            --ae-title ${{ matrix.dicom_server.aet }} \
+            --generate-corpus corpus \
+            --category parser
+          
+          echo ""
+          echo "Corpus files generated:"
+          find corpus -name "*.dcm" | head -20
+          echo "Total: $(find corpus -name "*.dcm" | wc -l) files"
+
+      # ========================================
+      # Final Checks
+      # ========================================
+
+      - name: Final server health check
+        id: health_final
+        run: |
+          echo "=== Final Health Check ==="
+          CRASHED=false
+          
+          if ! nc -z -w 5 127.0.0.1 ${{ matrix.dicom_server.port }}; then
+            echo "✗ SERVER CRASHED - Port not responding!"
+            CRASHED=true
+          else
+            echo "✓ Server port still open"
+            if echoscu -aet FINAL -aec ${{ matrix.dicom_server.aet }} 127.0.0.1 ${{ matrix.dicom_server.port }} 2>/dev/null; then
+              echo "✓ Server responding to C-ECHO"
+            else
+              echo "⚠ Server port open but C-ECHO failed"
+            fi
+          fi
+          
+          if [ "$CRASHED" = "true" ]; then
+            echo ""
+            echo "=========================================="
+            echo "  ⚠️  POTENTIAL VULNERABILITY FOUND  ⚠️"
+            echo "  Server crashed during testing!"
+            echo "=========================================="
+          fi
+
+      - name: Stop packet capture
+        if: always()
+        run: |
+          if [ -n "${{ steps.pcap.outputs.pcap_pid }}" ]; then
+            sudo kill ${{ steps.pcap.outputs.pcap_pid }} 2>/dev/null || true
+          fi
+          sleep 2
+
+      - name: PCAP Summary
+        if: always()
+        run: |
+          if [ -f cscare_capture.pcap ]; then
+            echo "Packets captured: $(tshark -r cscare_capture.pcap 2>/dev/null | wc -l)"
+            echo ""
+            echo "DICOM traffic:"
+            tshark -r cscare_capture.pcap -Y "tcp.port == ${{ matrix.dicom_server.port }}" -c 30 2>/dev/null || true
+          fi
+        continue-on-error: true
+
+      - name: Show server logs
+        if: always()
+        run: |
+          echo "=== Server Logs (last 100 lines) ==="
+          docker logs dicom-scp 2>&1 | tail -100 || true
+          
+          echo ""
+          echo "=== Errors/Warnings ==="
+          docker logs dicom-scp 2>&1 | grep -iE "(error|warning|crash|abort|segfault|invalid|reject)" | tail -30 || echo "None found"
+        continue-on-error: true
+
+      - name: Stop container
+        if: always()
+        run: docker stop dicom-scp || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cscare-results-${{ matrix.dicom_server.name }}
+          path: |
+            cscare_capture.pcap
+            corpus/
+          if-no-files-found: ignore
+
+      # ========================================
+      # Test Report
+      # ========================================
+
+      - name: Generate Test Report
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "       C-SCARE TEST REPORT"
+          echo "=========================================="
+          echo ""
+          echo "Target: ${{ matrix.dicom_server.name }}"
+          echo "Image:  ${{ matrix.dicom_server.image }}"
+          echo "AE:     ${{ matrix.dicom_server.aet }}"
+          echo "Port:   ${{ matrix.dicom_server.port }}"
+          echo ""
+          echo "Test Results:"
+          echo "  Parser Attacks:        ${{ steps.test_parser.outcome }}"
+          echo "  Protocol Attacks:      ${{ steps.test_protocol.outcome }}"
+          echo "  Memory Attacks:        ${{ steps.test_memory.outcome }}"
+          echo "  Logic Attacks:         ${{ steps.test_logic.outcome }}"
+          echo "  State Machine Attacks: ${{ steps.test_state.outcome }}"
+          echo "  CVE Attacks:           ${{ steps.test_cve.outcome }}"
+          echo "  Fuzz Packets:          ${{ steps.test_fuzz_packets.outcome }}"
+          echo "  Live Fuzzing:          ${{ steps.test_live_fuzz.outcome }}"
+          echo "  Complete Suite:        ${{ steps.test_all.outcome }}"
+          echo ""
+          echo "Final Server Status:     ${{ steps.health_final.outcome }}"
+          echo ""
+          echo "CVE Coverage:"
+          echo "  - CVE-2023-32135 (Use-After-Free DCM)"
+          echo "  - CVE-2024-24793 (Use-After-Free Meta Info)"
+          echo "  - CVE-2024-24794 (Use-After-Free Sequences)"
+          echo "  - CVE-2024-33606 (SSRF via URI)"
+          echo "  - CVE-2019-11687 (PEDICOM/ELFDICOM)"
+          echo "  - CVE-2024-22100 (Heap Overflow)"
+          echo "  - CVE-2024-25578 (OOB Write)"
+          echo "  - CVE-2024-28877 (Stack Overflow)"
+          echo ""
+          echo "=========================================="

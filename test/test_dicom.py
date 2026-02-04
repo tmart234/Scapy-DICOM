@@ -24,7 +24,7 @@ logging.getLogger("scapy.contrib.dicom").setLevel(logging.INFO)
 
 from scapy.volatile import RandShort, RandInt, RandString
 
-from dicom import (
+from scapy_dicom import (
     # PDU classes
     DICOM,
     A_ASSOCIATE_RQ,
@@ -913,7 +913,7 @@ class TestConstants:
 
     def test_port_constant(self):
         """DICOM_PORT should be 104."""
-        from dicom import DICOM_PORT
+        from scapy_dicom import DICOM_PORT
         assert DICOM_PORT == 104
 
     def test_uid_constants(self):
