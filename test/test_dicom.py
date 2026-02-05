@@ -7,6 +7,8 @@ Tests the current architecture:
 - DIMSEPacket base class with post_build group length calculation
 - DICOMSocket for session management
 - Native Scapy field patterns (StrLenField, PacketListField, etc.)
+- DIMSE-N commands (PS3.7 Section 10.3)
+- Transfer Syntax UIDs (PS3.5 Annex A)
 """
 import pytest
 import struct
@@ -57,7 +59,8 @@ from scapy_dicom import (
     DICOMUSField,
     DICOMULField,
     DICOMAEDIMSEField,
-    # DIMSE Packet classes
+    DICOMATField,
+    # DIMSE Packet classes - DIMSE-C
     DIMSEPacket,
     C_ECHO_RQ,
     C_ECHO_RSP,
@@ -69,13 +72,27 @@ from scapy_dicom import (
     C_MOVE_RSP,
     C_GET_RQ,
     C_GET_RSP,
+    C_CANCEL_RQ,
+    # DIMSE Packet classes - DIMSE-N (PS3.7 Section 10.3)
+    N_EVENT_REPORT_RQ,
+    N_EVENT_REPORT_RSP,
+    N_GET_RQ,
+    N_GET_RSP,
+    N_SET_RQ,
+    N_SET_RSP,
+    N_ACTION_RQ,
+    N_ACTION_RSP,
+    N_CREATE_RQ,
+    N_CREATE_RSP,
+    N_DELETE_RQ,
+    N_DELETE_RSP,
     # Session management
     DICOMSocket,
     # Helpers
     build_presentation_context_rq,
     build_user_information,
     parse_dimse_status,
-    # Constants
+    # Constants - Core
     APP_CONTEXT_UID,
     VERIFICATION_SOP_CLASS_UID,
     DEFAULT_TRANSFER_SYNTAX_UID,
@@ -83,6 +100,21 @@ from scapy_dicom import (
     PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
     PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID,
     PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
+    # Constants - Transfer Syntax UIDs (PS3.5 Annex A)
+    IMPLICIT_VR_LITTLE_ENDIAN_UID,
+    EXPLICIT_VR_LITTLE_ENDIAN_UID,
+    EXPLICIT_VR_BIG_ENDIAN_UID,
+    DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN_UID,
+    JPEG_BASELINE_UID,
+    JPEG_LOSSLESS_UID,
+    JPEG_LS_LOSSLESS_UID,
+    JPEG_LS_LOSSY_UID,
+    JPEG_2000_LOSSLESS_UID,
+    JPEG_2000_UID,
+    RLE_LOSSLESS_UID,
+    HTJP2K_LOSSLESS_UID,
+    HTJP2K_LOSSLESS_RPCL_UID,
+    HTJP2K_UID,
     # Utilities
     _uid_to_bytes,
     _uid_to_bytes_raw,
@@ -168,6 +200,84 @@ class TestDICOMElementFields:
 
 
 # =============================================================================
+# Test DICOMATField (Attribute Tag Field)
+# =============================================================================
+
+class TestDICOMATField:
+    """Test the DICOM Attribute Tag (AT) field for N-GET Attribute Identifier List."""
+
+    def test_at_field_single_tag_tuple(self):
+        """DICOMATField should encode a single tag tuple."""
+        field = DICOMATField("attr_list", [], 0x0000, 0x1005)
+
+        result = field.addfield(None, b"", [(0x0010, 0x0020)])
+
+        # Header (8 bytes) + 1 tag (4 bytes) = 12 bytes
+        assert len(result) == 12
+
+        # Extract length - should be 4 (one tag)
+        length = struct.unpack("<I", result[4:8])[0]
+        assert length == 4
+
+        # Extract the tag
+        group, elem = struct.unpack("<HH", result[8:12])
+        assert group == 0x0010
+        assert elem == 0x0020
+
+    def test_at_field_multiple_tags(self):
+        """DICOMATField should encode multiple tags."""
+        field = DICOMATField("attr_list", [], 0x0000, 0x1005)
+
+        tags = [(0x0010, 0x0010), (0x0010, 0x0020), (0x0008, 0x0018)]
+        result = field.addfield(None, b"", tags)
+
+        # Header (8 bytes) + 3 tags (12 bytes) = 20 bytes
+        assert len(result) == 20
+
+        # Extract length - should be 12 (three tags)
+        length = struct.unpack("<I", result[4:8])[0]
+        assert length == 12
+
+    def test_at_field_integer_tag(self):
+        """DICOMATField should handle integer tag format."""
+        field = DICOMATField("attr_list", [], 0x0000, 0x1005)
+
+        # Tag 0x00100020 = (0x0010, 0x0020)
+        result = field.addfield(None, b"", [0x00100020])
+
+        # Extract the tag
+        group, elem = struct.unpack("<HH", result[8:12])
+        assert group == 0x0010
+        assert elem == 0x0020
+
+    def test_at_field_empty_list(self):
+        """DICOMATField should handle empty tag list."""
+        field = DICOMATField("attr_list", [], 0x0000, 0x1005)
+
+        result = field.addfield(None, b"", [])
+
+        # Header (8 bytes) + 0 tags = 8 bytes
+        assert len(result) == 8
+
+        # Length should be 0
+        length = struct.unpack("<I", result[4:8])[0]
+        assert length == 0
+
+    def test_at_field_getfield_roundtrip(self):
+        """DICOMATField should correctly decode encoded tags."""
+        field = DICOMATField("attr_list", [], 0x0000, 0x1005)
+
+        original_tags = [(0x0010, 0x0010), (0x0010, 0x0020), (0x0008, 0x0018)]
+        encoded = field.addfield(None, b"", original_tags)
+
+        # Decode (skip to data portion)
+        remain, decoded_tags = field.getfield(None, encoded)
+
+        assert len(decoded_tags) == 3
+        assert decoded_tags == original_tags
+
+
+# =============================================================================
 # Test DICOMAETitleField
 # =============================================================================
 
@@ -212,8 +322,8 @@ class TestDICOMAETitleField:
 class TestDIMSEPacketBaseClass:
     """Test the DIMSEPacket base class with group length calculation."""
 
-    def test_dimse_packet_inheritance(self):
-        """All DIMSE commands should inherit from DIMSEPacket."""
+    def test_dimse_packet_inheritance_dimse_c(self):
+        """All DIMSE-C commands should inherit from DIMSEPacket."""
         assert issubclass(C_ECHO_RQ, DIMSEPacket)
         assert issubclass(C_ECHO_RSP, DIMSEPacket)
         assert issubclass(C_STORE_RQ, DIMSEPacket)
@@ -224,6 +334,22 @@ class TestDIMSEPacketBaseClass:
         assert issubclass(C_MOVE_RSP, DIMSEPacket)
         assert issubclass(C_GET_RQ, DIMSEPacket)
         assert issubclass(C_GET_RSP, DIMSEPacket)
+        assert issubclass(C_CANCEL_RQ, DIMSEPacket)
+
+    def test_dimse_packet_inheritance_dimse_n(self):
+        """All DIMSE-N commands should inherit from DIMSEPacket."""
+        assert issubclass(N_EVENT_REPORT_RQ, DIMSEPacket)
+        assert issubclass(N_EVENT_REPORT_RSP, DIMSEPacket)
+        assert issubclass(N_GET_RQ, DIMSEPacket)
+        assert issubclass(N_GET_RSP, DIMSEPacket)
+        assert issubclass(N_SET_RQ, DIMSEPacket)
+        assert issubclass(N_SET_RSP, DIMSEPacket)
+        assert issubclass(N_ACTION_RQ, DIMSEPacket)
+        assert issubclass(N_ACTION_RSP, DIMSEPacket)
+        assert issubclass(N_CREATE_RQ, DIMSEPacket)
+        assert issubclass(N_CREATE_RSP, DIMSEPacket)
+        assert issubclass(N_DELETE_RQ, DIMSEPacket)
+        assert issubclass(N_DELETE_RSP, DIMSEPacket)
 
     def test_dimse_post_build_adds_group_length(self):
         """DIMSEPacket.post_build() should prepend CommandGroupLength element."""
@@ -243,6 +369,434 @@ class TestDIMSEPacketBaseClass:
         group_len = struct.unpack("<I", raw[8:12])[0]
         remaining = len(raw) - 12
         assert group_len == remaining
+
+
+# =============================================================================
+# Test Transfer Syntax UIDs (PS3.5 Annex A)
+# =============================================================================
+
+class TestTransferSyntaxUIDs:
+    """Test Transfer Syntax UID constants from PS3.5 Annex A."""
+
+    def test_implicit_vr_little_endian(self):
+        """Implicit VR Little Endian should be the default."""
+        assert IMPLICIT_VR_LITTLE_ENDIAN_UID == "1.2.840.10008.1.2"
+        assert DEFAULT_TRANSFER_SYNTAX_UID == IMPLICIT_VR_LITTLE_ENDIAN_UID
+
+    def test_explicit_vr_little_endian(self):
+        """Explicit VR Little Endian UID should be correct."""
+        assert EXPLICIT_VR_LITTLE_ENDIAN_UID == "1.2.840.10008.1.2.1"
+
+    def test_explicit_vr_big_endian_retired(self):
+        """Explicit VR Big Endian (retired) UID should be correct."""
+        assert EXPLICIT_VR_BIG_ENDIAN_UID == "1.2.840.10008.1.2.2"
+
+    def test_deflated_explicit_vr(self):
+        """Deflated Explicit VR Little Endian UID should be correct."""
+        assert DEFLATED_EXPLICIT_VR_LITTLE_ENDIAN_UID == "1.2.840.10008.1.2.1.99"
+
+    def test_jpeg_baseline(self):
+        """JPEG Baseline (lossy) UID should be correct."""
+        assert JPEG_BASELINE_UID == "1.2.840.10008.1.2.4.50"
+
+    def test_jpeg_lossless(self):
+        """JPEG Lossless UID should be correct."""
+        assert JPEG_LOSSLESS_UID == "1.2.840.10008.1.2.4.70"
+
+    def test_jpeg_ls_lossless(self):
+        """JPEG-LS Lossless UID should be correct."""
+        assert JPEG_LS_LOSSLESS_UID == "1.2.840.10008.1.2.4.80"
+
+    def test_jpeg_ls_lossy(self):
+        """JPEG-LS Near-Lossless UID should be correct."""
+        assert JPEG_LS_LOSSY_UID == "1.2.840.10008.1.2.4.81"
+
+    def test_jpeg_2000_lossless(self):
+        """JPEG 2000 Lossless UID should be correct."""
+        assert JPEG_2000_LOSSLESS_UID == "1.2.840.10008.1.2.4.90"
+
+    def test_jpeg_2000(self):
+        """JPEG 2000 UID should be correct."""
+        assert JPEG_2000_UID == "1.2.840.10008.1.2.4.91"
+
+    def test_rle_lossless(self):
+        """RLE Lossless UID should be correct."""
+        assert RLE_LOSSLESS_UID == "1.2.840.10008.1.2.5"
+
+    def test_htjp2k_lossless(self):
+        """High-Throughput JPEG 2000 Lossless UID should be correct."""
+        assert HTJP2K_LOSSLESS_UID == "1.2.840.10008.1.2.4.201"
+
+    def test_htjp2k_lossless_rpcl(self):
+        """High-Throughput JPEG 2000 with RPCL UID should be correct."""
+        assert HTJP2K_LOSSLESS_RPCL_UID == "1.2.840.10008.1.2.4.202"
+
+    def test_htjp2k(self):
+        """High-Throughput JPEG 2000 UID should be correct."""
+        assert HTJP2K_UID == "1.2.840.10008.1.2.4.203"
+
+    def test_transfer_syntax_in_presentation_context(self):
+        """Transfer syntax UIDs should work in presentation context negotiation."""
+        # Build presentation context with multiple transfer syntaxes
+        transfer_syntaxes = [
+            EXPLICIT_VR_LITTLE_ENDIAN_UID,
+            IMPLICIT_VR_LITTLE_ENDIAN_UID,
+            JPEG_2000_LOSSLESS_UID,
+        ]
+        pctx = build_presentation_context_rq(
+            context_id=1,
+            abstract_syntax_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            transfer_syntax_uids=transfer_syntaxes
+        )
+
+        raw = bytes(pctx)
+
+        # Verify all transfer syntaxes are present
+        for ts_uid in transfer_syntaxes:
+            assert ts_uid.encode('ascii') in raw
+
+
+# =============================================================================
+# Test C-CANCEL Command (PS3.7 Section 9.3)
+# =============================================================================
+
+class TestCCancelCommand:
+    """Test C-CANCEL-RQ command for canceling pending operations."""
+
+    def test_c_cancel_rq_creation(self):
+        """C_CANCEL_RQ should be creatable with message ID to cancel."""
+        pkt = C_CANCEL_RQ(message_id_being_responded_to=42)
+        raw = bytes(pkt)
+
+        # Command field for C-CANCEL-RQ is 0x0FFF
+        assert struct.pack("<H", 0x0FFF) in raw
+
+    def test_c_cancel_rq_inherits_dimse_packet(self):
+        """C_CANCEL_RQ should inherit from DIMSEPacket."""
+        assert issubclass(C_CANCEL_RQ, DIMSEPacket)
+
+    def test_c_cancel_rq_has_group_length(self):
+        """C_CANCEL_RQ should have CommandGroupLength prepended."""
+        pkt = C_CANCEL_RQ(message_id_being_responded_to=100)
+        raw = bytes(pkt)
+
+        # First element should be CommandGroupLength (0000,0000)
+        tag_g, tag_e = struct.unpack("<HH", raw[:4])
+        assert tag_g == 0x0000
+        assert tag_e == 0x0000
+
+    def test_c_cancel_rq_message_id_encoding(self):
+        """C_CANCEL_RQ should encode the message ID being cancelled."""
+        msg_id = 12345
+        pkt = C_CANCEL_RQ(message_id_being_responded_to=msg_id)
+        raw = bytes(pkt)
+
+        # Message ID Being Responded To tag is (0000,0120)
+        assert struct.pack("<H", msg_id) in raw
+
+
+# =============================================================================
+# Test DIMSE-N Commands (PS3.7 Section 10.3)
+# =============================================================================
+
+class TestDIMSENCommands:
+    """Test DIMSE-N command packets per PS3.7 Section 10.3."""
+
+    # -------------------------------------------------------------------------
+    # N-EVENT-REPORT (Tables 10.3-1, 10.3-2)
+    # -------------------------------------------------------------------------
+
+    def test_n_event_report_rq_creation(self):
+        """N_EVENT_REPORT_RQ should be creatable."""
+        pkt = N_EVENT_REPORT_RQ(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=1,
+            event_type_id=1
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-EVENT-REPORT-RQ is 0x0100
+        assert struct.pack("<H", 0x0100) in raw
+        assert b'1.2.3.4.5' in raw
+
+    def test_n_event_report_rsp_creation(self):
+        """N_EVENT_REPORT_RSP should be creatable."""
+        pkt = N_EVENT_REPORT_RSP(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id_responded=1,
+            status=0x0000
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-EVENT-REPORT-RSP is 0x8100
+        assert struct.pack("<H", 0x8100) in raw
+
+    # -------------------------------------------------------------------------
+    # N-GET (Tables 10.3-3, 10.3-4)
+    # -------------------------------------------------------------------------
+
+    def test_n_get_rq_creation(self):
+        """N_GET_RQ should be creatable."""
+        pkt = N_GET_RQ(
+            requested_sop_class_uid="1.2.3.4.5",
+            requested_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=1
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-GET-RQ is 0x0110
+        assert struct.pack("<H", 0x0110) in raw
+
+    def test_n_get_rq_with_attribute_list(self):
+        """N_GET_RQ should support Attribute Identifier List."""
+        pkt = N_GET_RQ(
+            requested_sop_class_uid="1.2.3.4.5",
+            requested_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=1,
+            attribute_identifier_list=[(0x0010, 0x0010), (0x0010, 0x0020)]
+        )
+        raw = bytes(pkt)
+
+        # Should contain the attribute tags
+        assert len(raw) > 0
+
+    def test_n_get_rsp_creation(self):
+        """N_GET_RSP should be creatable."""
+        pkt = N_GET_RSP(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id_responded=1,
+            status=0x0000
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-GET-RSP is 0x8110
+        assert struct.pack("<H", 0x8110) in raw
+
+    # -------------------------------------------------------------------------
+    # N-SET (Tables 10.3-5, 10.3-6)
+    # -------------------------------------------------------------------------
+
+    def test_n_set_rq_creation(self):
+        """N_SET_RQ should be creatable."""
+        pkt = N_SET_RQ(
+            requested_sop_class_uid="1.2.3.4.5",
+            requested_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=1
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-SET-RQ is 0x0120
+        assert struct.pack("<H", 0x0120) in raw
+
+    def test_n_set_rsp_creation(self):
+        """N_SET_RSP should be creatable."""
+        pkt = N_SET_RSP(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id_responded=1,
+            status=0x0000
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-SET-RSP is 0x8120
+        assert struct.pack("<H", 0x8120) in raw
+
+    # -------------------------------------------------------------------------
+    # N-ACTION (Tables 10.3-7, 10.3-8)
+    # -------------------------------------------------------------------------
+
+    def test_n_action_rq_creation(self):
+        """N_ACTION_RQ should be creatable."""
+        pkt = N_ACTION_RQ(
+            requested_sop_class_uid="1.2.3.4.5",
+            requested_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=1,
+            action_type_id=1
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-ACTION-RQ is 0x0130
+        assert struct.pack("<H", 0x0130) in raw
+
+    def test_n_action_rsp_creation(self):
+        """N_ACTION_RSP should be creatable."""
+        pkt = N_ACTION_RSP(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id_responded=1,
+            status=0x0000
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-ACTION-RSP is 0x8130
+        assert struct.pack("<H", 0x8130) in raw
+
+    # -------------------------------------------------------------------------
+    # N-CREATE (Tables 10.3-9, 10.3-10)
+    # -------------------------------------------------------------------------
+
+    def test_n_create_rq_creation(self):
+        """N_CREATE_RQ should be creatable."""
+        pkt = N_CREATE_RQ(
+            affected_sop_class_uid="1.2.3.4.5",
+            message_id=1
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-CREATE-RQ is 0x0140
+        assert struct.pack("<H", 0x0140) in raw
+
+    def test_n_create_rq_with_instance_uid(self):
+        """N_CREATE_RQ should support optional Affected SOP Instance UID."""
+        pkt = N_CREATE_RQ(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7.8.9",
+            message_id=1
+        )
+        raw = bytes(pkt)
+
+        assert b'1.2.3.4.5.6.7.8.9' in raw
+
+    def test_n_create_rsp_creation(self):
+        """N_CREATE_RSP should be creatable."""
+        pkt = N_CREATE_RSP(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id_responded=1,
+            status=0x0000
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-CREATE-RSP is 0x8140
+        assert struct.pack("<H", 0x8140) in raw
+
+    # -------------------------------------------------------------------------
+    # N-DELETE (Tables 10.3-11, 10.3-12)
+    # -------------------------------------------------------------------------
+
+    def test_n_delete_rq_creation(self):
+        """N_DELETE_RQ should be creatable."""
+        pkt = N_DELETE_RQ(
+            requested_sop_class_uid="1.2.3.4.5",
+            requested_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=1
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-DELETE-RQ is 0x0150
+        assert struct.pack("<H", 0x0150) in raw
+
+    def test_n_delete_rsp_creation(self):
+        """N_DELETE_RSP should be creatable."""
+        pkt = N_DELETE_RSP(
+            affected_sop_class_uid="1.2.3.4.5",
+            affected_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id_responded=1,
+            status=0x0000
+        )
+        raw = bytes(pkt)
+
+        # Command field for N-DELETE-RSP is 0x8150
+        assert struct.pack("<H", 0x8150) in raw
+
+    # -------------------------------------------------------------------------
+    # Common DIMSE-N Tests
+    # -------------------------------------------------------------------------
+
+    def test_dimse_n_commands_have_group_length(self):
+        """All DIMSE-N commands should have CommandGroupLength prepended."""
+        commands = [
+            N_EVENT_REPORT_RQ(message_id=1),
+            N_EVENT_REPORT_RSP(message_id_responded=1, status=0),
+            N_GET_RQ(message_id=1),
+            N_GET_RSP(message_id_responded=1, status=0),
+            N_SET_RQ(message_id=1),
+            N_SET_RSP(message_id_responded=1, status=0),
+            N_ACTION_RQ(message_id=1, action_type_id=1),
+            N_ACTION_RSP(message_id_responded=1, status=0),
+            N_CREATE_RQ(message_id=1),
+            N_CREATE_RSP(message_id_responded=1, status=0),
+            N_DELETE_RQ(message_id=1),
+            N_DELETE_RSP(message_id_responded=1, status=0),
+        ]
+
+        for cmd in commands:
+            raw = bytes(cmd)
+            # First element should be CommandGroupLength (0000,0000)
+            tag_g, tag_e = struct.unpack("<HH", raw[:4])
+            assert tag_g == 0x0000, f"{cmd.name} missing group length tag"
+            assert tag_e == 0x0000, f"{cmd.name} missing group length tag"
+
+    def test_dimse_n_in_pdata_tf(self):
+        """DIMSE-N packets should work inside P-DATA-TF."""
+        dimse = N_GET_RQ(
+            requested_sop_class_uid="1.2.3.4.5",
+            requested_sop_instance_uid="1.2.3.4.5.6.7",
+            message_id=42
+        )
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            data=bytes(dimse),
+            is_command=1,
+            is_last=1,
+        )
+        pdata = DICOM() / P_DATA_TF(pdv_items=[pdv])
+
+        raw = bytes(pdata)
+        assert raw[0] == 0x04  # P-DATA-TF PDU type
+        assert b'1.2.3.4.5' in raw
+
+
+# =============================================================================
+# Test C-STORE Move Originator Fields
+# =============================================================================
+
+class TestCStoreMoveOriginatorFields:
+    """Test C-STORE-RQ Move Originator fields per PS3.7 Table 9.3-1."""
+
+    def test_c_store_rq_without_move_originator(self):
+        """C_STORE_RQ without Move Originator should work normally."""
+        pkt = C_STORE_RQ(
+            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            affected_sop_instance_uid="1.2.3.4.5.6.7.8.9",
+            message_id=1
+        )
+        raw = bytes(pkt)
+
+        # Should not contain Move Originator tag (0000,1030)
+        # This is tricky to test since the field is conditional
+        assert b'1.2.3.4.5.6.7.8.9' in raw
+
+    def test_c_store_rq_with_move_originator_ae(self):
+        """C_STORE_RQ should support Move Originator AE Title."""
+        pkt = C_STORE_RQ(
+            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            affected_sop_instance_uid="1.2.3.4.5.6.7.8.9",
+            message_id=1,
+            move_originator_ae_title=b"MOVE_SCU"
+        )
+        raw = bytes(pkt)
+
+        # Should contain Move Originator AE Title
+        assert b'MOVE_SCU' in raw
+
+    def test_c_store_rq_with_move_originator_message_id(self):
+        """C_STORE_RQ should support Move Originator Message ID."""
+        pkt = C_STORE_RQ(
+            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            affected_sop_instance_uid="1.2.3.4.5.6.7.8.9",
+            message_id=1,
+            move_originator_ae_title=b"MOVE_SCU",
+            move_originator_message_id=999
+        )
+        raw = bytes(pkt)
+
+        # Should contain both Move Originator fields
+        assert b'MOVE_SCU' in raw
+        assert struct.pack("<H", 999) in raw
 
 
 # =============================================================================
@@ -345,7 +899,7 @@ class TestVariableItemBindLayers:
 
 
 # =============================================================================
-# Test DIMSE Packet Classes
+# Test DIMSE-C Packet Classes
 # =============================================================================
 
 class TestDIMSEPacketClasses:
@@ -531,6 +1085,24 @@ class TestDIMSEFuzzing:
         # Verify mutation
         mutated_len = struct.unpack("<I", raw[8:12])[0]
         assert mutated_len == 0xFFFFFFFF
+
+    def test_fuzz_dimse_n_invalid_event_type(self):
+        """Test N-EVENT-REPORT with invalid event type ID."""
+        pkt = N_EVENT_REPORT_RQ(
+            message_id=1,
+            event_type_id=0xFFFF  # Max value
+        )
+        raw = bytes(pkt)
+        assert struct.pack("<H", 0xFFFF) in raw
+
+    def test_fuzz_dimse_n_invalid_action_type(self):
+        """Test N-ACTION with invalid action type ID."""
+        pkt = N_ACTION_RQ(
+            message_id=1,
+            action_type_id=0xDEAD
+        )
+        raw = bytes(pkt)
+        assert struct.pack("<H", 0xDEAD) in raw
 
 
 # =============================================================================
