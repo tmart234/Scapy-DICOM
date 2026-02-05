@@ -80,7 +80,7 @@ __author__ = 'Tyler M'
 # Core Building Blocks (Dataset Layer)
 # =============================================================================
 
-from .element import (
+from element import (
     Element,
     Dataset,
     Sequence,
@@ -95,7 +95,7 @@ from .element import (
 # Pydicom Integration (THE KEY VALUE-ADD)
 # =============================================================================
 
-from .corruptor import (
+from corruptor import (
     Corruptor,
     Override,
     Injection,
@@ -110,7 +110,7 @@ from .corruptor import (
 # Encapsulated Pixel Data
 # =============================================================================
 
-from .pixel import (
+from pixel import (
     EncapsulatedPixelData,
     PixelData,
     Fragment,
@@ -123,7 +123,7 @@ from .pixel import (
 # File Handling (Part 10)
 # =============================================================================
 
-from .file import (
+from file import (
     DicomFile,
     FileMetaInformation,
     TransferSyntax,
@@ -136,7 +136,7 @@ from .file import (
 
 # Scapy may not be available or may fail in sandboxed environments
 try:
-    from .scapy_dicom import (
+    from scapy_dicom import (
         # PDU packets
         DICOM,
         A_ASSOCIATE_RQ,
@@ -229,7 +229,7 @@ except Exception as e:
 # Rogue Server (for fuzzing clients)
 # =============================================================================
 
-from .server import (
+from server import (
     RawSCP,
     Connection,
     ConnectionState,
@@ -239,7 +239,7 @@ from .server import (
 # Attack Patterns (High-level API)
 # =============================================================================
 
-from .attacks import (
+from attacks import (
     AttackResult,
     ParserAttacks,
     ProtocolAttacks,
@@ -256,7 +256,7 @@ from .attacks import (
 # Scapy Layer Installation Helper
 # =============================================================================
 
-from .scapy_layer import (
+from scapy_layer import (
     install_scapy_layer,
     load_scapy_layer,
     get_scapy_layer_path,
