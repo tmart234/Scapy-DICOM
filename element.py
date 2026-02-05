@@ -37,7 +37,7 @@ class Tag:
             self.element = element
         elif isinstance(group_or_combined, tuple):
             self.group, self.element = group_or_combined
-        elif isinstance(group_or_combined, int):
+        elif isinstance(group_or_combined, int): # Safe (defined before property)
             self.group = (group_or_combined >> 16) & 0xFFFF
             self.element = group_or_combined & 0xFFFF
         elif isinstance(group_or_combined, bytes):
@@ -47,11 +47,11 @@ class Tag:
             raise ValueError(f"Invalid tag: {group_or_combined}")
     
     @property
-    def int(self) -> int:
+    def as_int(self) -> int:  # <--- RENAMED from 'int'
         return (self.group << 16) | self.element
     
     @property
-    def tuple(self) -> Tuple[int, int]:
+    def tuple(self) -> Tuple[int, int]: # Now 'int' correctly refers to the type
         return (self.group, self.element)
     
     def encode(self, little_endian: bool = True) -> bytes:
@@ -60,15 +60,15 @@ class Tag:
     
     def __eq__(self, other):
         if isinstance(other, Tag):
-            return self.int == other.int
+            return self.as_int == other.as_int  # <--- Updated
         elif isinstance(other, tuple):
             return self.tuple == other
-        elif isinstance(other, int):
-            return self.int == other
+        elif isinstance(other, int): # Now works correctly!
+            return self.as_int == other         # <--- Updated
         return False
     
     def __hash__(self):
-        return hash(self.int)
+        return hash(self.as_int)  # <--- Updated
     
     def __repr__(self):
         return f'({self.group:04X},{self.element:04X})'
@@ -81,7 +81,6 @@ class Tag:
             return keyword_for_tag(self.tuple) or ''
         except ImportError:
             return ''
-
 
 # =============================================================================
 # VR Definitions
@@ -371,7 +370,7 @@ class Dataset:
                 self._add(e)
     
     def _add(self, elem: Element) -> None:
-        tag_int = elem.tag.int
+        tag_int = elem.tag.as_int
         self._elements[tag_int] = elem
         if tag_int not in self._order:
             self._order.append(tag_int)
@@ -404,23 +403,23 @@ class Dataset:
             raise KeyError(f"Unknown keyword: {key}")
         
         tag = Tag(key)
-        return self._elements.get(tag.int)
+        return self._elements.get(tag.as_int)
     
     def __setitem__(self, key, elem: Element) -> None:
         tag = Tag(key)
-        self._elements[tag.int] = elem
-        if tag.int not in self._order:
-            self._order.append(tag.int)
+        self._elements[tag.as_int] = elem
+        if tag.as_int not in self._order:
+            self._order.append(tag.as_int) # <--- FIXED
     
     def __delitem__(self, key) -> None:
         tag = Tag(key)
-        if tag.int in self._elements:
-            del self._elements[tag.int]
-            self._order.remove(tag.int)
+        if tag.as_int in self._elements:  
+            del self._elements[tag.as_int]
+            self._order.remove(tag.as_int)
     
     def __contains__(self, key) -> bool:
         tag = Tag(key)
-        return tag.int in self._elements
+        return tag.as_int in self._elements # <--- FIXED
     
     def __iter__(self) -> Iterator[Element]:
         for tag_int in self._order:
@@ -490,7 +489,6 @@ class Dataset:
                 diffs.append(f"~ {self._elements[tag_int]} -> {other._elements[tag_int]}")
         
         return diffs
-
 
 # =============================================================================
 # Sequence Classes
