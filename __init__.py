@@ -74,7 +74,7 @@ Quick Start:
 """
 
 __version__ = '0.3.0'
-__author__ = 've3ga'
+__author__ = 'Tyler M'
 
 # =============================================================================
 # Core Building Blocks (Dataset Layer)

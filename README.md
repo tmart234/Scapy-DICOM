@@ -5,66 +5,51 @@ A DICOM Security Testing Framework
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              C-Scare Framework                                  │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│  Attack Patterns (attacks.py)                                                   │
-│    ParserAttacks, ProtocolAttacks, MemoryAttacks, StateMachineAttacks           │
-│    Corpus generation, targeted fuzzing, combined attacks                        │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│  Corruptor (corruptor.py)                                         │
-│    pydicom.Dataset ──→ [surgical corruption] ──→ our encoder                    │
-│    Preserves: transfer syntax, sequences, private tags, pixel data              │
-│    Corrupts: VR, length, value, tag order, duplicates                           │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│  Dataset Layer              File Layer              Pixel Layer                 │
-│    element.py                 file.py                 pixel.py                  │
-│    Element, Dataset           DicomFile               EncapsulatedPixelData     │
-│    Scapy-style chaining       Part 10 files           Fragment manipulation     │
-│    Element.raw() control      Transfer syntax         Offset table attacks      │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│  Scapy Protocol Layer (scapy_dicom.py)             │
-│    PDU: A_ASSOCIATE_RQ/AC/RJ, P_DATA_TF, A_RELEASE, A_ABORT                     │
-│    DIMSE: C_ECHO_RQ, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ + responses               │
-│    Client: DICOMSocket with full Scapy integration                              │
-│    Server: RawSCP with state machine hooks (Sta1-Sta13)                         │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## DICOM Stack Coverage
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ Application Layer                                                               │
-│   IOD constraints, SOP Class semantics                                          │
-│   ► LogicAttacks: SOP class mismatch, transfer syntax mismatch                  │
-│   ► Tool: attacks.py (LogicAttacks class)                                       │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│ Dataset Layer                                                                   │
-│   Elements, Sequences, Values                                                   │
-│   ► Element.raw(): arbitrary VR, length, value bytes                            │
-│   ► Corruptor: surgical corruption of pydicom datasets                          │
-│   ► ParserAttacks: VR fuzzing, length overflow/underflow, sequence bombs        │
-│   ► Tool: element.py, corruptor.py, attacks.py                                  │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│ DIMSE Layer                                                                     │
-│   C-STORE, C-FIND, C-ECHO commands + data                                       │
-│   ► Scapy DIMSE packets with field overrides                                    │
-│   ► fuzz() for automatic field mutation                                         │
-│   ► Tool: scapy_dicom.py (C_ECHO_RQ, C_STORE_RQ, etc.)                          │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│ PDU Layer                                                                       │
-│   A-ASSOCIATE, P-DATA-TF, A-RELEASE, A-ABORT                                    │
-│   ► Scapy PDU packets with raw() for byte-level control                         │
-│   ► ProtocolAttacks, StateMachineAttacks                                        │
-│   ► Tool: scapy_dicom.py (A_ASSOCIATE_RQ, P_DATA_TF, etc.)                      │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│ Transport Layer                                                                 │
-│   TCP segments                                                                  │
-│   ► DICOMSocket: full Scapy integration                                         │
-│   ► RawSCP: rogue server for fuzzing clients                                    │
-│   ► Tool: scapy_dicom.py (DICOMSocket), server.py (RawSCP)                      │
-└─────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              C-Scare Framework                                      │
+├──────────────────────────────────┬──────────────────────────────────────────────────┤
+│         DICOM STACK              │              C-SCARE TOOLS                       │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  Application Layer               │  attacks.py (LogicAttacks)                       │
+│    IOD constraints               │    SOP class mismatch, transfer syntax mismatch  │
+│    SOP Class semantics           │    SSRF via URI, file:// injection               │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  Dataset Layer                   │  element.py    ─ Element.raw() byte control      │
+│    Elements, Sequences, Values   │  corruptor.py  ─ pydicom surgical corruption     │
+│    Part 10 Files, Pixel Data     │  file.py       ─ Part 10 file handling           │
+│                                  │  pixel.py      ─ Encapsulated/fragment attacks   │
+│                                  │  attacks.py (ParserAttacks, MemoryAttacks)       │
+│                                  │    VR fuzzing, length overflow, sequence bombs   │
+│                                  │    Buffer overflow, fragment bombs, LUT attacks  │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  DIMSE Layer                     │  scapy_dicom.py (DIMSE packets)                  │
+│    C-STORE, C-FIND, C-ECHO       │    C_ECHO_RQ, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ   │
+│    Command + Data                │    C_STORE_RQ_Fuzz ─ explicit group_length       │
+│                                  │    fuzz() for automatic field mutation           │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  PDU Layer                       │  scapy_dicom.py (PDU packets)                    │
+│    A-ASSOCIATE-RQ/AC/RJ          │    A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ABORT       │
+│    P-DATA-TF, A-RELEASE          │    P_DATA_TF, A_RELEASE_RQ/RP                    │
+│    A-ABORT                       │  attacks.py (ProtocolAttacks, StateMachineAttacks)│
+│                                  │    PDU malformation, AE title fuzzing            │
+│                                  │    State violations (Sta1-Sta13)                 │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  Transport Layer                 │  scapy_dicom.py (DICOMSocket)                    │
+│    TCP segments                  │    Client with full Scapy integration            │
+│                                  │  server.py (RawSCP)                              │
+│                                  │    Rogue server for fuzzing DICOM clients        │
+│                                  │    State machine hooks, response injection       │
+│                                  │                                                  │
+└──────────────────────────────────┴──────────────────────────────────────────────────┘
 ```
 
 ## Quick Start
@@ -218,7 +203,7 @@ for attack in fuzzer.target_pixel_data():
 | Module | Purpose |
 |--------|---------|
 | `element.py` | Core Dataset/Element building with Scapy-style chaining |
-| `corruptor.py` | Pydicom bridge for surgical corruption (THE KEY) |
+| `corruptor.py` | Pydicom bridge for surgical corruption |
 | `pixel.py` | Encapsulated pixel data with fragment-level control |
 | `file.py` | Part 10 file handling (preamble, meta header) |
 | `scapy_dicom.py` | **ALL protocol** - PDUs, DIMSE, DICOMSocket |
@@ -239,32 +224,9 @@ pip install c_scare scapy
 pip install c_scare pydicom scapy
 ```
 
-## Design Philosophy
-
-1. **Scapy for protocol, our code for datasets**
-   - scapy_dicom.py is the single source of truth for PDU/DIMSE
-   - No redundant packet builders - Scapy does it right
-
-2. **Pydicom for understanding, our encoder for output**
-   - Pydicom excels at parsing (transfer syntaxes, sequences, private tags)
-   - But it validates on encoding - we bypass that
-
-3. **Every byte controllable**
-   - `Element.raw()` gives full byte control for datasets
-   - `raw()` from Scapy gives byte control for packets
-
-4. **Works without network access**
-   - Core dataset/file manipulation works without Scapy
-   - Scapy features gracefully degrade if unavailable
-
 ## Protocol Reference
 
-See [PROTOCOL.md](PROTOCOL.md) for detailed byte-level structure of:
-- DICOM file format (Part 10)
-- Data element encoding (Explicit/Implicit VR)
-- All PDU types with field layouts
-- DIMSE command structures
-- State machine reference (Sta1-Sta13)
+See [PROTOCOL.md](PROTOCOL.md) for detailed byte-level structure
 
 ## License
 
