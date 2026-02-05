@@ -38,9 +38,13 @@ Note on PS3.5 encoding:
     negotiation and identification purposes.
 """
 
+import logging
+import socket
 import struct
-from typing import Any, Optional, Tuple
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+from scapy.compat import Self
 from scapy.packet import Packet, bind_layers
 from scapy.error import Scapy_Exception
 from scapy.fields import (
@@ -58,6 +62,7 @@ from scapy.fields import (
     StrLenField,
 )
 from scapy.layers.inet import TCP
+from scapy.supersocket import StreamSocket
 from scapy.volatile import RandShort, RandInt, RandString
 
 __all__ = [
@@ -205,7 +210,7 @@ __all__ = [
     "STATUS_ERR_NOT_AUTHORIZED",
 ]
 
-
+log = logging.getLogger("scapy.contrib.dicom")
 # =============================================================================
 # Constants
 # =============================================================================
@@ -2382,10 +2387,6 @@ class N_DELETE_RSP(DIMSEPacket):
         return 0
 
 
-# =============================================================================
-# DIMSE Status Parser
-# =============================================================================
-
 def parse_dimse_status(dimse_bytes):
     # type: (bytes) -> Optional[int]
     """
@@ -2432,3 +2433,353 @@ def parse_dimse_status(dimse_bytes):
         return None
 
     return None
+
+def build_presentation_context_rq(context_id: int,
+                                  abstract_syntax_uid: str,
+                                  transfer_syntax_uids: List[str]) -> Packet:
+    """Build a Presentation Context RQ item."""
+    abs_uid = _uid_to_bytes(abstract_syntax_uid)
+    abs_syn = DICOMVariableItem() / DICOMAbstractSyntax(uid=abs_uid)
+
+    sub_items = [abs_syn]
+    for ts_uid in transfer_syntax_uids:
+        ts = DICOMVariableItem() / DICOMTransferSyntax(uid=_uid_to_bytes(ts_uid))
+        sub_items.append(ts)
+
+    return DICOMVariableItem() / DICOMPresentationContextRQ(
+        context_id=context_id,
+        sub_items=sub_items,
+    )
+
+
+def build_user_information(max_pdu_length: int = 16384,
+                           implementation_class_uid: Optional[str] = None,
+                           implementation_version: Optional[Union[str, bytes]] = None
+                           ) -> Packet:
+    """Build a User Information item."""
+    sub_items = [
+        DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=max_pdu_length)
+    ]
+
+    if implementation_class_uid:
+        uid = _uid_to_bytes(implementation_class_uid)
+        sub_items.append(
+            DICOMVariableItem() / DICOMImplementationClassUID(uid=uid)
+        )
+
+    if implementation_version:
+        if isinstance(implementation_version, bytes):
+            ver_bytes = implementation_version
+        else:
+            ver_bytes = implementation_version.encode('ascii')
+        sub_items.append(
+            DICOMVariableItem() / DICOMImplementationVersionName(name=ver_bytes)
+        )
+
+    return DICOMVariableItem() / DICOMUserInformation(sub_items=sub_items)
+
+class DICOMSocket:
+    """DICOM application-layer socket for associations and DIMSE operations."""
+
+    def __init__(self, dst_ip: str, dst_port: int, dst_ae: str,
+                 src_ae: str = "SCAPY_SCU", read_timeout: int = 10) -> None:
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+        self.dst_ae = dst_ae
+        self.src_ae = src_ae
+        self.sock: Optional[socket.socket] = None
+        self.stream: Optional[StreamSocket] = None
+        self.assoc_established = False
+        self.accepted_contexts: Dict[int, Tuple[str, str]] = {}
+        self.read_timeout = read_timeout
+        self._current_message_id_counter = int(time.time()) % 50000
+        self._proposed_max_pdu = 16384
+        self.max_pdu_length = 16384
+        self._proposed_context_map: Dict[int, str] = {}
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+        if self.assoc_established:
+            try:
+                self.release()
+            except (socket.error, socket.timeout, OSError):
+                pass
+        self.close()
+        return False
+
+    def connect(self) -> bool:
+        try:
+            self.sock = socket.create_connection(
+                (self.dst_ip, self.dst_port),
+                timeout=self.read_timeout,
+            )
+            self.stream = StreamSocket(self.sock, basecls=DICOM)
+            return True
+        except (socket.error, socket.timeout, OSError) as e:
+            log.error("Connection failed: %s", e)
+            return False
+
+    def send(self, pkt: Packet) -> None:
+        self.stream.send(pkt)
+
+    def recv(self) -> Optional[Packet]:
+        try:
+            return self.stream.recv()
+        except socket.timeout:
+            return None
+        except (socket.error, OSError) as e:
+            log.error("Error receiving PDU: %s", e)
+            return None
+
+    def sr1(self, *args, **kargs):
+        # type: (*Any, **Any) -> Optional[Packet]
+        """Send one packet and receive one answer."""
+        timeout = kargs.pop("timeout", self.read_timeout)
+        try:
+            return self.stream.sr1(*args, timeout=timeout, **kargs)
+        except (socket.error, OSError) as e:
+            log.error("Error in sr1: %s", e)
+            return None
+
+    def send_raw_bytes(self, raw_bytes: bytes) -> None:
+        self.sock.sendall(raw_bytes)
+
+    def associate(self, requested_contexts: Optional[Dict[str, List[str]]] = None
+                  ) -> bool:
+        if not self.stream and not self.connect():
+            return False
+
+        if requested_contexts is None:
+            requested_contexts = {
+                VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]
+            }
+
+        self._proposed_context_map = {}
+
+        variable_items: List[Packet] = [
+            DICOMVariableItem() / DICOMApplicationContext()
+        ]
+
+        ctx_id = 1
+        for abs_syntax, trn_syntaxes in requested_contexts.items():
+            self._proposed_context_map[ctx_id] = abs_syntax
+            pctx = build_presentation_context_rq(ctx_id, abs_syntax, trn_syntaxes)
+            variable_items.append(pctx)
+            ctx_id += 2
+
+        user_info = build_user_information(max_pdu_length=self._proposed_max_pdu)
+        variable_items.append(user_info)
+
+        assoc_rq = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=self.dst_ae,
+            calling_ae_title=self.src_ae,
+            variable_items=variable_items,
+        )
+
+        response = self.sr1(assoc_rq)
+
+        if response:
+            if response.haslayer(A_ASSOCIATE_AC):
+                self.assoc_established = True
+                self._parse_accepted_contexts(response)
+                self._parse_max_pdu_length(response)
+                return True
+            elif response.haslayer(A_ASSOCIATE_RJ):
+                log.error(
+                    "Association rejected: result=%d, source=%d, reason=%d",
+                    response[A_ASSOCIATE_RJ].result,
+                    response[A_ASSOCIATE_RJ].source,
+                    response[A_ASSOCIATE_RJ].reason_diag,
+                )
+                return False
+
+        log.error("Association failed: no valid response received")
+        return False
+
+    def _parse_max_pdu_length(self, response: Packet) -> None:
+        try:
+            for item in response[A_ASSOCIATE_AC].variable_items:
+                if item.item_type != 0x50:
+                    continue
+                if not item.haslayer(DICOMUserInformation):
+                    continue
+                user_info = item[DICOMUserInformation]
+                for sub_item in user_info.sub_items:
+                    if sub_item.item_type != 0x51:
+                        continue
+                    if not sub_item.haslayer(DICOMMaximumLength):
+                        continue
+                    max_len = sub_item[DICOMMaximumLength]
+                    server_max = max_len.max_pdu_length
+                    self.max_pdu_length = min(
+                        self._proposed_max_pdu, server_max
+                    )
+                    return
+        except (KeyError, IndexError, AttributeError):
+            pass
+        self.max_pdu_length = self._proposed_max_pdu
+
+    def _parse_accepted_contexts(self, response: Packet) -> None:
+        for item in response[A_ASSOCIATE_AC].variable_items:
+            if item.item_type != 0x21:
+                continue
+            if not item.haslayer(DICOMPresentationContextAC):
+                continue
+            pctx = item[DICOMPresentationContextAC]
+            ctx_id = pctx.context_id
+            result = pctx.result
+
+            if result != 0:
+                continue
+
+            abs_syntax = self._proposed_context_map.get(ctx_id)
+            if abs_syntax is None:
+                continue
+
+            for sub_item in pctx.sub_items:
+                if sub_item.item_type != 0x40:
+                    continue
+                if not sub_item.haslayer(DICOMTransferSyntax):
+                    continue
+                ts_uid = sub_item[DICOMTransferSyntax].uid
+                ts_uid = ts_uid.rstrip(b"\x00").decode("ascii")
+                self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
+                break
+
+    def _get_next_message_id(self) -> int:
+        self._current_message_id_counter += 1
+        return self._current_message_id_counter & 0xFFFF
+
+    def _find_accepted_context_id(self, sop_class_uid: str,
+                                  transfer_syntax_uid: Optional[str] = None
+                                  ) -> Optional[int]:
+        for ctx_id, (abs_syntax, ts_syntax) in self.accepted_contexts.items():
+            if abs_syntax == sop_class_uid:
+                if transfer_syntax_uid is None or transfer_syntax_uid == ts_syntax:
+                    return ctx_id
+        return None
+
+    def c_echo(self) -> Optional[int]:
+        if not self.assoc_established:
+            log.error("Association not established")
+            return None
+
+        echo_ctx_id = self._find_accepted_context_id(VERIFICATION_SOP_CLASS_UID)
+        if echo_ctx_id is None:
+            log.error("No accepted context for Verification SOP Class")
+            return None
+
+        msg_id = self._get_next_message_id()
+        dimse_rq = bytes(C_ECHO_RQ(message_id=msg_id))
+
+        pdv_rq = PresentationDataValueItem(
+            context_id=echo_ctx_id,
+            data=dimse_rq,
+            is_command=1,
+            is_last=1,
+        )
+        pdata_rq = DICOM() / P_DATA_TF(pdv_items=[pdv_rq])
+
+        response = self.sr1(pdata_rq)
+
+        if response and response.haslayer(P_DATA_TF):
+            pdv_items = response[P_DATA_TF].pdv_items
+            if pdv_items:
+                pdv_rsp = pdv_items[0]
+                return parse_dimse_status(pdv_rsp.data)
+        return None
+
+    def c_store(self, dataset_bytes: bytes, sop_class_uid: str,
+                sop_instance_uid: str, transfer_syntax_uid: str
+                ) -> Optional[int]:
+        if not self.assoc_established:
+            log.error("Association not established")
+            return None
+
+        store_ctx_id = self._find_accepted_context_id(
+            sop_class_uid,
+            transfer_syntax_uid,
+        )
+        if store_ctx_id is None:
+            log.error(
+                "No accepted context for SOP %s with TS %s",
+                sop_class_uid,
+                transfer_syntax_uid,
+            )
+            return None
+
+        msg_id = self._get_next_message_id()
+
+        dimse_rq = bytes(C_STORE_RQ(
+            affected_sop_class_uid=sop_class_uid,
+            affected_sop_instance_uid=sop_instance_uid,
+            message_id=msg_id,
+        ))
+
+        cmd_pdv = PresentationDataValueItem(
+            context_id=store_ctx_id,
+            data=dimse_rq,
+            is_command=1,
+            is_last=1,
+        )
+        pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
+        self.send(pdata_cmd)
+
+        max_pdv_data = self.max_pdu_length - 12
+
+        if len(dataset_bytes) <= max_pdv_data:
+            data_pdv = PresentationDataValueItem(
+                context_id=store_ctx_id,
+                data=dataset_bytes,
+                is_command=0,
+                is_last=1,
+            )
+            pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
+            self.send(pdata_data)
+        else:
+            offset = 0
+            while offset < len(dataset_bytes):
+                chunk = dataset_bytes[offset:offset + max_pdv_data]
+                is_last = 1 if (offset + len(chunk) >= len(dataset_bytes)) else 0
+                data_pdv = PresentationDataValueItem(
+                    context_id=store_ctx_id,
+                    data=chunk,
+                    is_command=0,
+                    is_last=is_last,
+                )
+                pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
+                self.send(pdata_data)
+                offset += len(chunk)
+
+        response = self.recv()
+
+        if response and response.haslayer(P_DATA_TF):
+            pdv_items = response[P_DATA_TF].pdv_items
+            if pdv_items:
+                pdv_rsp = pdv_items[0]
+                return parse_dimse_status(pdv_rsp.data)
+        return None
+
+    def release(self) -> bool:
+        if not self.assoc_established:
+            return True
+
+        release_rq = DICOM() / A_RELEASE_RQ()
+        response = self.sr1(release_rq)
+        self.close()
+
+        if response:
+            return response.haslayer(A_RELEASE_RP)
+        return False
+
+    def close(self) -> None:
+        if self.stream:
+            try:
+                self.stream.close()
+            except (socket.error, OSError):
+                pass
+        self.sock = None
+        self.stream = None
+        self.assoc_established = False
