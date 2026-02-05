@@ -66,9 +66,9 @@ from scapy.supersocket import StreamSocket
 from scapy.volatile import RandShort, RandInt, RandString
 
 __all__ = [
-    # =========================================================================
+ 
     # Constants
-    # =========================================================================
+ 
     "DICOM_PORT",
     "DICOM_PORT_ALT",
     "APP_CONTEXT_UID",
@@ -97,9 +97,9 @@ __all__ = [
     "STUDY_ROOT_QR_FIND_SOP_CLASS_UID",
     "STUDY_ROOT_QR_MOVE_SOP_CLASS_UID",
     "STUDY_ROOT_QR_GET_SOP_CLASS_UID",
-    # =========================================================================
+ 
     # PDU Classes (PS3.8 Section 9.3)
-    # =========================================================================
+ 
     "DICOM",
     "A_ASSOCIATE_RQ",
     "A_ASSOCIATE_AC",
@@ -109,9 +109,9 @@ __all__ = [
     "A_RELEASE_RP",
     "A_ABORT",
     "PresentationDataValueItem",
-    # =========================================================================
+ 
     # Variable Items (PS3.8 Section 9.3.2)
-    # =========================================================================
+ 
     "DICOMVariableItem",
     "DICOMApplicationContext",
     "DICOMPresentationContextRQ",
@@ -121,9 +121,9 @@ __all__ = [
     "DICOMUserInformation",
     "DICOMMaximumLength",
     "DICOMGenericItem",
-    # =========================================================================
+ 
     # Extended User Info Sub-Items (PS3.7 D.3.3)
-    # =========================================================================
+ 
     "DICOMImplementationClassUID",
     "DICOMAsyncOperationsWindow",
     "DICOMSCPSCURoleSelection",
@@ -132,9 +132,7 @@ __all__ = [
     "DICOMSOPClassCommonExtendedNegotiation",
     "DICOMUserIdentity",
     "DICOMUserIdentityResponse",
-    # =========================================================================
     # DIMSE Field Classes
-    # =========================================================================
     "DICOMAETitleField",
     "DICOMElementField",
     "DICOMUIDField",
@@ -142,13 +140,9 @@ __all__ = [
     "DICOMULField",
     "DICOMAEDIMSEField",
     "DICOMATField",
-    # =========================================================================
     # DIMSE Base Class
-    # =========================================================================
     "DIMSEPacket",
-    # =========================================================================
     # DIMSE-C Commands (PS3.7 Section 9.3)
-    # =========================================================================
     "C_ECHO_RQ",
     "C_ECHO_RSP",
     "C_STORE_RQ",
@@ -160,10 +154,8 @@ __all__ = [
     "C_GET_RQ",
     "C_GET_RSP",
     "C_CANCEL_RQ",
-    # =========================================================================
-    # DIMSE-N Commands (PS3.7 Section 10.3)
-    # =========================================================================
-    "N_EVENT_REPORT_RQ",
+     # DIMSE-N Commands (PS3.7 Section 10.3)
+     "N_EVENT_REPORT_RQ",
     "N_EVENT_REPORT_RSP",
     "N_GET_RQ",
     "N_GET_RSP",
@@ -175,14 +167,15 @@ __all__ = [
     "N_CREATE_RSP",
     "N_DELETE_RQ",
     "N_DELETE_RSP",
-    # =========================================================================
-    # Utilities
-    # =========================================================================
+     # Utilities
+     "DICOMSocket",
     "parse_dimse_status",
-    # =========================================================================
-    # DIMSE Status Codes (PS3.7 Annex C)
-    # =========================================================================
-    "STATUS_SUCCESS",
+    "_uid_to_bytes",
+    "_uid_to_bytes_raw",
+    "build_presentation_context_rq",
+    "build_user_information",
+     # DIMSE Status Codes (PS3.7 Annex C)
+     "STATUS_SUCCESS",
     "STATUS_CANCEL",
     "STATUS_PENDING",
     "STATUS_PENDING_WARNINGS",
@@ -211,9 +204,9 @@ __all__ = [
 ]
 
 log = logging.getLogger("scapy.contrib.dicom")
-# =============================================================================
+
 # Constants
-# =============================================================================
+
 
 # Standard DICOM ports (PS3.8 Section 9.1.1)
 DICOM_PORT = 104        # Well-known port (privileged)
@@ -222,9 +215,9 @@ DICOM_PORT_ALT = 11112  # Registered port (non-privileged)
 # Application Context Name (PS3.7 Annex A, B)
 APP_CONTEXT_UID = "1.2.840.10008.3.1.1.1"
 
-# =============================================================================
+
 # Transfer Syntax UIDs (PS3.5 Annex A)
-# =============================================================================
+
 
 # Default - Implicit VR Little Endian (PS3.5 A.1)
 DEFAULT_TRANSFER_SYNTAX_UID = "1.2.840.10008.1.2"
@@ -280,9 +273,9 @@ STUDY_ROOT_QR_MOVE_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.2.2.2"
 STUDY_ROOT_QR_GET_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.2.2.3"
 
 
-# =============================================================================
+
 # PDU Type Definitions (PS3.8 Section 9.3.1)
-# =============================================================================
+
 
 PDU_TYPES = {
     0x01: "A-ASSOCIATE-RQ",
@@ -295,9 +288,9 @@ PDU_TYPES = {
 }
 
 
-# =============================================================================
+
 # Item Type Definitions (PS3.8 Section 9.3.2-9.3.3, PS3.7 Annex D.3.3)
-# =============================================================================
+
 
 ITEM_TYPES = {
     # PS3.8 defined items
@@ -320,9 +313,9 @@ ITEM_TYPES = {
 }
 
 
-# =============================================================================
+
 # DIMSE Command Field Values (PS3.7 E.1-1)
-# =============================================================================
+
 
 DIMSE_COMMAND_FIELDS = {
     # DIMSE-C (Section 9)
@@ -359,9 +352,9 @@ PRIORITY_VALUES = {
 }
 
 
-# =============================================================================
+
 # DIMSE Status Codes (PS3.7 Annex C)
-# =============================================================================
+
 
 # Status Class convention per Annex C:
 # Success: 0000
@@ -402,9 +395,9 @@ STATUS_ERR_NO_SUCH_ACTION_TYPE = 0x0123      # C.5.24
 STATUS_ERR_NOT_AUTHORIZED = 0x0124           # C.5.25
 
 
-# =============================================================================
+
 # Utility Functions
-# =============================================================================
+
 
 def _uid_to_bytes(uid):
     # type: (Any) -> bytes
@@ -425,10 +418,19 @@ def _uid_to_bytes(uid):
         b_uid += b"\x00"
     return b_uid
 
+def _uid_to_bytes_raw(uid: Union[str, bytes]) -> bytes:
+    """Convert UID to bytes without padding."""
+    if isinstance(uid, bytes):
+        return uid
+    elif isinstance(uid, str):
+        return uid.encode("ascii")
+    else:
+        return b""
 
-# =============================================================================
+
+
 # Field Classes
-# =============================================================================
+
 
 class DICOMAETitleField(StrFixedLenField):
     """
@@ -462,9 +464,9 @@ class DICOMAETitleField(StrFixedLenField):
         return str(val).rstrip()
 
 
-# =============================================================================
+
 # Generic Item Handler
-# =============================================================================
+
 
 class DICOMGenericItem(Packet):
     """
@@ -491,9 +493,9 @@ class DICOMGenericItem(Packet):
         return b"", s
 
 
-# =============================================================================
+
 # Variable Item Header (PS3.8 Section 9.3.2)
-# =============================================================================
+
 
 class DICOMVariableItem(Packet):
     """
@@ -550,9 +552,9 @@ class DICOMVariableItem(Packet):
         return self.sprintf("Item %item_type%")
 
 
-# =============================================================================
+
 # Application Context Item (PS3.8 Section 9.3.2.1)
-# =============================================================================
+
 
 class DICOMApplicationContext(Packet):
     """
@@ -584,9 +586,9 @@ class DICOMApplicationContext(Packet):
         return f"AppContext {uid_str}"
 
 
-# =============================================================================
+
 # Abstract Syntax Sub-Item (PS3.8 Section 9.3.2.2.1)
-# =============================================================================
+
 
 class DICOMAbstractSyntax(Packet):
     """
@@ -618,9 +620,9 @@ class DICOMAbstractSyntax(Packet):
         return f"AbstractSyntax {uid_str}"
 
 
-# =============================================================================
+
 # Transfer Syntax Sub-Item (PS3.8 Section 9.3.2.2.2)
-# =============================================================================
+
 
 class DICOMTransferSyntax(Packet):
     """
@@ -652,9 +654,9 @@ class DICOMTransferSyntax(Packet):
         return f"TransferSyntax {uid_str}"
 
 
-# =============================================================================
+
 # Presentation Context Item - Request (PS3.8 Section 9.3.2.2)
-# =============================================================================
+
 
 class DICOMPresentationContextRQ(Packet):
     """
@@ -692,9 +694,9 @@ class DICOMPresentationContextRQ(Packet):
         return f"PresentationContext-RQ ctx_id={self.context_id}"
 
 
-# =============================================================================
+
 # Presentation Context Item - Accept (PS3.8 Section 9.3.3.2)
-# =============================================================================
+
 
 class DICOMPresentationContextAC(Packet):
     """
@@ -743,9 +745,9 @@ class DICOMPresentationContextAC(Packet):
         )
 
 
-# =============================================================================
+
 # Maximum Length Sub-Item (PS3.8 Annex D.1)
-# =============================================================================
+
 
 class DICOMMaximumLength(Packet):
     """
@@ -775,9 +777,9 @@ class DICOMMaximumLength(Packet):
         return f"MaxLength {self.max_pdu_length}"
 
 
-# =============================================================================
+
 # Implementation Class UID Sub-Item (PS3.7 D.3.3.2)
-# =============================================================================
+
 
 class DICOMImplementationClassUID(Packet):
     """
@@ -809,9 +811,9 @@ class DICOMImplementationClassUID(Packet):
         return f"ImplClassUID {uid_str}"
 
 
-# =============================================================================
+
 # Implementation Version Name Sub-Item (PS3.7 D.3.3.2)
-# =============================================================================
+
 
 class DICOMImplementationVersionName(Packet):
     """
@@ -843,9 +845,9 @@ class DICOMImplementationVersionName(Packet):
         return f"ImplVersion {name_str}"
 
 
-# =============================================================================
+
 # Asynchronous Operations Window Sub-Item (PS3.7 D.3.3.3)
-# =============================================================================
+
 
 class DICOMAsyncOperationsWindow(Packet):
     """
@@ -871,9 +873,9 @@ class DICOMAsyncOperationsWindow(Packet):
         return f"AsyncOps inv={self.max_ops_invoked} perf={self.max_ops_performed}"
 
 
-# =============================================================================
+
 # SCP/SCU Role Selection Sub-Item (PS3.7 D.3.3.4)
-# =============================================================================
+
 
 class DICOMSCPSCURoleSelection(Packet):
     """
@@ -901,9 +903,9 @@ class DICOMSCPSCURoleSelection(Packet):
         return f"RoleSelection SCU={self.scu_role} SCP={self.scp_role}"
 
 
-# =============================================================================
+
 # SOP Class Extended Negotiation Sub-Item (PS3.7 D.3.3.5)
-# =============================================================================
+
 
 class DICOMSOPClassExtendedNegotiation(Packet):
     """
@@ -937,9 +939,9 @@ class DICOMSOPClassExtendedNegotiation(Packet):
         return f"SOPClassExtNeg {uid_str}"
 
 
-# =============================================================================
+
 # SOP Class Common Extended Negotiation Sub-Item (PS3.7 D.3.3.6)
-# =============================================================================
+
 
 class DICOMSOPClassCommonExtendedNegotiation(Packet):
     """
@@ -978,9 +980,9 @@ class DICOMSOPClassCommonExtendedNegotiation(Packet):
         return f"SOPClassCommonExtNeg {uid_str}"
 
 
-# =============================================================================
+
 # User Identity Sub-Item (PS3.7 D.3.3.7)
-# =============================================================================
+
 
 USER_IDENTITY_TYPES = {
     1: "Username",
@@ -1033,9 +1035,9 @@ class DICOMUserIdentity(Packet):
         return self.sprintf("UserIdentity %user_identity_type%")
 
 
-# =============================================================================
+
 # User Identity Server Response Sub-Item (PS3.7 D.3.3.7)
-# =============================================================================
+
 
 class DICOMUserIdentityResponse(Packet):
     """
@@ -1062,9 +1064,9 @@ class DICOMUserIdentityResponse(Packet):
         return "UserIdentityResponse"
 
 
-# =============================================================================
+
 # User Information Item (PS3.8 Section 9.3.2.3)
-# =============================================================================
+
 
 class DICOMUserInformation(Packet):
     """
@@ -1101,9 +1103,9 @@ class DICOMUserInformation(Packet):
         return f"UserInfo ({len(self.sub_items)} items)"
 
 
-# =============================================================================
+
 # Layer Bindings for Variable Items
-# =============================================================================
+
 
 bind_layers(DICOMVariableItem, DICOMApplicationContext, item_type=0x10)
 bind_layers(DICOMVariableItem, DICOMPresentationContextRQ, item_type=0x20)
@@ -1123,9 +1125,9 @@ bind_layers(DICOMVariableItem, DICOMUserIdentityResponse, item_type=0x59)
 bind_layers(DICOMVariableItem, DICOMGenericItem)
 
 
-# =============================================================================
+
 # DICOM Upper Layer PDU Header (PS3.8 Section 9.3.1)
-# =============================================================================
+
 
 class DICOM(Packet):
     """
@@ -1159,9 +1161,9 @@ class DICOM(Packet):
         return self.sprintf("DICOM %pdu_type%")
 
 
-# =============================================================================
+
 # Presentation Data Value Item (PS3.8 Section 9.3.5.1)
-# =============================================================================
+
 
 class PresentationDataValueItem(Packet):
     """
@@ -1202,9 +1204,9 @@ class PresentationDataValueItem(Packet):
         return f"PDV ctx={self.context_id} {frag_type}{last} len={len(self.data)}"
 
 
-# =============================================================================
+
 # A-ASSOCIATE-RQ PDU (PS3.8 Section 9.3.2)
-# =============================================================================
+
 
 class A_ASSOCIATE_RQ(Packet):
     """
@@ -1248,9 +1250,9 @@ class A_ASSOCIATE_RQ(Packet):
         return self.called_ae_title + self.calling_ae_title
 
 
-# =============================================================================
+
 # A-ASSOCIATE-AC PDU (PS3.8 Section 9.3.3)
-# =============================================================================
+
 
 class A_ASSOCIATE_AC(Packet):
     """
@@ -1299,9 +1301,9 @@ class A_ASSOCIATE_AC(Packet):
         return isinstance(other, A_ASSOCIATE_RQ)
 
 
-# =============================================================================
+
 # A-ASSOCIATE-RJ PDU (PS3.8 Section 9.3.4)
-# =============================================================================
+
 
 class A_ASSOCIATE_RJ(Packet):
     """
@@ -1359,9 +1361,9 @@ class A_ASSOCIATE_RJ(Packet):
         return isinstance(other, A_ASSOCIATE_RQ)
 
 
-# =============================================================================
+
 # P-DATA-TF PDU (PS3.8 Section 9.3.5)
-# =============================================================================
+
 
 class P_DATA_TF(Packet):
     """
@@ -1391,9 +1393,9 @@ class P_DATA_TF(Packet):
         return f"P-DATA-TF ({len(self.pdv_items)} PDVs)"
 
 
-# =============================================================================
+
 # A-RELEASE-RQ PDU (PS3.8 Section 9.3.6)
-# =============================================================================
+
 
 class A_RELEASE_RQ(Packet):
     """
@@ -1413,9 +1415,9 @@ class A_RELEASE_RQ(Packet):
         return "A-RELEASE-RQ"
 
 
-# =============================================================================
+
 # A-RELEASE-RP PDU (PS3.8 Section 9.3.7)
-# =============================================================================
+
 
 class A_RELEASE_RP(Packet):
     """
@@ -1439,9 +1441,9 @@ class A_RELEASE_RP(Packet):
         return isinstance(other, A_RELEASE_RQ)
 
 
-# =============================================================================
+
 # A-ABORT PDU (PS3.8 Section 9.3.8)
-# =============================================================================
+
 
 class A_ABORT(Packet):
     """
@@ -1482,9 +1484,9 @@ class A_ABORT(Packet):
         return self.sprintf("A-ABORT %source%")
 
 
-# =============================================================================
+
 # TCP Port and PDU Type Bindings (PS3.8 Section 9.1)
-# =============================================================================
+
 
 bind_layers(TCP, DICOM, dport=DICOM_PORT)
 bind_layers(TCP, DICOM, sport=DICOM_PORT)
@@ -1500,9 +1502,9 @@ bind_layers(DICOM, A_RELEASE_RP, pdu_type=0x06)
 bind_layers(DICOM, A_ABORT, pdu_type=0x07)
 
 
-# =============================================================================
+
 # DIMSE Data Element Fields (PS3.7 Section 9, PS3.5 for encoding)
-# =============================================================================
+
 
 class DICOMElementField(Field):
     """
@@ -1676,9 +1678,9 @@ class DICOMATField(DICOMElementField):
         return remain, tags
 
 
-# =============================================================================
+
 # DIMSE Base Class (PS3.7 Section 9)
-# =============================================================================
+
 
 class DIMSEPacket(Packet):
     """
@@ -1700,9 +1702,9 @@ class DIMSEPacket(Packet):
         return header + pkt + pay
 
 
-# =============================================================================
+
 # DIMSE-C Commands (PS3.7 Section 9.3)
-# =============================================================================
+
 
 class C_ECHO_RQ(DIMSEPacket):
     """
@@ -2036,9 +2038,9 @@ class C_CANCEL_RQ(DIMSEPacket):
         return self.sprintf("C-CANCEL-RQ canceling=%message_id_responded%")
 
 
-# =============================================================================
+
 # DIMSE-N Commands (PS3.7 Section 10.3)
-# =============================================================================
+
 
 class N_EVENT_REPORT_RQ(DIMSEPacket):
     """
@@ -2497,7 +2499,7 @@ class DICOMSocket:
         self.max_pdu_length = 16384
         self._proposed_context_map: Dict[int, str] = {}
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> Self: # type: ignore
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
