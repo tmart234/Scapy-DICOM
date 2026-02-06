@@ -229,7 +229,7 @@ except Exception as e:
 # Rogue Server (for fuzzing clients)
 # =============================================================================
 
-from server import (
+from c_scare.server import (
     RawSCP,
     Connection,
     ConnectionState,
@@ -256,7 +256,7 @@ from attacks import (
 # Scapy Layer Installation Helper
 # =============================================================================
 
-from scapy_layer import (
+from c_scare.scapy_layer import (
     install_scapy_layer,
     load_scapy_layer,
     get_scapy_layer_path,

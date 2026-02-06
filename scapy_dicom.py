@@ -42,9 +42,39 @@ import logging
 import socket
 import struct
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
-from scapy.compat import Self
+# =============================================================================
+# SCAPY IPv6 FIX - Must run before any scapy.layers imports
+# Fixes KeyError: 'scope' in containerized environments without full IPv6
+# =============================================================================
+class _FakeRoute6:
+    """Fake Route6 class to avoid IPv6 routing errors in containers."""
+    routes = []
+    def resync(self): pass
+    def route(self, *args, **kwargs): return ("::", "::", "::")
+
+try:
+    import scapy.config
+    scapy.config.conf.route6 = _FakeRoute6()
+except Exception:
+    pass
+# =============================================================================
+
+# Handle Self import for backwards compatibility across Python versions
+# Per scapy devs: use scapy.compat.Self for backwards compatibility
+try:
+    from scapy.compat import Self
+except ImportError:
+    try:
+        from typing import Self  # Python 3.11+
+    except ImportError:
+        # Fallback for Python < 3.11 without scapy.compat.Self
+        if TYPE_CHECKING:
+            from typing_extensions import Self
+        else:
+            Self = Any  # Runtime fallback
+
 from scapy.packet import Packet, bind_layers
 from scapy.error import Scapy_Exception
 from scapy.fields import (
@@ -418,7 +448,8 @@ def _uid_to_bytes(uid):
         b_uid += b"\x00"
     return b_uid
 
-def _uid_to_bytes_raw(uid: Union[str, bytes]) -> bytes:
+def _uid_to_bytes_raw(uid):
+    # type: (Union[str, bytes]) -> bytes
     """Convert UID to bytes without padding."""
     if isinstance(uid, bytes):
         return uid
@@ -1651,6 +1682,10 @@ class DICOMAEDIMSEField(DICOMElementField):
 class DICOMATField(DICOMElementField):
     """DICOM Attribute Tag (AT) element field for N-GET Attribute Identifier List."""
 
+    # This field holds a list, so set islist=True to fix Scapy packet iteration
+    # when the list is empty (empty SetGen yields nothing, breaking do_build)
+    islist = True
+
     def addfield(self, pkt, s, val):
         # type: (Optional[Packet], bytes, Any) -> bytes
         if val is None:
@@ -1676,6 +1711,11 @@ class DICOMATField(DICOMElementField):
             tags.append((group, elem))
             offset += 4
         return remain, tags
+
+    def randval(self):
+        # type: () -> list
+        # Return empty list as default random value for attribute identifier list
+        return []
 
 
 
@@ -1781,13 +1821,14 @@ class C_STORE_RQ(DIMSEPacket):
         DICOMUIDField("affected_sop_instance_uid",
                       "1.2.3.4.5.6.7.8.9", 0x0000, 0x1000),
         # Optional: Move Originator fields (used in C-MOVE sub-operations)
+        # Note: Use getfieldval() to avoid recursion in ConditionalField evaluation
         ConditionalField(
             DICOMAEDIMSEField("move_originator_ae_title", b"", 0x0000, 0x1030),
-            lambda pkt: pkt.move_originator_ae_title not in (None, b"", b" " * 16)
+            lambda pkt: pkt.fields.get("move_originator_ae_title") not in (None, b"", b" " * 16)
         ),
         ConditionalField(
             DICOMUSField("move_originator_message_id", 0, 0x0000, 0x1031),
-            lambda pkt: pkt.move_originator_message_id not in (None, 0)
+            lambda pkt: pkt.fields.get("move_originator_message_id") not in (None, 0)
         ),
     ]
 
@@ -2029,13 +2070,13 @@ class C_CANCEL_RQ(DIMSEPacket):
     name = "C-CANCEL-RQ"
     fields_desc = [
         DICOMUSField("command_field", 0x0FFF, 0x0000, 0x0100),
-        DICOMUSField("message_id_responded", 1, 0x0000, 0x0120),
+        DICOMUSField("message_id_being_responded_to", 1, 0x0000, 0x0120),
         DICOMUSField("data_set_type", 0x0101, 0x0000, 0x0800),
     ]
 
     def mysummary(self):
         # type: () -> str
-        return self.sprintf("C-CANCEL-RQ canceling=%message_id_responded%")
+        return self.sprintf("C-CANCEL-RQ canceling=%message_id_being_responded_to%")
 
 
 
@@ -2436,9 +2477,8 @@ def parse_dimse_status(dimse_bytes):
 
     return None
 
-def build_presentation_context_rq(context_id: int,
-                                  abstract_syntax_uid: str,
-                                  transfer_syntax_uids: List[str]) -> Packet:
+def build_presentation_context_rq(context_id, abstract_syntax_uid, transfer_syntax_uids):
+    # type: (int, str, List[str]) -> Packet
     """Build a Presentation Context RQ item."""
     abs_uid = _uid_to_bytes(abstract_syntax_uid)
     abs_syn = DICOMVariableItem() / DICOMAbstractSyntax(uid=abs_uid)
@@ -2454,10 +2494,8 @@ def build_presentation_context_rq(context_id: int,
     )
 
 
-def build_user_information(max_pdu_length: int = 16384,
-                           implementation_class_uid: Optional[str] = None,
-                           implementation_version: Optional[Union[str, bytes]] = None
-                           ) -> Packet:
+def build_user_information(max_pdu_length=16384, implementation_class_uid=None, implementation_version=None):
+    # type: (int, Optional[str], Optional[Union[str, bytes]]) -> Packet
     """Build a User Information item."""
     sub_items = [
         DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=max_pdu_length)
@@ -2483,26 +2521,28 @@ def build_user_information(max_pdu_length: int = 16384,
 class DICOMSocket:
     """DICOM application-layer socket for associations and DIMSE operations."""
 
-    def __init__(self, dst_ip: str, dst_port: int, dst_ae: str,
-                 src_ae: str = "SCAPY_SCU", read_timeout: int = 10) -> None:
+    def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", read_timeout=10):
+        # type: (str, int, str, str, int) -> None
         self.dst_ip = dst_ip
         self.dst_port = dst_port
         self.dst_ae = dst_ae
         self.src_ae = src_ae
-        self.sock: Optional[socket.socket] = None
-        self.stream: Optional[StreamSocket] = None
+        self.sock = None  # type: Optional[socket.socket]
+        self.stream = None  # type: Optional[StreamSocket]
         self.assoc_established = False
-        self.accepted_contexts: Dict[int, Tuple[str, str]] = {}
+        self.accepted_contexts = {}  # type: Dict[int, Tuple[str, str]]
         self.read_timeout = read_timeout
         self._current_message_id_counter = int(time.time()) % 50000
         self._proposed_max_pdu = 16384
         self.max_pdu_length = 16384
-        self._proposed_context_map: Dict[int, str] = {}
+        self._proposed_context_map = {}  # type: Dict[int, str]
 
-    def __enter__(self) -> Self: # type: ignore
+    def __enter__(self):
+        # type: () -> DICOMSocket
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # type: (Any, Any, Any) -> bool
         if self.assoc_established:
             try:
                 self.release()
@@ -2511,7 +2551,8 @@ class DICOMSocket:
         self.close()
         return False
 
-    def connect(self) -> bool:
+    def connect(self):
+        # type: () -> bool
         try:
             self.sock = socket.create_connection(
                 (self.dst_ip, self.dst_port),
@@ -2523,10 +2564,12 @@ class DICOMSocket:
             log.error("Connection failed: %s", e)
             return False
 
-    def send(self, pkt: Packet) -> None:
+    def send(self, pkt):
+        # type: (Packet) -> None
         self.stream.send(pkt)
 
-    def recv(self) -> Optional[Packet]:
+    def recv(self):
+        # type: () -> Optional[Packet]
         try:
             return self.stream.recv()
         except socket.timeout:
@@ -2545,11 +2588,12 @@ class DICOMSocket:
             log.error("Error in sr1: %s", e)
             return None
 
-    def send_raw_bytes(self, raw_bytes: bytes) -> None:
+    def send_raw_bytes(self, raw_bytes):
+        # type: (bytes) -> None
         self.sock.sendall(raw_bytes)
 
-    def associate(self, requested_contexts: Optional[Dict[str, List[str]]] = None
-                  ) -> bool:
+    def associate(self, requested_contexts=None):
+        # type: (Optional[Dict[str, List[str]]]) -> bool
         if not self.stream and not self.connect():
             return False
 
@@ -2560,9 +2604,9 @@ class DICOMSocket:
 
         self._proposed_context_map = {}
 
-        variable_items: List[Packet] = [
+        variable_items = [
             DICOMVariableItem() / DICOMApplicationContext()
-        ]
+        ]  # type: List[Packet]
 
         ctx_id = 1
         for abs_syntax, trn_syntaxes in requested_contexts.items():
@@ -2600,7 +2644,8 @@ class DICOMSocket:
         log.error("Association failed: no valid response received")
         return False
 
-    def _parse_max_pdu_length(self, response: Packet) -> None:
+    def _parse_max_pdu_length(self, response):
+        # type: (Packet) -> None
         try:
             for item in response[A_ASSOCIATE_AC].variable_items:
                 if item.item_type != 0x50:
@@ -2623,7 +2668,8 @@ class DICOMSocket:
             pass
         self.max_pdu_length = self._proposed_max_pdu
 
-    def _parse_accepted_contexts(self, response: Packet) -> None:
+    def _parse_accepted_contexts(self, response):
+        # type: (Packet) -> None
         for item in response[A_ASSOCIATE_AC].variable_items:
             if item.item_type != 0x21:
                 continue
@@ -2650,20 +2696,21 @@ class DICOMSocket:
                 self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
                 break
 
-    def _get_next_message_id(self) -> int:
+    def _get_next_message_id(self):
+        # type: () -> int
         self._current_message_id_counter += 1
         return self._current_message_id_counter & 0xFFFF
 
-    def _find_accepted_context_id(self, sop_class_uid: str,
-                                  transfer_syntax_uid: Optional[str] = None
-                                  ) -> Optional[int]:
+    def _find_accepted_context_id(self, sop_class_uid, transfer_syntax_uid=None):
+        # type: (str, Optional[str]) -> Optional[int]
         for ctx_id, (abs_syntax, ts_syntax) in self.accepted_contexts.items():
             if abs_syntax == sop_class_uid:
                 if transfer_syntax_uid is None or transfer_syntax_uid == ts_syntax:
                     return ctx_id
         return None
 
-    def c_echo(self) -> Optional[int]:
+    def c_echo(self):
+        # type: () -> Optional[int]
         if not self.assoc_established:
             log.error("Association not established")
             return None
@@ -2693,9 +2740,8 @@ class DICOMSocket:
                 return parse_dimse_status(pdv_rsp.data)
         return None
 
-    def c_store(self, dataset_bytes: bytes, sop_class_uid: str,
-                sop_instance_uid: str, transfer_syntax_uid: str
-                ) -> Optional[int]:
+    def c_store(self, dataset_bytes, sop_class_uid, sop_instance_uid, transfer_syntax_uid):
+        # type: (bytes, str, str, str) -> Optional[int]
         if not self.assoc_established:
             log.error("Association not established")
             return None
@@ -2764,7 +2810,8 @@ class DICOMSocket:
                 return parse_dimse_status(pdv_rsp.data)
         return None
 
-    def release(self) -> bool:
+    def release(self):
+        # type: () -> bool
         if not self.assoc_established:
             return True
 
@@ -2776,7 +2823,8 @@ class DICOMSocket:
             return response.haslayer(A_RELEASE_RP)
         return False
 
-    def close(self) -> None:
+    def close(self):
+        # type: () -> None
         if self.stream:
             try:
                 self.stream.close()
